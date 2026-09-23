@@ -71,6 +71,7 @@ idf_component_register(
         "adif/adif_check.c"   # #263 "check my log" - portable, host-tested
         "util/format_freq.c"  # #302 one frequency format, portable
         "cat/cat.c"
+        "radio/radio.c"
         "audio/audio.c"
         "audio/rx_audio.c"
         "dsp/dsp.c"
@@ -151,6 +152,7 @@ idf_component_register(
         "ui"
         "util"
         "cat"
+        "radio"
         "audio"
         "dsp"
         "render"

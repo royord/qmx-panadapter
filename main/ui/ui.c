@@ -12,6 +12,7 @@ LV_FONT_DECLARE(qmx_mono_25);   /* shared with the radio-menus screen */
 #include "render_waterfall.h"
 #include "dsp.h"
 #include "audio.h"    // audio_note_dial_hz - #298
+#include "radio.h"    // which radio drives the panadapter's baseband mapping
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -117,10 +118,18 @@ static int16_t s_cw_cal_hz = 0;  // loaded from NVS at boot, default -60
 // removed in 2026-08 - see the settings note below.)
 int ui_get_if_offset_hz(void)
 {
-    int total_hz = IF_OFFSET_HZ;
-    const char *m = cat_get_mode_str();
-    if (m && strcmp(m, "CW") == 0)
-        total_hz += cat_get_cw_offset_hz() + (int)s_cw_cal_hz;
+    int total_hz;
+    if (radio_get_kind() == RADIO_KX3) {
+        /* The KX3's I/Q is a true baseband capture centred EXACTLY on the VFO:
+         * whatever is tuned to appears at baseband 0. (The QMX's I/Q is the
+         * exception, not the rule - this firmware's naming grew up around it.) */
+        total_hz = 0;
+    } else {
+        total_hz = IF_OFFSET_HZ;
+        const char *m = cat_get_mode_str();
+        if (m && strcmp(m, "CW") == 0)
+            total_hz += cat_get_cw_offset_hz() + (int)s_cw_cal_hz;
+    }
 
     // RIT: keep the signals STILL (Bill Carver's requirement - with RIT engaged
     // the display must not slide, it should mark where you are listening).

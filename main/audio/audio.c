@@ -1,5 +1,6 @@
 #include "audio.h"
 #include "cat.h"          // cat_is_ready - the dead-stream watchdog's CAT-alive test
+#include "radio.h"        // which UAC device carries the I/Q stream (KX3: the dongle)
 #include "usb_replug.h"   // the dead-stream watchdog's escalation
 #include "util/usb_patch_counters.h"  // #189: report the silent USB patches' counts
 #include "util/sock_probe.h"          // #313: socket-exhaustion canary
@@ -513,8 +514,10 @@ static inline int32_t s24_to_s32(const uint8_t *p)
 
 // Returns true if this poll actually moved audio. The caller uses that to decide
 // whether to yield: see audio_task().
-// Bytes left over from the previous read when it did not end on a whole 6-byte
-// stereo frame, carried into the next one.
+// Bytes left over from the previous read when it did not end on a whole stereo
+// frame, carried into the next one. A frame is 3 bytes I + 3 bytes Q on 24-bit
+// streams (the QMX) or 2 bytes I + 2 bytes Q on 16-bit streams (a line-in
+// dongle); the byte budget below covers the largest, 6.
 //
 // WHY THIS EXISTS. The stream is 3 bytes I + 3 bytes Q, and NOTHING in the path
 // re-synchronises it. `pairs = bytes_read / 6` used to discard the remainder, so
@@ -540,10 +543,12 @@ static inline int32_t s24_to_s32(const uint8_t *p)
 // frames are not happening and the mirror images have another cause.
 static bool process_rx(void)
 {
-    // Raw 24-bit packed bytes from the QMX
+    // Raw packed bytes from the I/Q UAC source (24-bit = 3B I + 3B Q per pair,
+    // 16-bit = 2B I + 2B Q per pair).
     static uint8_t raw[RX_BUF_BYTES];
-    // Decoded int16 stereo pairs (max half the bytes from raw, since 6B->4B)
-    static int16_t decoded[(RX_BUF_BYTES / 6) * 2 + 2];
+    // Decoded int16 stereo pairs, sized for the SMALLEST frame (4 B/pair) so
+    // the worst-case pair count fits. 24-bit fills proportionally fewer.
+    static int16_t decoded[(RX_BUF_BYTES / 4) * 2 + 2];
 
     // Whether this call moved any audio at all. NOT simply "the last read
     // returned data": the drain loop always ends on an empty read, so a healthy
@@ -572,17 +577,22 @@ static bool process_rx(void)
             return got_data;
         }
 
-        // Each stereo pair = 6 bytes (3B L + 3B R, little-endian signed 24-bit)
+        // Each stereo pair is 6 bytes (3B I + 3B Q, little-endian signed
+        // 24-bit) on the QMX, or 4 bytes (2B I + 2B Q, little-endian signed
+        // 16-bit) on a typical line-in dongle. Frame size comes from the
+        // bit depth this stream negotiated, so the pair count and carry are
+        // correct for whichever device is feeding us.
+        size_t bpp = (s_bit_res > 16) ? 6 : 4;
         size_t avail = s_carry_len + bytes_read;
-        size_t pairs = avail / 6;
-        size_t rem   = avail - pairs * 6;
+        size_t pairs = avail / bpp;
+        size_t rem   = avail - pairs * bpp;
 
         // Keep the partial frame for the next read instead of dropping it.
         // Dropping is what shifted the I/Q interleave permanently.
         if (rem) {
             s_misalign_events++;
             s_misalign_bytes += (uint32_t)rem;
-            memcpy(s_carry, raw + pairs * 6, rem);
+            memcpy(s_carry, raw + pairs * bpp, rem);
         }
         s_carry_len = rem;
 
@@ -599,26 +609,38 @@ static bool process_rx(void)
 
         int16_t local_peak_L = s_peak_left;
         int16_t local_peak_R = s_peak_right;
+        bool swap_iq = radio_iq_swap();
 
         for (size_t i = 0; i < pairs; i++) {
-            const uint8_t *p = raw + 6*i;
-            int32_t L = s24_to_s32(p);
-            int32_t R = s24_to_s32(p + 3);
-            int32_t Ls = L >> 8;
-            int32_t Rs = R >> 8;
-            if (Ls > 32767) Ls = 32767; else if (Ls < -32768) Ls = -32768;
-            if (Rs > 32767) Rs = 32767; else if (Rs < -32768) Rs = -32768;
+            const uint8_t *p = raw + bpp * i;
+            int32_t L, R;
+            if (bpp == 6) {
+                L = s24_to_s32(p) >> 8;
+                R = s24_to_s32(p + 3) >> 8;
+            } else {
+                L = (int16_t)(p[0] | (p[1] << 8));
+                R = (int16_t)(p[2] | (p[3] << 8));
+            }
+            if (L > 32767) L = 32767; else if (L < -32768) L = -32768;
+            if (R > 32767) R = 32767; else if (R < -32768) R = -32768;
 
-            int16_t Is = (int16_t)Ls;
-            int16_t Qs = (int16_t)Rs;
+            int16_t Is = (int16_t)L;
+            int16_t Qs = (int16_t)R;
+
+            // Peaks from the raw decode, BEFORE balance/swap correction - same
+            // as the historical behaviour; the correction is a sample-tweak,
+            // not something the level meters should track.
+            int16_t aL = (L < 0) ? (int16_t)-L : (int16_t)L;
+            int16_t aR = (R < 0) ? (int16_t)-R : (int16_t)R;
+            if (aL > local_peak_L) local_peak_L = aL;
+            if (aR > local_peak_R) local_peak_R = aR;
+
+            if (swap_iq) {
+                int16_t t = Is; Is = Qs; Qs = t;
+            }
             iq_balance_apply(&Is, &Qs);
             decoded[2*i]     = Is;
             decoded[2*i + 1] = Qs;
-
-            int16_t aL = (Ls < 0) ? (int16_t)-Ls : (int16_t)Ls;
-            int16_t aR = (Rs < 0) ? (int16_t)-Rs : (int16_t)Rs;
-            if (aL > local_peak_L) local_peak_L = aL;
-            if (aR > local_peak_R) local_peak_R = aR;
         }
 
         s_peak_left = local_peak_L;
@@ -647,6 +669,20 @@ static bool process_rx(void)
 
 static esp_err_t open_and_start(uint8_t addr, uint8_t iface_num)
 {
+    /* The panadapter's audio is the configured I/Q UAC source. On the QMX that
+     * is the radio's own device; with a KX3 the I/Q comes from a separate
+     * line-in dongle AND the KX3's own USB audio (demodulated AF) also shows up
+     * as a UAC on the same bus - which must be left alone. Everything below
+     * follows this VID/PID, so only the source opens. */
+    uint16_t iq_vid, iq_pid;
+    radio_iq_vid_pid(&iq_vid, &iq_pid);
+    if ((iq_vid | iq_pid) == 0) {
+        ESP_LOGE(TAG, "I/Q source not configured (radio=%s, VID/PID 0:0) - "
+                      "panadapter stays silent. Set it with radio_set_dongle_vid_pid().",
+                 radio_kind_name());
+        return ESP_ERR_NOT_FOUND;
+    }
+
     const uac_host_device_config_t dev_cfg = {
         .addr = addr,
         .iface_num = iface_num,
@@ -657,11 +693,51 @@ static esp_err_t open_and_start(uint8_t addr, uint8_t iface_num)
     };
     esp_err_t err = uac_host_device_open(&dev_cfg, &s_uac_dev);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "device_open(addr=%u iface=%u) failed: 0x%x (%s)",
+        /* The connect event named a device we could not open - most likely the
+         * OTHER UAC on the bus (a KX3's AF audio), or a device mid
+         * enumeration. Fall back to the configured I/Q source by VID/PID so a
+         * race between the two UAC connects cannot strand the panadapter. */
+        ESP_LOGW(TAG, "device_open(addr=%u iface=%u) failed: 0x%x (%s) - "
+                      "trying the configured I/Q source by VID/PID",
                  addr, iface_num, err, esp_err_to_name(err));
-        return err;
+        err = uac_host_device_open_with_vid_pid(iq_vid, iq_pid, &dev_cfg, &s_uac_dev);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "I/Q source %04X:%04X not openable: 0x%x (%s)",
+                     iq_vid, iq_pid, err, esp_err_to_name(err));
+            return err;
+        }
     }
-    ESP_LOGI(TAG, "Device opened (addr=%u iface=%u)", addr, iface_num);
+
+    /* Identify what we actually have open. Two cases: the event device IS the
+     * configured source (QMX, or a dongle whose event won the race), or it is
+     * a different UAC and the id-based reopen above just swapped it. In both
+     * cases the READ shows the truth; if it is still not the source, drop it
+     * and take the id-based path for real. This line is also the bus dump that
+     * names a new dongle/KX3 for setting radio_set_dongle_vid_pid(). */
+    {
+        uac_host_dev_info_t info = {0};
+        if (uac_host_get_device_info(s_uac_dev, &info) == ESP_OK) {
+            if (info.VID != iq_vid || info.PID != iq_pid) {
+                ESP_LOGW(TAG, "UAC at addr=%u is %04X:%04X (%ls), NOT the I/Q "
+                              "source %04X:%04X - closing and reopening the right device",
+                         addr, (unsigned)info.VID, (unsigned)info.PID,
+                         info.iProduct, (unsigned)iq_vid, (unsigned)iq_pid);
+                uac_host_device_close(s_uac_dev);
+                s_uac_dev = NULL;
+                err = uac_host_device_open_with_vid_pid(iq_vid, iq_pid, &dev_cfg, &s_uac_dev);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "I/Q source %04X:%04X not openable: 0x%x (%s)",
+                             iq_vid, iq_pid, err, esp_err_to_name(err));
+                    return err;
+                }
+            } else {
+                ESP_LOGI(TAG, "I/Q source open: VID=%04X PID=%04X addr=%u iface=%u",
+                         (unsigned)info.VID, (unsigned)info.PID, addr, iface_num);
+            }
+        } else {
+            ESP_LOGI(TAG, "Device opened (addr=%u iface=%u)", addr, iface_num);
+        }
+    }
 
     uac_host_dev_alt_param_t alt = {0};
     err = uac_host_get_device_alt_param(s_uac_dev, 1, &alt);
@@ -674,6 +750,27 @@ static esp_err_t open_and_start(uint8_t addr, uint8_t iface_num)
     ESP_LOGI(TAG, "Alt 1: channels=%u, %u-bit, first_rate=%lu Hz",
              alt.channels, alt.bit_resolution,
              (unsigned long)alt.sample_freq[0]);
+
+    /* The DSP pipeline is fixed at 48 kHz int16 stereo. A source that is not
+     * 16/24-bit or not 48 kHz would produce a spectrum on the wrong pitch with
+     * no resampler to fall back on - refuse the un-decodable, warn loudly on
+     * the rest so a 44.1 kHz dongle cannot masquerade as a working panadapter. */
+    if (alt.channels != 2) {
+        ESP_LOGW(TAG, "I/Q source is %u-channel - this firmware decodes stereo only",
+                 alt.channels);
+    }
+    if (alt.bit_resolution != 16 && alt.bit_resolution != 24) {
+        ESP_LOGE(TAG, "Unsupported I/Q bit depth %u-bit (16 and 24 only)", alt.bit_resolution);
+        uac_host_device_close(s_uac_dev);
+        s_uac_dev = NULL;
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (alt.sample_freq[0] != 48000) {
+        ESP_LOGW(TAG, "I/Q sample rate %lu Hz != 48000 - the DSP is pinned to "
+                      "48 kHz; the spectrum will be wrong-pitched unless a 48 kHz "
+                      "device is used",
+                 (unsigned long)alt.sample_freq[0]);
+    }
 
     const uac_host_stream_config_t stream_cfg = {
         .channels = alt.channels,
