@@ -18,10 +18,15 @@ static const char *TAG = "radio";
 #define KEY_DONG_VID  "dkr_vid"  /* u32 I/Q line-in dongle */
 #define KEY_DONG_PID  "dkr_pid"
 #define KEY_IQ_SWAP   "iq_swap"  /* u8: flip I/Q channels */
+#define KEY_BAUD      "baud"     /* u32 KX3 CAT baud (QMX is fixed at 38400) */
+#define CAT_BAUD_DEFAULT 38400
+
+bool radio_cat_baud_valid(uint32_t baud);   /* forward decl: load_all() uses it */
 
 static radio_kind_t s_kind = RADIO_QMX;
 static uint16_t s_kx3_vid = 0, s_kx3_pid = 0;
 static uint16_t s_dongle_vid = 0, s_dongle_pid = 0;
+static uint32_t s_baud = CAT_BAUD_DEFAULT;
 static bool     s_iq_swap = false;
 static bool     s_loaded = false;
 
@@ -36,6 +41,7 @@ static void load_all(void)
     if (nvs_get_u32(h, KEY_KX3_PID, &u32) == ESP_OK)  s_kx3_pid   = (uint16_t)u32;
     if (nvs_get_u32(h, KEY_DONG_VID, &u32) == ESP_OK) s_dongle_vid = (uint16_t)u32;
     if (nvs_get_u32(h, KEY_DONG_PID, &u32) == ESP_OK) s_dongle_pid = (uint16_t)u32;
+    if (nvs_get_u32(h, KEY_BAUD, &u32) == ESP_OK)     s_baud      = radio_cat_baud_valid(u32) ? u32 : CAT_BAUD_DEFAULT;
     if (nvs_get_u8(h, KEY_IQ_SWAP, &u8) == ESP_OK)    s_iq_swap   = (u8 != 0);
     nvs_close(h);
     s_loaded = true;
@@ -49,8 +55,8 @@ static void load_all(void)
              s_iq_swap ? 1 : 0);
 
     if (s_kind == RADIO_KX3 && ((s_kx3_vid | s_kx3_pid) == 0)) {
-        ESP_LOGW(TAG, "KX3 CAT identity not set (kx3 VID/PID = 0) - CAT will refuse "
-                      "to open. Set it via radio_set_kx3_vid_pid().");
+        ESP_LOGW(TAG, "KX3 CAT identity not set (kx3 VID/PID = 0) - will open by "
+                      "protocol probe on first plug and learn it.");
     }
     if (s_kind == RADIO_KX3 && ((s_dongle_vid | s_dongle_pid) == 0)) {
         ESP_LOGW(TAG, "I/Q dongle identity not set (VID/PID = 0) - the panadapter "
@@ -133,4 +139,47 @@ void radio_set_dongle_vid_pid(uint16_t vid, uint16_t pid)
     s_dongle_vid = vid; s_dongle_pid = pid;
     store_u32(KEY_DONG_VID, vid);
     store_u32(KEY_DONG_PID, pid);
+}
+
+bool radio_cat_baud_valid(uint32_t baud)
+{
+    return baud == 4800 || baud == 9600 || baud == 19200 || baud == 38400;
+}
+
+uint32_t radio_get_cat_baud(void)
+{
+    /* The QMX is fixed at 38400; only the KX3's stored baud is user-pickable. */
+    if (radio_get_kind() == RADIO_QMX) return CAT_BAUD_DEFAULT;
+    return s_baud;
+}
+
+void radio_set_cat_baud(uint32_t baud)
+{
+    if (!radio_cat_baud_valid(baud)) {
+        ESP_LOGW(TAG, "ignoring baud %lu (must be one of %lu/%lu/%lu/%lu)",
+                 (unsigned long)baud,
+                 (unsigned long)4800, (unsigned long)9600,
+                 (unsigned long)19200, (unsigned long)38400);
+        return;
+    }
+    s_baud = baud;
+    store_u32(KEY_BAUD, baud);
+    ESP_LOGI(TAG, "KX3 CAT baud set to %lu", (unsigned long)baud);
+}
+
+void radio_note_cat_found(uint16_t vid, uint16_t pid)
+{
+    /* Classification: only the QMX answers its probe as a QMX; anything else
+     * that answers FA;/VN; is the Elecraft KX3. The probe only ever runs while
+     * kind or identity is unknown, so this "wins" unconditionally - a QMX
+     * answering a probe recorded when kind==KX3 flips us back to QMX. */
+    radio_kind_t kind = (vid == QMX_VID && pid == QMX_PID) ? RADIO_QMX : RADIO_KX3;
+    radio_set_kind(kind);
+    if (kind == RADIO_KX3) {
+        radio_set_kx3_vid_pid(vid, pid);
+        ESP_LOGW(TAG, "⚡ CAT probe identified a KX3 (%04X:%04X) - pinned for next boot",
+                 vid, pid);
+    } else {
+        ESP_LOGW(TAG, "⚡ CAT probe identified the QMX (%04X:%04X)", vid, pid);
+    }
 }

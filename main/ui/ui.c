@@ -2834,6 +2834,12 @@ static bool s_drawer_swipe_vertical = false;  /* this drag went vertical */
                                  // made the web UI unreachable (#307). Built only
                                  // when a static address is actually configured.
 #define DRAWER_SEC_TUNESNAP  41  /* #347: the tap-to-tune grid, or off */
+#define DRAWER_SEC_KX3BAUD   42  /* KX3 CAT baud (QMX is fixed at 38400 - this
+                                   * section only exists for a KX3 profile).
+                                   * Id 42 was FREE within N_DRAWER_SECTIONS(46);
+                                   * an id beyond the array wrote past it and
+                                   * boot-looped the device on black - see
+                                   * CLAUDE.md. */
 #define DRAWER_SEC_CWPROF    40  /* #359: apply a stored CW profile (centre +
                                   * which filter widths the radio offers). The
                                   * profiles themselves are EDITED on the web
@@ -2988,6 +2994,7 @@ static const drawer_item_t GRP_STATION[] = {
 static const drawer_item_t GRP_RADIO[] = {
     { DRAWER_SEC_QMXVOL, "QMX volume", true },
     { DRAWER_SEC_QMXRF, "RF gain", true },
+    { DRAWER_SEC_KX3BAUD, "KX3 CAT baud", true },
     { DRAWER_SEC_RXAUDIO, "RX audio (speaker/headphone)", false },
     /* Above CW centre (operator, 2026-09-07). It was filed under Spectrum with
      * the drawing controls, but it is not one: it trims the 12 kHz IF offset so
@@ -3284,6 +3291,12 @@ static bool drawer_sec_visible(int id, ui_mode_t mode, bool tune_ok)
 
     if (id == DRAWER_SEC_RESMON)  return false;   // dev-only, driven by /api/cmd
     if (id == DRAWER_SEC_TUNE2)   return tune_ok;
+    /* KX3 CAT baud: the QMX is fixed at 38400 and has no such control, so the
+     * section belongs to a KX3 profile alone. Criteria: the radio kind, not the
+     * mode - the baud is a link property, and it reads back from NVS whenever
+     * the link re-opens, so it is NOT FT8/WSPR-specific and stays on every page
+     * a KX3 is driving. */
+    if (id == DRAWER_SEC_KX3BAUD) return radio_get_kind() == RADIO_KX3;
     /* ⛔ THE WHOLE FT8 GROUP IS OFF THE WSPR PAGE (operator, 2026-09-11: "in
      * settings drawer remove ... FT8 section"). It used to show there for two
      * reasons, both recorded so nobody re-adds them blind:
@@ -3379,6 +3392,7 @@ static lv_obj_t *s_slider_ifcal = NULL;
 static lv_obj_t *s_lbl_cwpitch = NULL;
 static lv_obj_t *s_dropdown_cmap = NULL;
 static lv_obj_t *s_dropdown_bpregion = NULL;  // band-plan region picker
+static lv_obj_t *s_dropdown_kx3baud  = NULL;  // KX3 CAT baud picker
 static lv_obj_t *s_dropdown_swrlim   = NULL;  // SWR protection limit picker
 static lv_obj_t *s_cb_bt             = NULL;  // Bluetooth mouse enable
 // "Restart now", shown only while the setting and the running radio disagree.
@@ -3496,6 +3510,7 @@ static void drawer_dropdown_freqsep_cb(lv_event_t *e);
 static void drawer_dropdown_cmap_open_cb(lv_event_t *e);
 static void drawer_dropdown_sleep_open_cb(lv_event_t *e);
 static void drawer_dropdown_bpregion_cb(lv_event_t *e);
+static void drawer_dropdown_kx3baud_cb(lv_event_t *e);
 static void drawer_dropdown_swrlim_cb(lv_event_t *e);
 static void drawer_spotmode_cb(lv_event_t *e)
 {
@@ -12307,6 +12322,39 @@ static void drawer_build(void)
         y += 96;
     }
 
+    // KX3 CAT baud. The QMX is fixed at 38400 and never shows this section; a
+    // KX3 auto-detects its baud from the first valid command, so this is the
+    // value the LINK OPENS with (see radio_get_cat_baud()) - changing it takes
+    // effect on the next link re-open, and also IMMEDIATELY on a live link via
+    // cat_reconfigure_baud(). Same geometry as the band-plan dropdown above.
+    {
+        lv_obj_t *sec = drawer_section(DRAWER_SEC_KX3BAUD, y, 100);
+        lv_obj_t *hdr = lv_label_create(sec);
+        lv_label_set_text(hdr, "KX3 CAT baud");
+        lv_obj_set_style_text_color(hdr, lv_color_hex(0xA0E0A0), 0);
+        lv_obj_set_style_text_font(hdr, &lv_font_montserrat_28, 0);
+        lv_obj_align(hdr, LV_ALIGN_TOP_LEFT, 0, 0);
+
+        s_dropdown_kx3baud = lv_dropdown_create(sec);
+        lv_dropdown_set_options(s_dropdown_kx3baud,
+                                "38400 (default)\n9600\n19200\n4800");
+        lv_obj_set_size(s_dropdown_kx3baud, DRAWER_W - 32, 50);
+        lv_obj_align(s_dropdown_kx3baud, LV_ALIGN_TOP_LEFT, 0, 40);
+        lv_obj_set_style_text_font(s_dropdown_kx3baud, &lv_font_montserrat_28, 0);
+        {
+            static const uint32_t bauds[] = { 38400, 9600, 19200, 4800 };
+            uint32_t baud = radio_get_cat_baud();
+            for (size_t bi = 0; bi < sizeof(bauds) / sizeof(bauds[0]); bi++)
+                if (bauds[bi] == baud) {
+                    lv_dropdown_set_selected(s_dropdown_kx3baud, bi);
+                    break;
+                }
+        }
+        lv_obj_add_event_cb(s_dropdown_kx3baud, drawer_dropdown_kx3baud_cb, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_obj_add_event_cb(s_dropdown_kx3baud, drawer_dropdown_cmap_open_cb, LV_EVENT_CLICKED, NULL);
+        y += 100;
+    }
+
     // "Let me use the QMX menus" - Stan's pause button, via Samuel W7STF.
     //
     // WORDING, reworded 2026-08-11 after Samuel called the original "not too helpful,
@@ -15207,6 +15255,22 @@ static void drawer_dropdown_bpregion_cb(lv_event_t *e)
     // Refresh the strip right away for the current VFO.
     if (s_last_qmx_freq_hz) update_bandplan_strip(s_last_qmx_freq_hz);
     ESP_LOGI(TAG, "band-plan region set: %u", idx);
+}
+
+static void drawer_dropdown_kx3baud_cb(lv_event_t *e)
+{
+    static const uint32_t bauds[] = { 38400, 9600, 19200, 4800 };
+    uint8_t idx = (uint8_t)lv_dropdown_get_selected(lv_event_get_target(e));
+    if (idx >= sizeof(bauds) / sizeof(bauds[0])) return;
+    uint32_t baud = bauds[idx];
+
+    radio_set_cat_baud(baud);        /* persists; for a QMX get/use ignores it */
+    cat_reconfigure_baud(baud);      /* best-effort on a live link */
+    char toast[48];
+    snprintf(toast, sizeof(toast), "KX3 CAT baud: %lu (next link re-open)",
+             (unsigned long)baud);
+    ui_toast(toast);
+    ESP_LOGI(TAG, "KX3 CAT baud set: %lu", (unsigned long)baud);
 }
 
 static void drawer_slider_wf_black_cb(lv_event_t *e)

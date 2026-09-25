@@ -68,6 +68,45 @@ void radio_set_kind(radio_kind_t kind);
 void radio_set_kx3_vid_pid(uint16_t vid, uint16_t pid);
 void radio_set_dongle_vid_pid(uint16_t vid, uint16_t pid);
 
+/* CAT auto-detect (first-plug, zero-NVS) - protocol probe, NOT vid/pid.
+ *
+ * Long-standing pain (2026-09-15, "I don't understand nvs set or vid/pid... can
+ * we detect this until seen or have a menu to select the radio to connect
+ * to?"): the very first KX3 plug refused to open because the CAT identity
+ * (VID/PID) had to be typed/pinned first imposing a mennonite ceremony before
+ * anything would work. That was wrong in principle: the panadapter OPENED the
+ * QMX by hardcoded 0483:A34C, and now opens the I/Q side by pure class
+ * (audio.c:694, mirroring the dongle self-find) - only CAT demanded an identity
+ * before it would try.
+ *
+ * Now: CAT opens by PROTOCOL PROBE, classifying the radio from what answers
+ * FA;/VN; - QMX (composite 0483:A34C) vs any Kenwood-KX3 CAT CDC. The probe
+ * BOTH:
+ *   - classifies the radio kind (QMX vs KX3) automatically on first plug, and
+ *   - learns and persists the vid/pid into NVS for next-boot speed.
+ * So the user never needs NVS set vid/pid: the radio "until seen" then
+ * remembered. radio_set_kind()/radio_set_kx3_vid_pid() remain as overrides.
+ *
+ * -----------------------------------------------------------------------------
+ * ⛔ BUILD ISOLATION 2026-09-23: the ONE primitive below that needs a build-time
+ * confirmation is `usb_host_get_device_descriptor()` (acked in audio.c via
+ * uac_host_device_open(addr-less), and here via the USB-Host device handle the
+ * CDC new-dev callback hands us). If the esp-usb CDC-ACM component in your
+ * managed_components version differs, this is the seam to fix - everything else
+ * in this probe uses only primitives already proven in-tree (cdc_acm_host_open,
+ * data_tx_blocking, the -extra-port probe helpers in cat.c). */
+void radio_note_cat_found(uint16_t vid, uint16_t pid); /* probe found a radio's CAT: classify + persist */
+
+/* KX3 CAT baud. The QMX is fixed at 38400 (its firmware only speaks that); the
+ * KX3 auto-detects baud from its first valid command, so this value only
+ * matters for what the link and the probe try FIRST. Persists immediately;
+ * unset defaults to 38400. A wrong value self-heals: the probe falls through to
+ * the remaining bauds, and radio_get_cat_baud() never returns anything but
+ * 38400 while kind == RADIO_QMX. */
+bool     radio_cat_baud_valid(uint32_t baud);          /* 4800/9600/19200/38400 */
+uint32_t radio_get_cat_baud(void);                     /* policy: 38400 for QMX, else stored */
+void     radio_set_cat_baud(uint32_t baud);
+
 #ifdef __cplusplus
 }
 #endif

@@ -565,6 +565,7 @@ static void cat_rx_queue_init(void);
 static bool cat_rx_queue_ready(void);
 static void handle_cdc_event(const cdc_acm_host_dev_event_data_t *event, void *user_ctx);
 static esp_err_t try_open_cat(void);
+static void cat_probe_new_dev_sink(usb_device_handle_t usb_dev);
 static void process_cat_message(const char *msg, size_t len);
 static void diag_log_rx(const char *msg, size_t len);
 
@@ -582,6 +583,17 @@ err = cdc_acm_host_install(NULL);
         return err;
     }
     ESP_LOGI(TAG, "CDC-ACM host driver installed");
+
+    /* First-plug radio auto-detect: any new USB device may BE the radio, so
+     * watch for arrivals. The callback runs on the USB host task context and
+     * must only record the arrival - link_task() owns the CDC pipe and runs
+     * the actual probe. Registration failure is survivable: the bus walk in
+     * cat_probe_cat_by_protocol() still finds the radio, only less promptly. */
+    esp_err_t nerr = cdc_acm_host_register_new_dev_callback(cat_probe_new_dev_sink);
+    if (nerr != ESP_OK) {
+        ESP_LOGW(TAG, "new-dev callback registration failed: 0x%x - radio will "
+                      "only be found by bus walk", nerr);
+    }
 
     /* CAT RX processing, off the USB task - see handle_rx(). Created BEFORE the
      * link task, so the first byte the radio sends has somewhere to go. */
@@ -1026,13 +1038,13 @@ static void process_cat_message(const char *msg, size_t len)
         size_t ulen = len - 3;
         if (ulen >= sizeof(s_qmx_uid)) ulen = sizeof(s_qmx_uid) - 1;
         memcpy(s_qmx_uid, msg + 2, ulen);
-        s_qmx_uid[ulen] = ' ';
+        s_qmx_uid[ulen] = '\0';
         bool hex = ulen >= 16;
         for (size_t i = 0; i < ulen && hex; i++)
             if (!isxdigit((unsigned char)s_qmx_uid[i])) hex = false;
         if (!hex) {
             ESP_LOGW(TAG, "QMX unique id not recognised ('%s') - ignoring", s_qmx_uid);
-            s_qmx_uid[0] = ' ';
+            s_qmx_uid[0] = '\0';
         } else {
             ESP_LOGI(TAG, "QMX unique id: %s", s_qmx_uid);
             settings_radio_identity_changed(s_qmx_uid);
@@ -1200,17 +1212,193 @@ int cat_probe_terminal(void)
     return n;
 }
 
+/* ── CAT identity auto-probe (rig-control, 2026-09-23) ────────────────────────
+ * First-plug convention, and the whole reason `try_open_cat` no longer REFUSES
+ * on 0:0: the radio's own identity arrives ON THE BUS, not in NVS. Wid Opsik,
+ * "I don't understand nvs set or vid/pid can we detect this until seen or have
+ * a menu to select the radio to connect to?" - so CAT works by protocol probe,
+ * mirroring how the I/Q side already self-finds its UAC dongle (audio.c:694,
+ * `uac_host_device_open`, no vid/pid involved). NVS stays as a CACHE for the
+ * next boot, never as a first-plug requirement.
+ *
+ * Two radio kinds, identical CAT wire protocol (Kenwood two-byte command +
+ * ";" terminator, both answer `ID;` and `VN;`):
+ *   - QMX: fixed composite VID_PID 0483:A34C, CAT + I/Q on ONE device.
+ *   - KX3: CAT on its own CDC (users run it through a USB-serial dongle whose
+ *     VID/PID nobody can be expected to know), I/Q from a separate UAC dongle.
+ *
+ * The probe therefore has nothing to identify BEFORE it opens — it opens the
+ * first CDC device on the bus that "behaves like CAT" and CLASSIFIES the radio
+ * from the answer: `VN;` -> contains "QMX" -> RADIO_QMX, anything else that
+ * answers VN;/FA; is an Elecraft-family (RADIO_KX3). Identity is then promoted
+ * into NVS via radio_note_cat_found() so the second boot skips the bus walk. */
+static volatile bool s_new_dev_pending = false;          /* a CDC appeared while
+                                                          * probe was idle */
+static void cat_probe_new_dev_sink(usb_device_handle_t usb_dev)
+{
+    /* Runs on the USB host task context - do NOT open here. Record the arrival
+     * and let link_task() re-enter the probe (it owns the CDC pipe). */
+    (void)usb_dev;
+    s_new_dev_pending = true;
+    ESP_LOGI(TAG, "new USB device arrived - %s link probe will re-run",
+             radio_kind_name());
+}
+
+/* ---- the protocol probe itself --------------------------------------------
+ * Opening and talking to a radio is exactly what try_open_cat() does with a
+ * pinned identity, so the probe reuses its CALLBACK STRUCT only in shape - the
+ * probe must never touch handle_rx/process_cat_message (those feed the whole
+ * UI), so it captures into a scratch buffer through cat_probe_rx() instead and
+ * the real open happens AFTER classification, via try_open_cat(). */
+#define CAT_PROBE_RESP_CAP 64
+static char        s_probe_resp[CAT_PROBE_RESP_CAP];
+static volatile size_t s_probe_len = 0;
+
+static bool cat_probe_rx(const uint8_t *data, size_t data_len, void *user_arg)
+{
+    (void)user_arg;
+    for (size_t i = 0; i < data_len && s_probe_len < CAT_PROBE_RESP_CAP - 1; i++)
+        s_probe_resp[s_probe_len++] = (char)data[i];
+    s_probe_resp[s_probe_len] = '\0';   /* keep it a string for strstr()/prefix checks */
+    return true;
+}
+
+/* Send one 3-byte command and wait up to 500 ms for a reply that echoes its
+ * two-letter prefix (QMX and KX3 both echo "VN"-/enumeration-style answers).
+ * Returns true on a CAT-shaped answer, false when the baud/device is wrong. */
+static bool probe_wait_reply(cdc_acm_dev_hdl_t h, const char *cmd)
+{
+    s_probe_len = 0;
+    esp_err_t e = cdc_acm_host_data_tx_blocking(h, (const uint8_t *)cmd, 3, 200);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "probe: '%s' TX failed: 0x%x", cmd, e);
+        return false;
+    }
+    for (int i = 0; i < 50; i++) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if (s_probe_len >= 2 && s_probe_resp[0] == cmd[0] && s_probe_resp[1] == cmd[1])
+            return true;
+    }
+    return false;
+}
+
+/* Talk to an opened CDC device across the candidate bauds. Returns:
+ *    1  a QMX answered (proto reply contains "QMX") - classify it QMX;
+ *    0  a CAT-speaking radio answered but never named QMX - Elecraft family;
+ *   -1  nothing CAT-shaped answered at any baud - not the radio.
+ * The KX3 auto-detects baud from its first valid command, so a WRONG
+ * configured baud only costs a few extra probe rounds, never a miss. */
+static int probe_talk(cdc_acm_dev_hdl_t h)
+{
+    uint32_t want = radio_get_cat_baud();
+    static const uint32_t kx3_bauds[] = { 38400, 9600, 19200, 4800 };
+    uint32_t order[1 + sizeof(kx3_bauds) / sizeof(kx3_bauds[0])];
+    size_t n = 0;
+    order[n++] = want;
+    for (size_t i = 0; i < sizeof(kx3_bauds) / sizeof(kx3_bauds[0]); i++) {
+        bool dup = false;
+        for (size_t j = 0; j < n; j++)
+            if (order[j] == kx3_bauds[i]) { dup = true; break; }
+        if (!dup) order[n++] = kx3_bauds[i];
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        const cdc_acm_line_coding_t lc = {
+            .dwDTERate = order[i], .bCharFormat = 0, .bParityType = 0, .bDataBits = 8,
+        };
+        cdc_acm_host_line_coding_set(h, &lc);
+        cdc_acm_host_set_control_line_state(h, true, true);
+        ESP_LOGI(TAG, "probe: %lu baud, sending VN;", (unsigned long)order[i]);
+        if (probe_wait_reply(h, "VN;")) {
+            ESP_LOGI(TAG, "probe: %lu baud answered '%.*s'",
+                     (unsigned long)order[i], (int)s_probe_len, s_probe_resp);
+            return strstr(s_probe_resp, "QMX") ? 1 : 0;
+        }
+        /* VN; is implemented by both radios, so FA; as a plan B only fires when
+         * a device answers CAT but not the version query - treat it as Elecraft. */
+        if (probe_wait_reply(h, "FA;")) {
+            ESP_LOGI(TAG, "probe: %lu baud answered '%.*s' (no VN)",
+                     (unsigned long)order[i], (int)s_probe_len, s_probe_resp);
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* Walk the USB bus, open each CDC interface 0, and PROTOCOL-probe it for a
+ * CAT-speaking radio. On a hit: classify, pin the identity into NVS
+ * (radio_note_cat_found), and reopen for real via try_open_cat(). */
+static esp_err_t cat_probe_cat_by_protocol(void)
+{
+    enum { MAX_DEVS = 24 };
+    usb_device_info_t devs[MAX_DEVS];
+    int n = 0;
+    esp_err_t err = usb_host_device_info_list(MAX_DEVS, devs, &n);
+    if (err != ESP_OK || n <= 0) {
+        ESP_LOGE(TAG, "CAT probe: bus walk failed (0x%x, %d device(s))", err, n);
+        return ESP_ERR_NOT_FOUND;
+    }
+    ESP_LOGI(TAG, "CAT probe: scanning %d USB device(s) for a CAT-speaking CDC", n);
+
+    const cdc_acm_host_device_config_t cfg = {
+        .connection_timeout_ms = 1000,
+        .out_buffer_size = 64,
+        .in_buffer_size  = 64,
+        .event_cb = NULL,
+        .data_cb  = cat_probe_rx,
+        .user_arg = NULL,
+    };
+
+    for (int i = 0; i < n; i++) {
+        const usb_device_desc_t *dd = NULL;
+        err = usb_host_get_device_descriptor(devs[i].dev_hdl, &dd);
+        if (err != ESP_OK || !dd) {
+            ESP_LOGI(TAG, "CAT probe: device %u no descriptor (0x%x)",
+                     devs[i].dev_addr, err);
+            continue;
+        }
+        uint16_t vid = dd->idVendor, pid = dd->idProduct;
+
+        cdc_acm_dev_hdl_t h = NULL;
+        esp_err_t e = cdc_acm_host_open(vid, pid, 0, &cfg, &h);
+        if (e != ESP_OK || !h) {
+            ESP_LOGI(TAG, "CAT probe: %04X:%04X not a CDC/serial port (0x%x)", vid, pid, e);
+            continue;   /* UAC dongle, etc. */
+        }
+
+        int kind = probe_talk(h);
+        cdc_acm_host_close(h);
+        if (kind < 0) {
+            ESP_LOGI(TAG, "CAT probe: %04X:%04X answered no CAT at any baud", vid, pid);
+            continue;
+        }
+
+        ESP_LOGW(TAG, "⚡ CAT probe: %04X:%04X identified as %s (baud scan done)",
+                 vid, pid, kind == 1 ? "QMX" : "KX3");
+        radio_note_cat_found(vid, pid);
+        s_probe_len = 0;
+        return try_open_cat();   /* pin in NVS; reopen with the real cfg + poll */
+    }
+
+    ESP_LOGW(TAG, "CAT probe: no CAT-speaking CDC found on the bus");
+    return ESP_ERR_NOT_FOUND;
+}
+
 static esp_err_t try_open_cat(void)
 {
-    /* Open the radio's OWN CDC (QMX: its composite; KX3: its USB serial).
-     * "ID;" answers on both radios, so it doubles as the alive-check. */
+    /* Open the radio's own CAT (CDC-ACM). When its identity is not pinned in
+     * NVS yet (KX3 first plug), do NOT refuse - probe by protocol instead, the
+     * same way the audio path self-finds its dongle. */
     uint16_t vid, pid;
     radio_cat_vid_pid(&vid, &pid);
+
     if ((vid | pid) == 0) {
-        ESP_LOGE(TAG, "CAT device identity not set (radio=%s VID/PID 0:0) - "
-                      "set it with radio_set_kx3_vid_pid().",
+        /* First KX3 plug, or identity never set: discover by protocol. `ID;`
+         * and `VN;` classify the radio kind, which then pins it into NVS. */
+        ESP_LOGW(TAG, "%s CID 0:0 - probing bus for a CAT-speaking CDC "
+                      "(Kenwood FA;/VN;), radio kind unset",
                  radio_kind_name());
-        return ESP_ERR_NOT_FOUND;
+        return cat_probe_cat_by_protocol();
     }
 
     const cdc_acm_host_device_config_t cfg = {
@@ -1227,8 +1415,9 @@ static esp_err_t try_open_cat(void)
 
     ESP_LOGI(TAG, "%s CDC opened (%04X:%04X)", radio_kind_name(), vid, pid);
 
+    const uint32_t baud = radio_get_cat_baud();
     const cdc_acm_line_coding_t lc = {
-        .dwDTERate = CAT_BAUD_RATE,
+        .dwDTERate = baud,
         .bCharFormat = 0,
         .bParityType = 0,
         .bDataBits = 8,
@@ -1240,7 +1429,7 @@ static esp_err_t try_open_cat(void)
     }
 
     cdc_acm_host_set_control_line_state(s_cdc_dev, true, true);
-    ESP_LOGI(TAG, "%s configured: %d baud, 8N1", radio_kind_name(), CAT_BAUD_RATE);
+    ESP_LOGI(TAG, "%s configured: %lu baud, 8N1", radio_kind_name(), (unsigned long)baud);
 
     cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"ID;", 3, 500);
 
@@ -1253,6 +1442,32 @@ static esp_err_t try_open_cat(void)
     }
 
     return ESP_OK;
+}
+
+/* KX3 CAT baud change on a LIVE link (drawer dropdown). Best-effort: the KX3
+ * auto-detects its baud from the next valid command, so even a successfully
+ * re-configured link self-heals if the radio does not answer - a string of
+ * quiet polls trips the RX watchdog and the link re-opens, which then uses the
+ * freshly stored baud via radio_get_cat_baud(). A no-op with no radio open. */
+void cat_reconfigure_baud(uint32_t baud)
+{
+    if (!s_cdc_dev) {
+        ESP_LOGI(TAG, "baud reconfigure requested but no radio open - next link "
+                      "open will use it (radio_get_cat_baud)");
+        return;
+    }
+    const cdc_acm_line_coding_t lc = {
+        .dwDTERate = baud, .bCharFormat = 0, .bParityType = 0, .bDataBits = 8,
+    };
+    esp_err_t e = cdc_acm_host_line_coding_set(s_cdc_dev, &lc);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "live baud change to %lu failed: 0x%x - takes effect on "
+                      "the next link re-open", (unsigned long)baud, e);
+        return;
+    }
+    ESP_LOGW(TAG, "live baud change to %lu - power-cycle the KX3 if it does not "
+                  "answer; it re-syncs on the next valid command",
+             (unsigned long)baud);
 }
 
 // ---- CW transmit offset (Roy KI0ER, 2026-08-07) ----------------------------
@@ -2810,7 +3025,17 @@ static void link_task(void *arg)
                 cdc_acm_host_close(dev);
             }
         } else {
-            vTaskDelay(pdMS_TO_TICKS(2000));
+            /* A new USB device appeared while we were waiting - do not sit out
+             * the full 2 s, the probe wants to re-run and meet it promptly. Any
+             * other failure is the normal "nothing plugged yet" pace. */
+            size_t delay_ms = 2000;
+            if (s_new_dev_pending) {
+                s_new_dev_pending = false;
+                delay_ms = 100;
+                ESP_LOGI(TAG, "new device pending - re-probing in %u ms",
+                         (unsigned)delay_ms);
+            }
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
         }
     }
 }

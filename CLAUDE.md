@@ -2,7 +2,7 @@
 
 ESP-IDF firmware for M5Stack Tab5 (ESP32-P4). Real-time panadapter for the QRP Labs QMX/QMX+ HF transceiver: USB host captures IQ audio (UAC) + CAT (CDC-ACM), FFT runs on-device, spectrum + waterfall rendered on the 5" touch display (landscape 1280×720).
 
-**Detailed project truth has been moved to the memory system** (C:/Users/Steffen/.claude/projects/C--dev-qmx-panadapter/memory/) to keep sessions fast. This file contains only build essentials and the most critical operational rules.
+**Detailed project truth lives in `memory/`** (in-repo — MEMORY.md is the readme-denying index; build essentials + the few rules that must never drift stay here).
 
 ## Build & flash
 
@@ -32,7 +32,7 @@ instruction. Ask, or wait for the word.
 
 ## ⛔⛔ CRITICAL: THE QMX NEVER SURVIVES A FLASH
 
-**Every flash with the radio attached wedges the QMX** (#74). It ALWAYS needs a manual power cycle by the operator afterwards. No exceptions. See [full rule](../../../memory/project_qmx_flash_wedge.md).
+**Every flash with the radio attached wedges the QMX** (#74). It ALWAYS needs a manual power cycle by the operator afterwards. No exceptions. See [full rule](memory/project_qmx_flash_wedge.md).
 
 Standing rule:
 1. Before flashing with radio attached: announce it needs a power cycle
@@ -41,7 +41,7 @@ Standing rule:
 
 ## ⛔ FOUR boards share this machine — resolve by BENCH NAME
 
-Use `bench flash <name>`, `bench capture <name>`, `bench antenna <name>`. See [bench setup](../../../memory/project_bench_setup.md) for the registry and MAC addresses. All four boards enumerate as `VID_303A&PID_1001` with no serial number—the COM port follows the socket, not the board.
+Use `bench flash <name>`, `bench capture <name>`, `bench antenna <name>`. See [bench setup](memory/project_bench_setup.md) for the registry and MAC addresses. All four boards enumerate as `VID_303A&PID_1001` with no serial number—the COM port follows the socket, not the board.
 
 ## Standing patches (MUST be applied before build)
 
@@ -60,15 +60,15 @@ refresh, or the release's `rm -r managed_components/` wipes them. All are idempo
 ⚠ **A release is the first time a component upgrade can break a patch**, because only
 the release re-fetches. At v1.16.0 `apply_cdc_acm_close_tolerant.ps1` stopped matching
 upstream and the build was correctly refused — see
-[patch went stale](../../../memory/project_standing_patch_went_stale_cdc_acm.md).
+[patch went stale](memory/project_standing_patches.md).
 When a clean build fails, **read `build/log/idf_py_stdout_output_*`**, not idf.py's
 summary: it prints an unrelated `PRI` format-specifier HINT that reads like the cause.
 
-See [patches detail](../../../memory/project_standing_patches.md).
+See [patches detail](memory/project_standing_patches.md).
 
 ## Serial capture rules
 
-**Capture is the diagnostic record** — see [full serial capture rules](../../../memory/project_serial_capture.md). Quick version:
+**Capture is the diagnostic record** — see [full serial capture rules](memory/project_serial_capture.md). Quick version:
 
 1. Use `bench capture <name>` (scheduled task, survives app updates)
 2. Never stop and restart in the same PowerShell call
@@ -78,15 +78,16 @@ See [patches detail](../../../memory/project_standing_patches.md).
 ## Project documentation
 
 Detailed sections moved to memory for session speed:
-- [Module map](../../../memory/project_module_map.md) — main/ directory structure
-- [Critical quirks](../../../memory/project_critical_quirks.md) — hardware, firmware hazards
-- [Display layout](../../../memory/project_display_layout.md) — 1280×720 panels
-- [CAT protocol](../../../memory/project_cat_protocol.md) — QMX commands
-- [RTC and time sync](../../../memory/project_rtc_time_sync.md)
-- [Bench setup](../../../memory/project_bench_setup.md) — MAC, COM, antenna
-- [Diagnostic logging](../../../memory/project_diagnostic_logging.md)
-- [FT8/FT4 features](../../../memory/project_ft8_features.md)
-- [Release process](../../../memory/project_release_process.md)
+- [Module map](memory/project_module_map.md) — main/ directory structure
+- [Critical quirks](memory/project_critical_quirks.md) — hardware, firmware hazards
+- [Display layout](memory/project_display_layout.md) — 1280×720 panels
+- [CAT protocol](memory/project_cat_protocol.md) — QMX + KX3 commands
+- [KX3 support](memory/project_kx3_support.md) — protocol auto-probe + baud (branch kx3, unbuilt)
+- [RTC and time sync](memory/project_rtc_time_sync.md)
+- [Bench setup](memory/project_bench_setup.md) — MAC, COM, antenna
+- [Diagnostic logging](memory/project_diagnostic_logging.md)
+- [FT8/FT4 features](memory/project_ft8_features.md)
+- [Release process](memory/project_release_process.md)
 
 See MEMORY.md index for complete topic list.
 

@@ -155,6 +155,13 @@ int64_t cat_last_rx_us(void);
 // can own it and never disturb the CAT poll.
 int cat_probe_extra_cdc_ports(void);
 
+// Ask an OPEN CAT link to move to a new baud immediately (best-effort; the
+// stored value stays radio_set_cat_baud()'s business). The KX3 re-syncs on the
+// next valid command, and if it does not, the RX watchdog re-opens the link at
+// the stored baud - so this can never leave the radio stranded. No-op with no
+// radio open. QMX is fixed at 38400; do not call for it.
+void cat_reconfigure_baud(uint32_t baud);
+
 // Open the QMX's SECOND serial port (interface 5), send Enter, and hex-dump what
 // comes back to the log. Returns the byte count, or -1 if the port would not
 // open. CAT on port 1 is untouched throughout.
