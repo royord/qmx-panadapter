@@ -678,7 +678,8 @@ static esp_err_t open_and_start(uint8_t addr, uint8_t iface_num)
     radio_iq_vid_pid(&iq_vid, &iq_pid);
     if ((iq_vid | iq_pid) == 0) {
         ESP_LOGE(TAG, "I/Q source not configured (radio=%s, VID/PID 0:0) - "
-                      "panadapter stays silent. Set it with radio_set_dongle_vid_pid().",
+                      "panadapter stays silent. On a KX3 set the dongle's VID:PID "
+                      "in the settings drawer (I/Q dongle).",
                  radio_kind_name());
         return ESP_ERR_NOT_FOUND;
     }
@@ -713,7 +714,7 @@ static esp_err_t open_and_start(uint8_t addr, uint8_t iface_num)
      * a different UAC and the id-based reopen above just swapped it. In both
      * cases the READ shows the truth; if it is still not the source, drop it
      * and take the id-based path for real. This line is also the bus dump that
-     * names a new dongle/KX3 for setting radio_set_dongle_vid_pid(). */
+     * names a new dongle/KX3 to type into the drawer's "I/Q dongle" picker. */
     {
         uac_host_dev_info_t info = {0};
         if (uac_host_get_device_info(s_uac_dev, &info) == ESP_OK) {
@@ -747,16 +748,34 @@ static esp_err_t open_and_start(uint8_t addr, uint8_t iface_num)
         s_uac_dev = NULL;
         return err;
     }
-    ESP_LOGI(TAG, "Alt 1: channels=%u, %u-bit, first_rate=%lu Hz",
-             alt.channels, alt.bit_resolution,
-             (unsigned long)alt.sample_freq[0]);
+    /* Log the WHOLE rate set, not just the first entry. The first entry is not
+     * the rate we are about to use, and on a continuous-range device it is not
+     * even a rate (it is the bottom of the range) - so a one-line "first_rate"
+     * log sent whoever is debugging this to the wrong conclusion. */
+    ESP_LOGI(TAG, "Alt 1: channels=%u, %u-bit, %u discrete rate(s)",
+             alt.channels, alt.bit_resolution, alt.sample_freq_type);
+    if (alt.sample_freq_type > 0) {
+        uint32_t n = alt.sample_freq_type;
+        if (n > UAC_FREQ_NUM_MAX) n = UAC_FREQ_NUM_MAX;
+        for (uint32_t i = 0; i < n; i++)
+            ESP_LOGI(TAG, "    offers %lu Hz",
+                     (unsigned long)alt.sample_freq[i]);
+    } else {
+        ESP_LOGI(TAG, "    offers a continuous %lu-%lu Hz range",
+                 (unsigned long)alt.sample_freq_lower,
+                 (unsigned long)alt.sample_freq_upper);
+    }
 
-    /* The DSP pipeline is fixed at 48 kHz int16 stereo. A source that is not
-     * 16/24-bit or not 48 kHz would produce a spectrum on the wrong pitch with
-     * no resampler to fall back on - refuse the un-decodable, warn loudly on
-     * the rest so a 44.1 kHz dongle cannot masquerade as a working panadapter. */
+    /* The DSP pipeline is fixed at 48 kHz int16 stereo, with no resampler
+     * anywhere. Anything it cannot be fed directly is refused rather than
+     * tolerated: a spectrum drawn at the wrong rate is an instrument that
+     * looks right and reads wrong. Bit depth and sample rate are both hard
+     * errors below. Channel count stays a warning only - a mono source still
+     * produces a usable (if half-width) display, and refusing it would turn a
+     * degraded picture into no picture at all. */
     if (alt.channels != 2) {
-        ESP_LOGW(TAG, "I/Q source is %u-channel - this firmware decodes stereo only",
+        ESP_LOGW(TAG, "I/Q source is %u-channel - this firmware de-interleaves "
+                      "I/Q from a STEREO pair, so a mono source will not decode",
                  alt.channels);
     }
     if (alt.bit_resolution != 16 && alt.bit_resolution != 24) {
@@ -765,17 +784,74 @@ static esp_err_t open_and_start(uint8_t addr, uint8_t iface_num)
         s_uac_dev = NULL;
         return ESP_ERR_NOT_SUPPORTED;
     }
-    if (alt.sample_freq[0] != 48000) {
-        ESP_LOGW(TAG, "I/Q sample rate %lu Hz != 48000 - the DSP is pinned to "
-                      "48 kHz; the spectrum will be wrong-pitched unless a 48 kHz "
-                      "device is used",
-                 (unsigned long)alt.sample_freq[0]);
+    /* ⛔ SELECT 48 kHz EXPLICITLY. NEVER `alt.sample_freq[0]`.
+     *
+     * DSP_SAMPLE_RATE_HZ (main/dsp/dsp.h) is 48000 and there is NO resampler
+     * anywhere in the chain - the FFT bin width is derived from it directly
+     * (48000/1024 = 46.875 Hz). So whatever rate we open at IS the rate the
+     * spectrum is drawn at. Taking the first rate the device happens to list
+     * and merely warning about it was quietly wrong twice over:
+     *
+     *   1. Devices list rates in whatever order their descriptors put them. A
+     *      device offering both 44.1k and 48k that lists 44.1k first was driven
+     *      at 44.1k: every signal 8.8% off (48000/44100), ~264 Hz out at 3 kHz
+     *      into a 14 MHz band, and FT8 tones landing in the wrong bins, so it
+     *      never decoded - while the UI looked perfectly healthy.
+     *      The DigiRig Mobile's CM108 is exactly this device: its datasheet
+     *      offers two rates and nothing else, "48K / 44.1KHz Sampling Rate for
+     *      Both Playback and Recording", so the order of a two-entry list
+     *      decided correctness.
+     *   2. When sample_freq_type == 0 the field is a CONTINUOUS range, and
+     *      sample_freq[0] is sample_freq_lower by union aliasing. The old code
+     *      therefore requested the bottom of the range and called it a rate.
+     *
+     * uac_host_device_start() also matches channels+bit_resolution+rate against
+     * an alt setting exactly, so asking for a rate the device does not offer
+     * fails there anyway - better to refuse here, by name, than there.
+     *
+     * A refused 48 kHz is now a hard error like the bit-depth check above,
+     * not a warning: a wrong-pitched spectrum is an instrument that lies,
+     * which is worse than one that declares itself unusable. */
+    const uint32_t want_hz = DSP_SAMPLE_RATE_HZ;
+    bool rate_ok = false;
+    if (alt.sample_freq_type > 0) {
+        /* sample_freq_type is the COUNT of discrete rates, and the driver
+         * truncates a longer list to UAC_FREQ_NUM_MAX (default 4) when it
+         * parses tSamFreq - so clamp to the same bound rather than trusting
+         * the count blindly. */
+        uint32_t n = alt.sample_freq_type;
+        if (n > UAC_FREQ_NUM_MAX) n = UAC_FREQ_NUM_MAX;
+        for (uint32_t i = 0; i < n; i++)
+            if (alt.sample_freq[i] == want_hz) { rate_ok = true; break; }
+    } else {
+        rate_ok = (alt.sample_freq_lower <= want_hz && alt.sample_freq_upper >= want_hz);
+    }
+
+    if (!rate_ok) {
+        if (alt.sample_freq_type > 0) {
+            uint32_t n = alt.sample_freq_type;
+            if (n > UAC_FREQ_NUM_MAX) n = UAC_FREQ_NUM_MAX;
+            ESP_LOGE(TAG, "I/Q source offers no %lu Hz rate (the DSP is pinned "
+                          "to 48 kHz and cannot resample). It offers %lu:",
+                     (unsigned long)want_hz, (unsigned long)n);
+            for (uint32_t i = 0; i < n; i++)
+                ESP_LOGE(TAG, "    %lu Hz",
+                         (unsigned long)alt.sample_freq[i]);
+        } else {
+            ESP_LOGE(TAG, "I/Q source offers a %lu-%lu Hz range, which excludes "
+                          "the 48 kHz the DSP is pinned to",
+                     (unsigned long)alt.sample_freq_lower,
+                     (unsigned long)alt.sample_freq_upper);
+        }
+        uac_host_device_close(s_uac_dev);
+        s_uac_dev = NULL;
+        return ESP_ERR_NOT_SUPPORTED;
     }
 
     const uac_host_stream_config_t stream_cfg = {
         .channels = alt.channels,
         .bit_resolution = alt.bit_resolution,
-        .sample_freq = alt.sample_freq[0],
+        .sample_freq = want_hz,
         .flags = 0,
     };
     err = uac_host_device_start(s_uac_dev, &stream_cfg);
@@ -788,7 +864,7 @@ static esp_err_t open_and_start(uint8_t addr, uint8_t iface_num)
 
     s_channels    = alt.channels;
     s_bit_res     = alt.bit_resolution;
-    s_sample_freq = alt.sample_freq[0];
+    s_sample_freq = want_hz;
     s_period_start_us = esp_timer_get_time();
     s_samples_this_period = 0;
     s_peak_left = 0;

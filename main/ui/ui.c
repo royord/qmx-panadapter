@@ -61,6 +61,7 @@ LV_FONT_DECLARE(qmx_mono_25);   /* shared with the radio-menus screen */
 #include "util/hid_rotate.h"
 #include "util/wf_shift.h"
 #include "memory_modal.h"
+#include "kx3_iq_modal.h"
 #include "identity_config.h"
 #include "onboarding.h"
 #include "iq_balance.h"
@@ -2957,9 +2958,14 @@ static bool s_drawer_swipe_vertical = false;  /* this drag went vertical */
 // drawer_sec_visible()'s own header) - a bright control that does nothing
 // is the broken promise this whole function exists to prevent.
 #define DRAWER_SEC_OUTPWR     45
+/* KX3 only: the USB VID/PID of the line-in dongle that carries the KX3's
+ * analog RX I/Q. Same gating rationale as DRAWER_SEC_KX3BAUD - a link property,
+ * not an FT8/WSPR one. Id 46 was the next free slot; the bound below is
+ * 46 entries (0..45) so this one REQUIRES the raise on the next line. */
+#define DRAWER_SEC_KX3IQ      46
 // ⛔ THE NEXT ONE MUST RAISE N_DRAWER_SECTIONS TOO - see CLAUDE.md's "fixed-
-// size array indexed by an enum will be overrun" section. IDs are 0..45.
-#define N_DRAWER_SECTIONS     46
+// size array indexed by an enum will be overrun" section. IDs are 0..46.
+#define N_DRAWER_SECTIONS     47
 static lv_obj_t *s_drawer_sections[N_DRAWER_SECTIONS];
 static int       s_drawer_section_y[N_DRAWER_SECTIONS];
 static int       s_drawer_section_h[N_DRAWER_SECTIONS];
@@ -2995,6 +3001,7 @@ static const drawer_item_t GRP_RADIO[] = {
     { DRAWER_SEC_QMXVOL, "QMX volume", true },
     { DRAWER_SEC_QMXRF, "RF gain", true },
     { DRAWER_SEC_KX3BAUD, "KX3 CAT baud", true },
+    { DRAWER_SEC_KX3IQ,   "KX3 I/Q dongle", true },
     { DRAWER_SEC_RXAUDIO, "RX audio (speaker/headphone)", false },
     /* Above CW centre (operator, 2026-09-07). It was filed under Spectrum with
      * the drawing controls, but it is not one: it trims the 12 kHz IF offset so
@@ -3297,6 +3304,7 @@ static bool drawer_sec_visible(int id, ui_mode_t mode, bool tune_ok)
      * the link re-opens, so it is NOT FT8/WSPR-specific and stays on every page
      * a KX3 is driving. */
     if (id == DRAWER_SEC_KX3BAUD) return radio_get_kind() == RADIO_KX3;
+    if (id == DRAWER_SEC_KX3IQ)   return radio_get_kind() == RADIO_KX3;
     /* ⛔ THE WHOLE FT8 GROUP IS OFF THE WSPR PAGE (operator, 2026-09-11: "in
      * settings drawer remove ... FT8 section"). It used to show there for two
      * reasons, both recorded so nobody re-adds them blind:
@@ -3511,6 +3519,7 @@ static void drawer_dropdown_cmap_open_cb(lv_event_t *e);
 static void drawer_dropdown_sleep_open_cb(lv_event_t *e);
 static void drawer_dropdown_bpregion_cb(lv_event_t *e);
 static void drawer_dropdown_kx3baud_cb(lv_event_t *e);
+static void drawer_kx3iq_btn_cb(lv_event_t *e);
 static void drawer_dropdown_swrlim_cb(lv_event_t *e);
 static void drawer_spotmode_cb(lv_event_t *e)
 {
@@ -6797,6 +6806,7 @@ void ui_init(lv_display_t *disp)
     power_cal_modal_init();
     memory_modal_init();
     identity_config_modal_init();
+    kx3_iq_modal_init();   // KX3 I/Q dongle VID/PID; lazily unused on a QMX
     onboarding_init();   // builds the first-boot WiFi prompt + schedules the one-time flow
 
     // Pre-build the settings drawer at boot for the same reason. Drawer is
@@ -12355,6 +12365,43 @@ static void drawer_build(void)
         y += 100;
     }
 
+    // KX3 I/Q dongle VID/PID. A KX3 has NO digital I/Q output - the receiver
+    // hands analog I/Q out of the "RX I/Q" jack - so the spectrum has to be fed
+    // by a line-in UAC dongle, and audio.c can only find it by VID/PID. That
+    // pair lived in NVS with a writer (radio_set_dongle_vid_pid) and no way to
+    // be set, so a KX3 + dongle came up silent. This button is that way in.
+    // Shows the current pair so the drawer reads as state, not a command.
+    {
+        lv_obj_t *sec = drawer_section(DRAWER_SEC_KX3IQ, y, 100);
+        lv_obj_t *hdr = lv_label_create(sec);
+        lv_label_set_text(hdr, "I/Q dongle");
+        lv_obj_set_style_text_color(hdr, lv_color_hex(0xA0E0A0), 0);
+        lv_obj_set_style_text_font(hdr, &lv_font_montserrat_28, 0);
+        lv_obj_align(hdr, LV_ALIGN_TOP_LEFT, 0, 0);
+
+        uint16_t iq_vid = 0, iq_pid = 0;
+        radio_iq_vid_pid(&iq_vid, &iq_pid);
+        char iq_txt[48];
+        if (iq_vid | iq_pid)
+            snprintf(iq_txt, sizeof(iq_txt), "%04X:%04X  (change)", (unsigned)iq_vid, (unsigned)iq_pid);
+        else
+            snprintf(iq_txt, sizeof(iq_txt), LV_SYMBOL_WARNING " not set - tap to choose");
+
+        lv_obj_t *btn = lv_btn_create(sec);
+        lv_obj_set_size(btn, DRAWER_W - 32, 50);
+        lv_obj_align(btn, LV_ALIGN_TOP_LEFT, 0, 40);
+        lv_obj_set_style_bg_color(btn, lv_color_hex((iq_vid | iq_pid) ? 0x2a3138 : 0x6b4a12), 0);
+        lv_obj_set_style_border_color(btn, lv_color_hex(UI_COLOR_PRIMARY), 0);
+        lv_obj_set_style_border_width(btn, 2, 0);
+        lv_obj_add_event_cb(btn, drawer_kx3iq_btn_cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_t *btn_lbl = lv_label_create(btn);
+        lv_label_set_text(btn_lbl, iq_txt);
+        lv_obj_set_style_text_font(btn_lbl, &lv_font_montserrat_28, 0);
+        lv_obj_set_style_text_color(btn_lbl, lv_color_hex(0xffffff), 0);
+        lv_obj_center(btn_lbl);
+        y += 100;
+    }
+
     // "Let me use the QMX menus" - Stan's pause button, via Samuel W7STF.
     //
     // WORDING, reworded 2026-08-11 after Samuel called the original "not too helpful,
@@ -15271,6 +15318,18 @@ static void drawer_dropdown_kx3baud_cb(lv_event_t *e)
              (unsigned long)baud);
     ui_toast(toast);
     ESP_LOGI(TAG, "KX3 CAT baud set: %lu", (unsigned long)baud);
+}
+
+/* Close the drawer and hand over to the VID/PID modal. The drawer must come
+ * down first: the modal is a full-screen overlay, and a drawer left open
+ * underneath it keeps its own input group and steals the taps meant for the
+ * fields. Same reason drawer_wifi_btn_cb()/drawer_identity_btn_cb() call
+ * drawer_close() before their modals. */
+static void drawer_kx3iq_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    drawer_close();
+    kx3_iq_modal_show();
 }
 
 static void drawer_slider_wf_black_cb(lv_event_t *e)
