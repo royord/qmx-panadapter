@@ -60,12 +60,21 @@ if ($text -match [regex]::Escape($marker)) {
     exit 0
 }
 
+# This script is stored with CRLF terminators, so the here-strings below carry
+# CRLF. A Windows IDF checkout is CRLF too and the match works; an LF checkout
+# (WSL, Linux CI, a tarball) never matches and the patch reports bogus "IDF
+# version drift". Normalise both sides to LF before matching - same treatment
+# as apply_cdc_acm_close_tolerant.ps1. 2026-09-25: found the hard way, building
+# the kx3 branch in WSL.
+$text = $text  -replace "`r`n", "`n"
+
 $old = @"
         ESP_LOGW(TAG, LOG_FMT("Failed to read header byte (socket FD invalid), closing socket now"));
         aux->ws_final = true;
         aux->ws_type = HTTPD_WS_TYPE_CLOSE;
         return ESP_OK;
 "@
+$old = $old -replace "`r`n", "`n"
 
 if ($text -notmatch [regex]::Escape($old)) {
     Write-Error "httpd_ws.c does not contain the expected block - IDF version drift? Patch NOT applied."
@@ -86,6 +95,7 @@ $new = @"
          * httpd_main.c then calls httpd_sess_delete(). */
         return ESP_FAIL;
 "@
+$new = $new -replace "`r`n", "`n"
 
 $text = $text.Replace($old, $new)
 Set-Content -LiteralPath $file -Value $text -NoNewline -Encoding UTF8

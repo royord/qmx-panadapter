@@ -15,6 +15,9 @@ qmx m                               # monitor only
 
 Exit monitor: `Ctrl+T` then `Ctrl+X`.
 
+⛔ **No Windows ESP-IDF here** — `qmx`/`bench` paths are another machine's layout.
+Compile in WSL with ESP-IDF v5.4.4 (https://dl.espressif.com/dl/esp-idf/) — [setup](memory/project_bench_setup.md).
+
 ## ⛔⛔ NEVER START A RELEASE UNLESS HE SAYS "WRAP-UP"
 
 **The release process begins on the word "wrap-up" and on nothing else.** Not on

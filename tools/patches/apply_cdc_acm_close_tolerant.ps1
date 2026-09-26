@@ -74,6 +74,8 @@ if ($content -match "PATCHED \(qmx-panadapter, 2026-08-16\)") {
 
 $original = @'
     // Cancel polling of BULK IN and INTERRUPT IN
+    cdc_dev->data.in_polling = false;
+    cdc_dev->notif.xfer_polling = false;
     if (cdc_dev->data.in_xfer) {
         ESP_ERROR_CHECK(cdc_acm_reset_transfer_endpoint(cdc_dev->dev_hdl, cdc_dev->data.in_xfer));
     }
@@ -97,12 +99,17 @@ $patched = @'
     // (that is the real fix - the window is simply too short), then log and
     // carry on so the device object is always freed.
     //
-    // 2026-09-21: upstream deleted cdc_dev->data.in_polling and
-    // notif.xfer_polling from the struct - polling is now cancelled by
-    // cdc_acm_reset_transfer_endpoint() alone, and the in_cb/notif.cb nulling
-    // above covers callback suppression. Assigning them here no longer
-    // compiles, so both blocks dropped them. The patch's own purpose is
-    // unchanged.
+    // 2026-09-25: the two *_polling assignments are BACK, and the $original
+    // block matches them again. They had been dropped on 2026-09-21 against a
+    // newer esp-usb where the struct fields no longer exist - but "the version
+    // we actually resolve" is 2.4.1 (both ^2.0.0 and ^2.4.0 cap at the 2.4.x
+    // line), and 2.4.1 has the fields and still clears them here. cdc_acm_submit_poll()
+    // takes their ADDRESS, so they are load-bearing; dropping the assignments
+    // left the flags true across a close. The patch then stopped matching
+    // 2.4.1 altogether, which is how it was found: check_patches.py refusing a
+    // WSL build of the kx3 branch. The patch's own purpose is unchanged.
+    cdc_dev->data.in_polling = false;
+    cdc_dev->notif.xfer_polling = false;
     if (cdc_dev->data.in_xfer) {
         esp_err_t e = cdc_acm_reset_transfer_endpoint(cdc_dev->dev_hdl, cdc_dev->data.in_xfer);
         if (e != ESP_OK) {

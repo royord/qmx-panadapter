@@ -1259,14 +1259,18 @@ static volatile bool s_new_dev_pending = false;          /* a CDC appeared while
 #define CAT_SEEN_MAX 8
 static struct { uint8_t addr; uint16_t vid, pid; } s_seen[CAT_SEEN_MAX];
 static int s_seen_n = 0;
+/* s_seen is written from the USB HOST_EVENT callback and read from the probe
+ * task, on either core - so it needs a real spinlock. This FreeRTOS kernel has
+ * no no-argument taskENTER_Critical(); the all-caps macro takes the mux. */
+static portMUX_TYPE s_seen_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void cat_probe_seen_ids(uint8_t addr, uint16_t *vid, uint16_t *pid)
 {
-    taskENTER_CRITICAL();
+    taskENTER_CRITICAL(&s_seen_mux);
     for (int i = 0; i < s_seen_n; i++) {
         if (s_seen[i].addr == addr) { *vid = s_seen[i].vid; *pid = s_seen[i].pid; break; }
     }
-    taskEXIT_CRITICAL();
+    taskEXIT_CRITICAL(&s_seen_mux);
 }
 
 static void cat_probe_note_dev(usb_device_handle_t dev)
@@ -1278,12 +1282,12 @@ static void cat_probe_note_dev(usb_device_handle_t dev)
     if (usb_host_device_info(dev, &info) != ESP_OK) return;
 
     bool fresh = false;
-    taskENTER_CRITICAL();
+    taskENTER_CRITICAL(&s_seen_mux);
     for (int i = 0; i < s_seen_n; i++) {
         if (s_seen[i].addr == info.dev_addr) {          /* re-announce: refresh ids */
             s_seen[i].vid = dd->idVendor;
             s_seen[i].pid = dd->idProduct;
-            taskEXIT_CRITICAL();
+            taskEXIT_CRITICAL(&s_seen_mux);
             goto logged;
         }
     }
@@ -1294,7 +1298,7 @@ static void cat_probe_note_dev(usb_device_handle_t dev)
         s_seen_n++;
         fresh = true;
     }
-    taskEXIT_CRITICAL();
+    taskEXIT_CRITICAL(&s_seen_mux);
 
 logged:
     ESP_LOGI(TAG, "USB device at addr=%u is %04X:%04X (%s) - %s link probe will re-run",
