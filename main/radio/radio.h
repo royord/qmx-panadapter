@@ -87,15 +87,20 @@ void radio_set_dongle_vid_pid(uint16_t vid, uint16_t pid);
  * So the user never needs NVS set vid/pid: the radio "until seen" then
  * remembered. radio_set_kind()/radio_set_kx3_vid_pid() remain as overrides.
  *
- * -----------------------------------------------------------------------------
- * ⛔ BUILD ISOLATION 2026-09-23: the ONE primitive below that needs a build-time
- * confirmation is `usb_host_get_device_descriptor()` (acked in audio.c via
- * uac_host_device_open(addr-less), and here via the USB-Host device handle the
- * CDC new-dev callback hands us). If the esp-usb CDC-ACM component in your
- * managed_components version differs, this is the seam to fix - everything else
- * in this probe uses only primitives already proven in-tree (cdc_acm_host_open,
- * data_tx_blocking, the -extra-port probe helpers in cat.c). */
-void radio_note_cat_found(uint16_t vid, uint16_t pid); /* probe found a radio's CAT: classify + persist */
+ * The KIND is passed in rather than derived from the VID/PID, because a probe
+ * that found the radio by USB address alone (a device that was already plugged
+ * in before the new-dev callback was registered - see cat.c's seen-device
+ * table) has no VID/PID to compare against QMX_VID:QMX_PID, and guessing "not
+ * the QMX" there would pin the wrong radio. vid/pid of 0/0 means "not learned
+ * this time" and leaves any previous pin alone. The interface index is pinned
+ * with it: a radio whose CAT is not interface 0 probes fine once and then
+ * fails every boot after, because try_open_cat() would go straight to the
+ * hard-coded interface 0 with a now-known VID/PID. */
+void radio_note_cat_found(radio_kind_t kind, uint16_t vid, uint16_t pid, uint8_t iface);
+
+/* Which USB interface of the CAT device carries the CAT wire protocol. Pinned
+ * by the probe alongside the VID/PID; 0 for the QMX and as the default. */
+uint8_t radio_cat_iface(void);
 
 /* KX3 CAT baud. The QMX is fixed at 38400 (its firmware only speaks that); the
  * KX3 auto-detects baud from its first valid command, so this value only

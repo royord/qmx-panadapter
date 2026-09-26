@@ -565,6 +565,7 @@ static void cat_rx_queue_init(void);
 static bool cat_rx_queue_ready(void);
 static void handle_cdc_event(const cdc_acm_host_dev_event_data_t *event, void *user_ctx);
 static esp_err_t try_open_cat(void);
+static esp_err_t cat_finish_open(cdc_acm_dev_hdl_t h);
 static void cat_probe_new_dev_sink(usb_device_handle_t usb_dev);
 static void process_cat_message(const char *msg, size_t len);
 static void diag_log_rx(const char *msg, size_t len);
@@ -1227,21 +1228,86 @@ int cat_probe_terminal(void)
  *   - KX3: CAT on its own CDC (users run it through a USB-serial dongle whose
  *     VID/PID nobody can be expected to know), I/Q from a separate UAC dongle.
  *
- * The probe therefore has nothing to identify BEFORE it opens — it opens the
- * first CDC device on the bus that "behaves like CAT" and CLASSIFIES the radio
- * from the answer: `VN;` -> contains "QMX" -> RADIO_QMX, anything else that
- * answers VN;/FA; is an Elecraft-family (RADIO_KX3). Identity is then promoted
- * into NVS via radio_note_cat_found() so the second boot skips the bus walk. */
+ * The probe therefore has nothing to identify BEFORE it opens — it walks every
+ * USB address on the bus, opens each CDC interface it finds, and CLASSIFIES the
+ * radio from the answer: `VN;` -> contains "QMX" -> RADIO_QMX, anything else
+ * that answers VN;/FA; is an Elecraft-family (RADIO_KX3). Kind is promoted into
+ * NVS via radio_note_cat_found() immediately; the VID/PID are promoted too when
+ * the new-dev callback has labelled that address, so the second boot skips the
+ * walk. */
 static volatile bool s_new_dev_pending = false;          /* a CDC appeared while
                                                           * probe was idle */
+
+/* Devices the new-dev callback has seen, as {USB address, VID, PID}.
+ *
+ * WHY: the probe has to walk the bus by ADDRESS, because the app owns no USB
+ * host client and must not open a device from the new-dev callback (USB host
+ * task context). Walking by address alone works - esp-usb's cdc_acm_host_open()
+ * takes a dev_addr and matches ANY VID/PID - but then nothing in the app knows
+ * the radio's VID/PID, and radio_note_cat_found() needs them to pin the radio
+ * for the next boot. This callback is the one place the app is handed an open
+ * `usb_device_handle_t`, and reading the CACHED descriptor with it is exactly
+ * what esp-usb documents the callback for ("the handle is only valid during the
+ * call. Use it to read descriptors ... or to get more information about the
+ * device with usb_host_device_info()"). Both calls are cached getters: no
+ * control transfer, no interface claim, nothing opened beyond what the stack
+ * itself opened for the duration of the callback.
+ *
+ * A device that was ALREADY plugged in before this registration never appears
+ * here. The probe copes - it opens by address alone and pins only the radio
+ * KIND - and the next hot-plug teaches us the rest. */
+#define CAT_SEEN_MAX 8
+static struct { uint8_t addr; uint16_t vid, pid; } s_seen[CAT_SEEN_MAX];
+static int s_seen_n = 0;
+
+static void cat_probe_seen_ids(uint8_t addr, uint16_t *vid, uint16_t *pid)
+{
+    taskENTER_CRITICAL();
+    for (int i = 0; i < s_seen_n; i++) {
+        if (s_seen[i].addr == addr) { *vid = s_seen[i].vid; *pid = s_seen[i].pid; break; }
+    }
+    taskEXIT_CRITICAL();
+}
+
+static void cat_probe_note_dev(usb_device_handle_t dev)
+{
+    const usb_device_desc_t *dd = NULL;
+    usb_device_info_t info = {0};
+    if (!dev) return;
+    if (usb_host_get_device_descriptor(dev, &dd) != ESP_OK || !dd) return;
+    if (usb_host_device_info(dev, &info) != ESP_OK) return;
+
+    bool fresh = false;
+    taskENTER_CRITICAL();
+    for (int i = 0; i < s_seen_n; i++) {
+        if (s_seen[i].addr == info.dev_addr) {          /* re-announce: refresh ids */
+            s_seen[i].vid = dd->idVendor;
+            s_seen[i].pid = dd->idProduct;
+            taskEXIT_CRITICAL();
+            goto logged;
+        }
+    }
+    if (s_seen_n < CAT_SEEN_MAX) {
+        s_seen[s_seen_n].addr = info.dev_addr;
+        s_seen[s_seen_n].vid  = dd->idVendor;
+        s_seen[s_seen_n].pid  = dd->idProduct;
+        s_seen_n++;
+        fresh = true;
+    }
+    taskEXIT_CRITICAL();
+
+logged:
+    ESP_LOGI(TAG, "USB device at addr=%u is %04X:%04X (%s) - %s link probe will re-run",
+             info.dev_addr, (unsigned)dd->idVendor, (unsigned)dd->idProduct,
+             fresh ? "new" : "re-announced", radio_kind_name());
+}
+
 static void cat_probe_new_dev_sink(usb_device_handle_t usb_dev)
 {
     /* Runs on the USB host task context - do NOT open here. Record the arrival
      * and let link_task() re-enter the probe (it owns the CDC pipe). */
-    (void)usb_dev;
+    cat_probe_note_dev(usb_dev);
     s_new_dev_pending = true;
-    ESP_LOGI(TAG, "new USB device arrived - %s link probe will re-run",
-             radio_kind_name());
 }
 
 /* ---- the protocol probe itself --------------------------------------------
@@ -1325,63 +1391,129 @@ static int probe_talk(cdc_acm_dev_hdl_t h)
     return -1;
 }
 
-/* Walk the USB bus, open each CDC interface 0, and PROTOCOL-probe it for a
- * CAT-speaking radio. On a hit: classify, pin the identity into NVS
- * (radio_note_cat_found), and reopen for real via try_open_cat(). */
+/* Probe the bus for a CAT-speaking radio and open it.
+ *
+ * HOW THE BUS IS WALKED. The app owns no `usb_host_client_handle_t` - the UAC
+ * and CDC drivers each keep theirs private - and it must not open devices from
+ * the new-dev callback (USB host task context), so the app cannot open a
+ * device just to read its descriptor. It does not need to:
+ * `usb_host_device_addr_list_fill()` lists the connected addresses, and
+ * `cdc_acm_host_open()` with a `dev_addr` plus CDC_HOST_ANY_VID/ANY_PID makes
+ * the CDC driver take that address, read its cached descriptor and parse the
+ * CDC interface itself (esp-usb cdc_acm_find_and_open_usb_device(), which
+ * walks the same list with its own client). The earlier draft of this function
+ * called `usb_host_device_info_list()`, which has never existed in ESP-IDF, and
+ * read `devs[i].dev_hdl`, a member `usb_device_info_t` does not have - it could
+ * not have compiled.
+ *
+ * vid/pid 0:0 IS "any" to the driver, so an address the new-dev callback never
+ * labelled still opens; it just cannot be pinned into NVS (see cat_probe_note_dev).
+ * A labelled address is opened by its real VID/PID, so two CDC devices on the
+ * same bus cannot be probed in the wrong order. */
+#define CAT_PROBE_MAX_DEVS  8
+#define CAT_PROBE_MAX_IFACES 3
+#define CAT_PROBE_OPEN_MS   200
+
 static esp_err_t cat_probe_cat_by_protocol(void)
 {
-    enum { MAX_DEVS = 24 };
-    usb_device_info_t devs[MAX_DEVS];
+    uint8_t addrs[CAT_PROBE_MAX_DEVS];
     int n = 0;
-    esp_err_t err = usb_host_device_info_list(MAX_DEVS, devs, &n);
+    esp_err_t err = usb_host_device_addr_list_fill(sizeof(addrs), addrs, &n);
     if (err != ESP_OK || n <= 0) {
         ESP_LOGE(TAG, "CAT probe: bus walk failed (0x%x, %d device(s))", err, n);
         return ESP_ERR_NOT_FOUND;
     }
     ESP_LOGI(TAG, "CAT probe: scanning %d USB device(s) for a CAT-speaking CDC", n);
 
-    const cdc_acm_host_device_config_t cfg = {
-        .connection_timeout_ms = 1000,
-        .out_buffer_size = 64,
-        .in_buffer_size  = 64,
-        .event_cb = NULL,
-        .data_cb  = cat_probe_rx,
-        .user_arg = NULL,
-    };
-
     for (int i = 0; i < n; i++) {
-        const usb_device_desc_t *dd = NULL;
-        err = usb_host_get_device_descriptor(devs[i].dev_hdl, &dd);
-        if (err != ESP_OK || !dd) {
-            ESP_LOGI(TAG, "CAT probe: device %u no descriptor (0x%x)",
-                     devs[i].dev_addr, err);
-            continue;
-        }
-        uint16_t vid = dd->idVendor, pid = dd->idProduct;
+        uint16_t vid = 0, pid = 0;
+        cat_probe_seen_ids(addrs[i], &vid, &pid);
 
-        cdc_acm_dev_hdl_t h = NULL;
-        esp_err_t e = cdc_acm_host_open(vid, pid, 0, &cfg, &h);
-        if (e != ESP_OK || !h) {
-            ESP_LOGI(TAG, "CAT probe: %04X:%04X not a CDC/serial port (0x%x)", vid, pid, e);
-            continue;   /* UAC dongle, etc. */
-        }
+        for (uint8_t itf = 0; itf < CAT_PROBE_MAX_IFACES; itf++) {
+            const cdc_acm_host_open_config_t ocfg = {
+                .vid = vid,
+                .pid = pid,
+                .interface_idx = itf,
+                .dev_addr = addrs[i],
+                .connection_timeout_ms = CAT_PROBE_OPEN_MS,
+                .out_buffer_size = 64,
+                .in_buffer_size  = 64,
+                .event_cb = NULL,
+                .data_cb  = cat_probe_rx,
+                .user_arg = NULL,
+            };
+            cdc_acm_dev_hdl_t h = NULL;
+            esp_err_t e = cdc_acm_host_open(&ocfg, &h);
+            if (e != ESP_OK || !h) {
+                continue;   /* not a CDC at this address/interface: UAC dongle, HID, hub */
+            }
 
-        int kind = probe_talk(h);
-        cdc_acm_host_close(h);
-        if (kind < 0) {
-            ESP_LOGI(TAG, "CAT probe: %04X:%04X answered no CAT at any baud", vid, pid);
-            continue;
-        }
+            int kind = probe_talk(h);
+            if (kind < 0) {
+                cdc_acm_host_close(h);
+                ESP_LOGI(TAG, "CAT probe: addr=%u if%u (%04X:%04X) answered no CAT at any baud",
+                         addrs[i], itf, (unsigned)vid, (unsigned)pid);
+                continue;
+            }
 
-        ESP_LOGW(TAG, "⚡ CAT probe: %04X:%04X identified as %s (baud scan done)",
-                 vid, pid, kind == 1 ? "QMX" : "KX3");
-        radio_note_cat_found(vid, pid);
-        s_probe_len = 0;
-        return try_open_cat();   /* pin in NVS; reopen with the real cfg + poll */
+            ESP_LOGW(TAG, "⚡ CAT probe: addr=%u if%u %04X:%04X identified as %s",
+                     addrs[i], itf, (unsigned)vid, (unsigned)pid,
+                     kind == 1 ? "QMX" : "KX3");
+            radio_note_cat_found(kind == 1 ? RADIO_QMX : RADIO_KX3, vid, pid, itf);
+            s_probe_len = 0;
+
+            if ((vid | pid) != 0) {
+                /* Identity is pinned, so the ordinary open finds it by VID/PID
+                 * and the interface index without needing this handle. */
+                cdc_acm_host_close(h);
+                return try_open_cat();
+            }
+            /* Found by address alone, so there is nothing to pin and nothing
+             * for try_open_cat() to open by: keep THIS handle and configure it
+             * as the link. Recursing into try_open_cat() here would re-enter the
+             * probe (NVS is still 0:0) and could only fail. */
+            s_cdc_dev = h;
+            return cat_finish_open(h);
+        }
     }
 
     ESP_LOGW(TAG, "CAT probe: no CAT-speaking CDC found on the bus");
     return ESP_ERR_NOT_FOUND;
+}
+
+/* Everything try_open_cat() does to an ALREADY open device: line coding at the
+ * radio's baud, DTR/RTS, the opening ID;, and the one-off descriptor dump.
+ * Split out so the protocol probe can hand over the handle it already opened
+ * when it found the radio by USB address alone and has no VID/PID to reopen by. */
+static esp_err_t cat_finish_open(cdc_acm_dev_hdl_t h)
+{
+    const uint32_t baud = radio_get_cat_baud();
+    const cdc_acm_line_coding_t lc = {
+        .dwDTERate = baud,
+        .bCharFormat = 0,
+        .bParityType = 0,
+        .bDataBits = 8,
+    };
+    esp_err_t err = cdc_acm_host_line_coding_set(h, &lc);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "line_coding_set failed: 0x%x", err);
+        return err;
+    }
+
+    cdc_acm_host_set_control_line_state(h, true, true);
+    ESP_LOGI(TAG, "%s configured: %lu baud, 8N1", radio_kind_name(), (unsigned long)baud);
+
+    cdc_acm_host_data_tx_blocking(h, (const uint8_t *)"ID;", 3, 500);
+
+    // Phase 3.1 — dump audio descriptors ONCE per session
+    if (!s_audio_dumped) {
+        ESP_LOGI(TAG, "=== Dumping %s descriptors ===", radio_kind_name());
+        cdc_acm_host_desc_print(h);
+        ESP_LOGI(TAG, "=== End descriptor dump ===");
+        s_audio_dumped = true;
+    }
+
+    return ESP_OK;
 }
 
 static esp_err_t try_open_cat(void)
@@ -1401,6 +1533,10 @@ static esp_err_t try_open_cat(void)
         return cat_probe_cat_by_protocol();
     }
 
+    /* The interface index is pinned by the probe alongside the VID/PID: 0 for
+     * the QMX, and for a KX3 whatever interface actually answered. */
+    const uint8_t itf = radio_cat_iface();
+
     const cdc_acm_host_device_config_t cfg = {
         .connection_timeout_ms = 1000,
         .out_buffer_size = 256,
@@ -1410,38 +1546,11 @@ static esp_err_t try_open_cat(void)
         .user_arg = NULL,
     };
 
-    esp_err_t err = cdc_acm_host_open(vid, pid, 0, &cfg, &s_cdc_dev);
+    esp_err_t err = cdc_acm_host_open(vid, pid, itf, &cfg, &s_cdc_dev);
     if (err != ESP_OK) return err;
 
-    ESP_LOGI(TAG, "%s CDC opened (%04X:%04X)", radio_kind_name(), vid, pid);
-
-    const uint32_t baud = radio_get_cat_baud();
-    const cdc_acm_line_coding_t lc = {
-        .dwDTERate = baud,
-        .bCharFormat = 0,
-        .bParityType = 0,
-        .bDataBits = 8,
-    };
-    err = cdc_acm_host_line_coding_set(s_cdc_dev, &lc);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "line_coding_set failed: 0x%x", err);
-        return err;
-    }
-
-    cdc_acm_host_set_control_line_state(s_cdc_dev, true, true);
-    ESP_LOGI(TAG, "%s configured: %lu baud, 8N1", radio_kind_name(), (unsigned long)baud);
-
-    cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"ID;", 3, 500);
-
-    // Phase 3.1 — dump audio descriptors ONCE per session
-    if (!s_audio_dumped) {
-        ESP_LOGI(TAG, "=== Dumping %s descriptors ===", radio_kind_name());
-        cdc_acm_host_desc_print(s_cdc_dev);
-        ESP_LOGI(TAG, "=== End descriptor dump ===");
-        s_audio_dumped = true;
-    }
-
-    return ESP_OK;
+    ESP_LOGI(TAG, "%s CDC opened (%04X:%04X if%u)", radio_kind_name(), vid, pid, itf);
+    return cat_finish_open(s_cdc_dev);
 }
 
 /* KX3 CAT baud change on a LIVE link (drawer dropdown). Best-effort: the KX3

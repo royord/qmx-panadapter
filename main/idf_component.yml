@@ -8,7 +8,13 @@ dependencies:
   espressif/esp_codec_dev: "^1.3.0"
   espressif/esp_lvgl_port: "~2.5.0"
 
-  espressif/usb_host_cdc_acm: "^2.0.0"
+  # 2.4.0 floor, not cosmetic: the KX3 CAT probe opens a CDC device BY USB
+  # ADDRESS (cdc_acm_host_open_config_t::dev_addr, added in 2.4.0) with
+  # CDC_HOST_ANY_VID/ANY_PID, because the app owns no usb host client and must
+  # not open a device from the new-dev callback. 2.3.x has the one-argument
+  # new-dev callback but no address selector, so a lower resolve simply will not
+  # build. ANY_VID/ANY_PID themselves arrived in 2.0.5.
+  espressif/usb_host_cdc_acm: "^2.4.0"
   espressif/usb_host_uac: "^1.4.0"
   espressif/usb_host_hid: "^1.0.0"
 
