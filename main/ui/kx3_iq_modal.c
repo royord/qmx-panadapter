@@ -293,7 +293,24 @@ static void modal_build(void)
         "7", "8", "9", "0", LV_SYMBOL_LEFT, " ", LV_SYMBOL_RIGHT, "",
         NULL
     };
-    lv_keyboard_set_map(s_keyboard, LV_KEYBOARD_MODE_USER_1, hex_map, NULL);
+    /* ⛔ The ctrl map MUST NOT be NULL. LVGL 9.2.2's
+     * lv_keyboard_update_ctrl_map() memcpy()s btn_cnt entries out of
+     * kb_ctrl[mode] whenever popovers are off (the default), so a NULL map is a
+     * load-access fault in lv_memcpy at modal-build time - and modal_build()
+     * runs at boot, so the Tab5 reset-looped with a blank screen (KX3 bench,
+     * 2026-10-06). One entry per button in hex_map: 7 + 7 + 7 = 21. Width 1
+     * each; the four control keys get the theme's "checked" look like the
+     * stock maps do. */
+    #define HEX_KEY  (LV_BUTTONMATRIX_CTRL_NO_REPEAT | LV_BUTTONMATRIX_CTRL_CLICK_TRIG | 1)
+    #define HEX_CTRL (LV_KEYBOARD_CTRL_BUTTON_FLAGS | 1)
+    static const lv_buttonmatrix_ctrl_t hex_ctrl[] = {
+        HEX_KEY, HEX_KEY, HEX_KEY, HEX_KEY, HEX_KEY, HEX_KEY, HEX_CTRL,
+        HEX_KEY, HEX_KEY, HEX_KEY, HEX_KEY, HEX_KEY, HEX_KEY, HEX_CTRL,
+        HEX_KEY, HEX_KEY, HEX_KEY, HEX_KEY, HEX_CTRL, HEX_KEY, HEX_CTRL,
+    };
+    _Static_assert(sizeof(hex_ctrl) / sizeof(hex_ctrl[0]) == 21,
+                   "hex_ctrl needs one entry per hex_map button");
+    lv_keyboard_set_map(s_keyboard, LV_KEYBOARD_MODE_USER_1, hex_map, hex_ctrl);
     lv_keyboard_set_mode(s_keyboard, LV_KEYBOARD_MODE_USER_1);
     lv_obj_set_style_text_font(s_keyboard, &lv_font_montserrat_28, 0);
     lv_obj_add_flag(s_keyboard, LV_OBJ_FLAG_HIDDEN);

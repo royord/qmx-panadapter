@@ -167,6 +167,13 @@ PATCHES = [
      "a USB channel error arriving without the halt bit abort()s the device - and "
      "that warm reset then leaves the QMX unable to re-enumerate for hours"),
 
+    ("apply_usb_dwc_hal_fsls_only.ps1", "idf",
+     "components/hal/include/hal/usb_dwc_hal.h",
+     "g_qmx_usb_fsls_only",
+     "a Full-Speed device behind a High-Speed hub (DigiRig Mobile: CAT + audio "
+     "behind its own hub) is refused by IDF 5.4.4's hub driver - no "
+     "transaction translator - so a KX3 is never found"),
+
     ("apply_httpd_ws_dead_socket_close.ps1", "idf",
      "components/esp_http_server/src/httpd_ws.c",
      "QMX PATCH #9: dead WS socket must close, not spin",

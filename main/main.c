@@ -29,6 +29,8 @@
 #include "mem_channels.h"
 #include "wifi.h"
 #include "util/usb_shutdown.h"
+#include "util/usb_patch_counters.h"   // g_qmx_usb_fsls_only
+#include "radio/radio.h"
 #include "net/update_check.h"
 #include "net/ota_update.h"
 #include "net/manual_embed.h"  // built-in user manual (boot integrity check)
@@ -332,6 +334,13 @@ void app_main(void)
     // costs nothing on any unit that has never turned it on.
     rx_audio_preopen();
 
+    // KX3 profile: present the root port as Full-Speed only. A DigiRig Mobile
+    // is a hub with FS children; behind a High-Speed root port IDF 5.4.4 has no
+    // transaction translator and disables both (see
+    // tools/patches/apply_usb_dwc_hal_fsls_only.ps1). QMX stays stock.
+    radio_init();
+    g_qmx_usb_fsls_only = (radio_get_kind() == RADIO_KX3) ? 1 : 0;
+    ESP_LOGI(TAG, "USB root port: %s", g_qmx_usb_fsls_only ? "Full-Speed only (KX3)" : "High-Speed capable");
     ESP_ERROR_CHECK(bsp_usb_host_start(BSP_USB_HOST_POWER_MODE_USB_DEV, true));
     ESP_LOGI(TAG, "USB host started");
     // Make every firmware-initiated reboot tear the USB link down properly, so

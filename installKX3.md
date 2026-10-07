@@ -79,7 +79,11 @@ The build output is on the WSL side, reachable from Windows Explorer as:
 | `qmx_panadapter.bin` | 4,598,528 | `0x10000` |
 | `ota_data_initial.bin` | 8,192 | `0x920000` |
 
-Also in that folder: `flash_kx3.bat` (a ready-made flash script) and
+The flash script is **`tools/flash_kx3.bat`** in the repo. It searches, in order:
+beside itself, the folder in `%KX3_FW_DIR%` (if set), this checkout's `build\`
+(after a Windows `idf.py build`), and finally the WSL build tree
+(`~/build/qmx-panadapter/build`, located with `wslpath`). So after a WSL build
+there is nothing to copy. The WSL `flash_kx3` folder also carries
 `flasher_args.json` (the exact parameters the build system used).
 
 Chip **esp32p4**, flash **16 MB**, mode **dio**, **40 MHz**. The offsets above
@@ -97,8 +101,16 @@ identical boards are attached, this is genuinely ambiguous; plug in one at a tim
 
 ## 6. Flash it
 
-Either double-click `flash_kx3.bat` after editing its `PORT` line, or run this
-from a shell in the `flash_kx3` folder:
+Double-click `tools\flash_kx3.bat`, or run it from a shell:
+
+```
+tools\flash_kx3.bat          # tries every COM port, lowest first
+tools\flash_kx3.bat COM7     # or name the port
+```
+
+It needs only Python with `esptool` (`python -m pip install esptool`). It
+reminds you to power-cycle the radio when it finishes. The equivalent manual
+command, from a folder holding the four `.bin` files:
 
 ```
 python -m esptool --chip esp32p4 -p COM7 -b 460800 ^
@@ -121,12 +133,23 @@ Then **power-cycle the radio** ([step 3](#3-before-you-flash-the-power-cycle-rul
 Open the settings drawer (swipe or tap the drawer handle) → **Radio** group. Two
 items are KX3-specific; they appear once the radio has been identified as a KX3.
 
-### 7.1 KX3 I/Q dongle — **required**
+### 7.0 Radio type — **choose KX3 first**
+
+**Settings → Radio → Radio type → KX3 (DigiRig)**. Nothing else on this page
+appears until you do, and nothing switches to a KX3 on its own. Then unplug and
+re-plug the DigiRig (the USB port runs Full-Speed-only for a KX3, which is what
+lets the hub-attached CAT and audio devices enumerate at all).
+
+### 7.1 KX3 I/Q dongle — set automatically, can be overridden
 
 Tap **KX3 I/Q dongle** and enter the USB VID:PID of the **UAC audio** device —
 the CM108 inside the DigiRig Mobile. This is *not* the CP2102's VID:PID; the
 CP2102 is only for CAT and is found by talking to it.
 
+- **With no dongle configured, the firmware adopts the first usable UAC capture
+  device that connects** and saves its VID:PID (log: `I/Q dongle auto-selected
+  and saved`). The serial/CAT side cannot supply it - a CP2102 only knows
+  itself. Use the picker to override.
 - Either hex digits with or without a `0x` prefix — `10C4`, `0x10C4`, `10c4` all
   work. 1 to 4 digits per field; a wider value is rejected rather than silently
   truncated.
@@ -200,11 +223,13 @@ first-rate-wins code used to hide.
 The device supports a range rather than a fixed list, and 48 kHz is inside it.
 This is handled correctly and is not a problem.
 
-**Only one channel / mono.**
+**Only one channel / mono — and the DigiRig Mobile IS mono.**
 Mono is reported as a warning but I/Q de-interleaving genuinely cannot work —
-there is no second channel to read the quadrature from. The CM108 in a DigiRig
-Mobile is expected to enumerate as stereo; if it does not, check the dongle's
-own configuration.
+there is no second channel to read the quadrature from. Measured on the bench
+(2026-10-07): the DigiRig's CM108 (`0D8C:0012`) enumerates as
+`Alt 1: channels=1, 16-bit`, 48000 and 44100 Hz. An earlier version of this
+guide expected stereo; that was wrong. A DigiRig can carry CAT but **cannot carry
+a KX3's I/Q** - use a separate STEREO line-in USB audio dongle for I/Q.
 
 **CAT dead at every baud.**
 Confirm the KX3's USB/CAT port electrical setting. The DigiRig Mobile ships in

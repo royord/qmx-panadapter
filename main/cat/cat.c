@@ -1320,6 +1320,61 @@ static void cat_probe_new_dev_sink(usb_device_handle_t usb_dev)
  * probe must never touch handle_rx/process_cat_message (those feed the whole
  * UI), so it captures into a scratch buffer through cat_probe_rx() instead and
  * the real open happens AFTER classification, via try_open_cat(). */
+/* ---- UART bridge setup: CDC-ACM or Silicon Labs CP210x ----------------------
+ *
+ * A QMX is a real CDC-ACM device, so cdc_acm_host_line_coding_set() works. A
+ * KX3 reaches the Tab5 through a DigiRig Mobile, whose serial half is a CP2102 -
+ * a VENDOR-specific bridge. The CDC host driver opens it happily (it finds the
+ * bulk endpoints) but, having no CDC functional descriptors, leaves
+ * line_coding_set / set_control_line_state unimplemented: they return
+ * ESP_ERR_NOT_SUPPORTED, and the old code ignored that. The result, bench
+ * 2026-10-07: the CP2102 enumerated, VN; went out, and "answered no CAT at any
+ * baud" - the UART had never been enabled or given a baud rate, so nothing was
+ * ever clocked. A CP210x needs its own vendor control requests (the same ones
+ * Linux's cp210x driver and Espressif's usb_host_cp210x_vcp component send),
+ * which cdc_acm_host_send_custom_request() can deliver on the open handle.
+ *
+ * DTR/RTS are left DEASSERTED on the bridge, unlike the CDC path: on a DigiRig
+ * RTS/DTR key PTT, and a CAT probe must never key a transmitter.
+ */
+#define CP210X_REQTYPE_H2I   0x41    /* host-to-device | vendor | interface */
+#define CP210X_IFC_ENABLE    0x00
+#define CP210X_SET_LINE_CTL  0x03
+#define CP210X_SET_MHS       0x07
+#define CP210X_SET_BAUDRATE  0x1E
+#define CP210X_UART_ENABLE   0x0001
+#define CP210X_LINE_8N1      0x0800  /* 8 data bits, no parity, 1 stop */
+#define CP210X_MHS_DTR_RTS_LOW 0x0300 /* write-mask for DTR and RTS, both values 0 */
+
+static esp_err_t cat_uart_setup(cdc_acm_dev_hdl_t h, uint32_t baud)
+{
+    const cdc_acm_line_coding_t lc = {
+        .dwDTERate = baud, .bCharFormat = 0, .bParityType = 0, .bDataBits = 8,
+    };
+    esp_err_t e = cdc_acm_host_line_coding_set(h, &lc);
+    if (e == ESP_OK) {
+        cdc_acm_host_set_control_line_state(h, true, true);
+        return ESP_OK;
+    }
+    if (e != ESP_ERR_NOT_SUPPORTED) return e;
+
+    /* Vendor-specific bridge: assume CP210x (the DigiRig's). On any other chip
+     * these requests STALL harmlessly and the baud check below reports it. */
+    uint8_t rate[4] = { (uint8_t)baud, (uint8_t)(baud >> 8),
+                        (uint8_t)(baud >> 16), (uint8_t)(baud >> 24) };
+    esp_err_t e1 = cdc_acm_host_send_custom_request(h, CP210X_REQTYPE_H2I,
+                       CP210X_IFC_ENABLE, CP210X_UART_ENABLE, 0, 0, NULL);
+    esp_err_t e2 = cdc_acm_host_send_custom_request(h, CP210X_REQTYPE_H2I,
+                       CP210X_SET_BAUDRATE, 0, 0, sizeof(rate), rate);
+    esp_err_t e3 = cdc_acm_host_send_custom_request(h, CP210X_REQTYPE_H2I,
+                       CP210X_SET_LINE_CTL, CP210X_LINE_8N1, 0, 0, NULL);
+    esp_err_t e4 = cdc_acm_host_send_custom_request(h, CP210X_REQTYPE_H2I,
+                       CP210X_SET_MHS, CP210X_MHS_DTR_RTS_LOW, 0, 0, NULL);
+    ESP_LOGI(TAG, "vendor UART bridge (CP210x) setup %lu 8N1: enable=0x%x baud=0x%x "
+                  "line=0x%x modem=0x%x", (unsigned long)baud, e1, e2, e3, e4);
+    return (e1 == ESP_OK && e2 == ESP_OK) ? ESP_OK : (e1 != ESP_OK ? e1 : e2);
+}
+
 #define CAT_PROBE_RESP_CAP 64
 static char        s_probe_resp[CAT_PROBE_RESP_CAP];
 static volatile size_t s_probe_len = 0;
@@ -1373,11 +1428,7 @@ static int probe_talk(cdc_acm_dev_hdl_t h)
     }
 
     for (size_t i = 0; i < n; i++) {
-        const cdc_acm_line_coding_t lc = {
-            .dwDTERate = order[i], .bCharFormat = 0, .bParityType = 0, .bDataBits = 8,
-        };
-        cdc_acm_host_line_coding_set(h, &lc);
-        cdc_acm_host_set_control_line_state(h, true, true);
+        cat_uart_setup(h, order[i]);
         ESP_LOGI(TAG, "probe: %lu baud, sending VN;", (unsigned long)order[i]);
         if (probe_wait_reply(h, "VN;")) {
             ESP_LOGI(TAG, "probe: %lu baud answered '%.*s'",
@@ -1492,19 +1543,11 @@ static esp_err_t cat_probe_cat_by_protocol(void)
 static esp_err_t cat_finish_open(cdc_acm_dev_hdl_t h)
 {
     const uint32_t baud = radio_get_cat_baud();
-    const cdc_acm_line_coding_t lc = {
-        .dwDTERate = baud,
-        .bCharFormat = 0,
-        .bParityType = 0,
-        .bDataBits = 8,
-    };
-    esp_err_t err = cdc_acm_host_line_coding_set(h, &lc);
+    esp_err_t err = cat_uart_setup(h, baud);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "line_coding_set failed: 0x%x", err);
         return err;
     }
-
-    cdc_acm_host_set_control_line_state(h, true, true);
     ESP_LOGI(TAG, "%s configured: %lu baud, 8N1", radio_kind_name(), (unsigned long)baud);
 
     cdc_acm_host_data_tx_blocking(h, (const uint8_t *)"ID;", 3, 500);
@@ -1569,10 +1612,7 @@ void cat_reconfigure_baud(uint32_t baud)
                       "open will use it (radio_get_cat_baud)");
         return;
     }
-    const cdc_acm_line_coding_t lc = {
-        .dwDTERate = baud, .bCharFormat = 0, .bParityType = 0, .bDataBits = 8,
-    };
-    esp_err_t e = cdc_acm_host_line_coding_set(s_cdc_dev, &lc);
+    esp_err_t e = cat_uart_setup(s_cdc_dev, baud);
     if (e != ESP_OK) {
         ESP_LOGW(TAG, "live baud change to %lu failed: 0x%x - takes effect on "
                       "the next link re-open", (unsigned long)baud, e);

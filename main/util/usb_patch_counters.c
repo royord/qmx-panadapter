@@ -15,6 +15,11 @@ volatile uint32_t g_qmx_usb_chan_err_no_halt     = 0;
 volatile uint32_t g_qmx_usb_pipe_event_unexpected = 0;
 volatile uint32_t g_qmx_usb_buffer_parse_no_urb    = 0;
 
+// Not a counter: a CONTROL read by the patched usb_dwc_hal_port_toggle_reset()
+// on every root-port reset. Non-zero = present Full-Speed only (see
+// apply_usb_dwc_hal_fsls_only.ps1). Set from the radio profile.
+volatile uint32_t g_qmx_usb_fsls_only              = 0;
+
 void usb_patch_counters_report(void)
 {
     static uint32_t last_no_halt = 0;

@@ -676,12 +676,23 @@ static esp_err_t open_and_start(uint8_t addr, uint8_t iface_num)
      * follows this VID/PID, so only the source opens. */
     uint16_t iq_vid, iq_pid;
     radio_iq_vid_pid(&iq_vid, &iq_pid);
+    /* KX3 with no I/Q dongle configured: ADOPT the first UAC capture device that
+     * connects, instead of refusing and making the operator read a VID:PID off the
+     * log and type it in. The VID/PID cannot come from the serial (CAT) side - a
+     * CP2102 only knows itself - but it IS known here: the USB host has just
+     * handed us the device. It is only persisted once the device has passed the
+     * bit-depth and 48 kHz checks below, so a webcam mic cannot become "the
+     * dongle". */
+    bool adopting = false;
     if ((iq_vid | iq_pid) == 0) {
-        ESP_LOGE(TAG, "I/Q source not configured (radio=%s, VID/PID 0:0) - "
-                      "panadapter stays silent. On a KX3 set the dongle's VID:PID "
-                      "in the settings drawer (I/Q dongle).",
-                 radio_kind_name());
-        return ESP_ERR_NOT_FOUND;
+        if (radio_get_kind() != RADIO_KX3) {
+            ESP_LOGE(TAG, "I/Q source not configured (radio=%s, VID/PID 0:0)",
+                     radio_kind_name());
+            return ESP_ERR_NOT_FOUND;
+        }
+        adopting = true;
+        ESP_LOGW(TAG, "KX3 I/Q dongle not configured - trying the UAC device that "
+                      "just connected (addr=%u) and adopting it if it is usable", addr);
     }
 
     const uac_host_device_config_t dev_cfg = {
@@ -693,6 +704,11 @@ static esp_err_t open_and_start(uint8_t addr, uint8_t iface_num)
         .callback_arg = NULL,
     };
     esp_err_t err = uac_host_device_open(&dev_cfg, &s_uac_dev);
+    if (err != ESP_OK && adopting) {
+        ESP_LOGE(TAG, "cannot open UAC addr=%u to adopt it: 0x%x (%s)",
+                 addr, err, esp_err_to_name(err));
+        return err;
+    }
     if (err != ESP_OK) {
         /* The connect event named a device we could not open - most likely the
          * OTHER UAC on the bus (a KX3's AF audio), or a device mid
@@ -717,6 +733,18 @@ static esp_err_t open_and_start(uint8_t addr, uint8_t iface_num)
      * names a new dongle/KX3 to type into the drawer's "I/Q dongle" picker. */
     {
         uac_host_dev_info_t info = {0};
+        if (adopting) {
+            if (uac_host_get_device_info(s_uac_dev, &info) != ESP_OK) {
+                ESP_LOGE(TAG, "cannot read the UAC device's VID/PID - not adopting");
+                uac_host_device_close(s_uac_dev);
+                s_uac_dev = NULL;
+                return ESP_ERR_NOT_FOUND;
+            }
+            iq_vid = info.VID;
+            iq_pid = info.PID;
+            ESP_LOGW(TAG, "candidate I/Q dongle: %04X:%04X (%ls)",
+                     (unsigned)iq_vid, (unsigned)iq_pid, info.iProduct);
+        }
         if (uac_host_get_device_info(s_uac_dev, &info) == ESP_OK) {
             if (info.VID != iq_vid || info.PID != iq_pid) {
                 ESP_LOGW(TAG, "UAC at addr=%u is %04X:%04X (%ls), NOT the I/Q "
@@ -846,6 +874,13 @@ static esp_err_t open_and_start(uint8_t addr, uint8_t iface_num)
         uac_host_device_close(s_uac_dev);
         s_uac_dev = NULL;
         return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    if (adopting) {
+        radio_set_dongle_vid_pid(iq_vid, iq_pid);
+        ESP_LOGW(TAG, "I/Q dongle auto-selected and saved: %04X:%04X (change it in "
+                      "Settings -> Radio -> I/Q dongle)",
+                 (unsigned)iq_vid, (unsigned)iq_pid);
     }
 
     const uac_host_stream_config_t stream_cfg = {

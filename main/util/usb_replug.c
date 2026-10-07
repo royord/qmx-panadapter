@@ -93,6 +93,7 @@ esp_err_t usb_replug(uint32_t off_ms)
 #include "usb_hid_mouse.h"
 #include "ui.h"
 #include "diag_log.h"
+#include "radio.h"        // KX3 profile: no zombie replug (see below)
 #include "audio.h"
 #include "esp_timer.h"
 
@@ -174,6 +175,20 @@ static void usb_stale_detect_task(void *arg)
         // stuck answering power-on with INVALID_STATE forever) - fall
         // through to the toast so the operator learns the state.
         usb_host_lib_info_t info;
+        /* ? KX3 PROFILE: NEVER REPLUG FOR A "ZOMBIE". This branch was written for
+         * a QMX that powered off mid-stream. A KX3 sits behind a DigiRig - a hub
+         * plus a CP2102 and a CM108 that the CAT probe OPENS TEMPORARILY and
+         * closes again, so "present but never opened" is simply its normal state
+         * while the radio is off or not answering. Replugging it was worse than
+         * useless: cutting VBUS while the hub tree was mid-enumeration hit
+         * ESP_ERROR_CHECK in IDF hub.c line 435 ("HCD Pipe alloc error" ->
+         * "Failed to add new device") and abort()ed the whole Tab5 - the repeating
+         * reboot at ~67 s of uptime, bench 2026-10-07. Nothing here is stuck. */
+        if (radio_get_kind() == RADIO_KX3) {
+            zombie_checks = 0;
+            prev_devices = 0;
+            continue;
+        }
         if (usb_host_lib_info(&info) == ESP_OK && info.num_devices > 0) {
             if (info.num_devices != prev_devices) {
                 zombie_checks = 0;   // device set changed - fresh window

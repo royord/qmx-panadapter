@@ -62,6 +62,7 @@ LV_FONT_DECLARE(qmx_mono_25);   /* shared with the radio-menus screen */
 #include "util/wf_shift.h"
 #include "memory_modal.h"
 #include "kx3_iq_modal.h"
+#include "util/usb_patch_counters.h"   // g_qmx_usb_fsls_only
 #include "identity_config.h"
 #include "onboarding.h"
 #include "iq_balance.h"
@@ -2964,8 +2965,15 @@ static bool s_drawer_swipe_vertical = false;  /* this drag went vertical */
  * 46 entries (0..45) so this one REQUIRES the raise on the next line. */
 #define DRAWER_SEC_KX3IQ      46
 // ⛔ THE NEXT ONE MUST RAISE N_DRAWER_SECTIONS TOO - see CLAUDE.md's "fixed-
-// size array indexed by an enum will be overrun" section. IDs are 0..46.
-#define N_DRAWER_SECTIONS     47
+// size array indexed by an enum will be overrun" section. IDs are 0..47.
+/* Radio type (QMX / KX3). Without this nothing ever leaves RADIO_QMX: the KX3
+ * sections are gated on radio_get_kind()==KX3, the CAT probe only runs when the
+ * pinned CAT VID/PID is 0:0, and a QMX profile pins the QMX's own VID/PID - so a
+ * KX3 behind a DigiRig was never looked for and no KX3 control ever appeared
+ * (bench, 2026-10-06). The kind has to be chosen by the operator. Id 47; the
+ * bound is raised to 48 with it. */
+#define DRAWER_SEC_RADIOTYPE  47
+#define N_DRAWER_SECTIONS     48
 static lv_obj_t *s_drawer_sections[N_DRAWER_SECTIONS];
 static int       s_drawer_section_y[N_DRAWER_SECTIONS];
 static int       s_drawer_section_h[N_DRAWER_SECTIONS];
@@ -2998,6 +3006,7 @@ static const drawer_item_t GRP_STATION[] = {
     { DRAWER_SEC_BPREGION, "Band-plan region", false },
 };
 static const drawer_item_t GRP_RADIO[] = {
+    { DRAWER_SEC_RADIOTYPE, "Radio type", true },
     { DRAWER_SEC_QMXVOL, "QMX volume", true },
     { DRAWER_SEC_QMXRF, "RF gain", true },
     { DRAWER_SEC_KX3BAUD, "KX3 CAT baud", true },
@@ -3303,6 +3312,7 @@ static bool drawer_sec_visible(int id, ui_mode_t mode, bool tune_ok)
      * mode - the baud is a link property, and it reads back from NVS whenever
      * the link re-opens, so it is NOT FT8/WSPR-specific and stays on every page
      * a KX3 is driving. */
+    if (id == DRAWER_SEC_RADIOTYPE) return true;   /* every page: it is how a KX3 profile is reached */
     if (id == DRAWER_SEC_KX3BAUD) return radio_get_kind() == RADIO_KX3;
     if (id == DRAWER_SEC_KX3IQ)   return radio_get_kind() == RADIO_KX3;
     /* ⛔ THE WHOLE FT8 GROUP IS OFF THE WSPR PAGE (operator, 2026-09-11: "in
@@ -3519,6 +3529,7 @@ static void drawer_dropdown_cmap_open_cb(lv_event_t *e);
 static void drawer_dropdown_sleep_open_cb(lv_event_t *e);
 static void drawer_dropdown_bpregion_cb(lv_event_t *e);
 static void drawer_dropdown_kx3baud_cb(lv_event_t *e);
+static void drawer_dropdown_radiotype_cb(lv_event_t *e);
 static void drawer_kx3iq_btn_cb(lv_event_t *e);
 static void drawer_dropdown_swrlim_cb(lv_event_t *e);
 static void drawer_spotmode_cb(lv_event_t *e)
@@ -4510,6 +4521,20 @@ static void qmx_wait_poll_cb(lv_timer_t *t)
     if (hidden) {
         lv_obj_clear_flag(s_qmx_wait_overlay, LV_OBJ_FLAG_HIDDEN);
         qmx_wait_start_breathing(s_qmx_wait_lbl);
+    }
+    // Name the radio the operator selected (Settings -> Radio -> Radio type).
+    // The text used to be fixed at "QMX/+". Refreshed here, on the overlay's own
+    // tick, so a change of radio type while the prompt is up is picked up too;
+    // only touched when the wording actually changes, to avoid a needless
+    // relayout of a label that is breathing.
+    {
+        static radio_kind_t s_text_kind = (radio_kind_t)-1;
+        const radio_kind_t k = radio_get_kind();
+        if (s_qmx_wait_lbl && k != s_text_kind) {
+            s_text_kind = k;
+            lv_label_set_text_fmt(s_qmx_wait_lbl, "Now turn on or reboot your %s",
+                                  k == RADIO_KX3 ? "KX3" : "QMX/+");
+        }
     }
     // Mode-dependent placement: +150 px in FT8 mode so the text clears the
     // 320 px left pane; plain screen-center in Panadapter mode (no pane to
@@ -7064,7 +7089,11 @@ void ui_init(lv_display_t *disp)
         // to a large wrapped label without confirming render cost on hardware
         // first. An earlier version also duplicated this as two offset
         // labels for a poor-man's-bold effect; dropped as visually messy.
-        const char *txt = "Now turn on or reboot your QMX/+";
+        /* Initial wording only - qmx_wait_poll_cb() keeps it in step with the
+         * selected radio type. */
+        const char *txt = (radio_get_kind() == RADIO_KX3)
+                              ? "Now turn on or reboot your KX3"
+                              : "Now turn on or reboot your QMX/+";
         lv_obj_t *lbl = lv_label_create(s_qmx_wait_overlay);
         // The HEADLINE IS NOT TAPPABLE. It was, briefly, and that was a bug worth
         // recording: this label's box is 1040 px wide and gets shifted +150 px in
@@ -12332,6 +12361,27 @@ static void drawer_build(void)
         y += 96;
     }
 
+    // Radio type: QMX / KX3. Always shown - it is the control that makes the KX3
+    // sections below appear at all (see DRAWER_SEC_RADIOTYPE).
+    {
+        lv_obj_t *sec = drawer_section(DRAWER_SEC_RADIOTYPE, y, 100);
+        lv_obj_t *hdr = lv_label_create(sec);
+        lv_label_set_text(hdr, "Radio type");
+        lv_obj_set_style_text_color(hdr, lv_color_hex(0xA0E0A0), 0);
+        lv_obj_set_style_text_font(hdr, &lv_font_montserrat_28, 0);
+        lv_obj_align(hdr, LV_ALIGN_TOP_LEFT, 0, 0);
+
+        lv_obj_t *dd = lv_dropdown_create(sec);
+        lv_dropdown_set_options(dd, "QMX / QMX+\nKX3 (DigiRig)");
+        lv_obj_set_size(dd, DRAWER_W - 32, 50);
+        lv_obj_align(dd, LV_ALIGN_TOP_LEFT, 0, 40);
+        lv_obj_set_style_text_font(dd, &lv_font_montserrat_28, 0);
+        lv_dropdown_set_selected(dd, radio_get_kind() == RADIO_KX3 ? 1 : 0);
+        lv_obj_add_event_cb(dd, drawer_dropdown_radiotype_cb, LV_EVENT_VALUE_CHANGED, NULL);
+        lv_obj_add_event_cb(dd, drawer_dropdown_cmap_open_cb, LV_EVENT_CLICKED, NULL);
+        y += 100;
+    }
+
     // KX3 CAT baud. The QMX is fixed at 38400 and never shows this section; a
     // KX3 auto-detects its baud from the first valid command, so this is the
     // value the LINK OPENS with (see radio_get_cat_baud()) - changing it takes
@@ -15302,6 +15352,32 @@ static void drawer_dropdown_bpregion_cb(lv_event_t *e)
     // Refresh the strip right away for the current VFO.
     if (s_last_qmx_freq_hz) update_bandplan_strip(s_last_qmx_freq_hz);
     ESP_LOGI(TAG, "band-plan region set: %u", idx);
+}
+
+/* Choose the radio profile. Persists the kind; the CAT link task re-runs
+ * try_open_cat() every couple of seconds while no radio is open, and that now
+ * reads the new kind - a KX3 profile with no pinned VID/PID probes the bus by
+ * protocol, a QMX profile opens the QMX by its own VID/PID. So no reboot is
+ * needed for CAT. The KX3-only drawer sections appear/disappear on the
+ * relayout below. The UAC dongle is only opened from a connect event, so it
+ * needs a re-plug (the toast says so). */
+static void drawer_dropdown_radiotype_cb(lv_event_t *e)
+{
+    uint8_t idx = (uint8_t)lv_dropdown_get_selected(lv_event_get_target(e));
+    radio_kind_t kind = idx ? RADIO_KX3 : RADIO_QMX;
+    if (kind == radio_get_kind()) return;
+
+    radio_set_kind(kind);
+    /* KX3 = Full-Speed-only USB root port (a DigiRig is a hub with FS
+     * children; see apply_usb_dwc_hal_fsls_only.ps1). The HAL reads this on
+     * every port reset, so it applies when the radio/DigiRig is next plugged in. */
+    g_qmx_usb_fsls_only = (kind == RADIO_KX3) ? 1 : 0;
+    drawer_set_mode(ui_mode_get());   /* show/hide the KX3-only sections */
+    if (kind == RADIO_KX3)
+        ui_toast("KX3 profile: now UNPLUG and re-plug the DigiRig");
+    else
+        ui_toast("QMX profile: re-plug the QMX");
+    ESP_LOGI(TAG, "radio type set: %s", radio_kind_name());
 }
 
 static void drawer_dropdown_kx3baud_cb(lv_event_t *e)

@@ -26,6 +26,11 @@
 // CHHLTD. Stock IDF asserts here; we report the error instead.
 extern volatile uint32_t g_qmx_usb_chan_err_no_halt;
 
+// CONTROL, not a counter: non-zero makes the next USB root-port reset present
+// Full-Speed only, so a FS device behind a HS hub (DigiRig Mobile) enumerates.
+// Set for the KX3 profile. See apply_usb_dwc_hal_fsls_only.ps1.
+extern volatile uint32_t g_qmx_usb_fsls_only;
+
 // Patch #8: _buffer_parse_error() saw a pipe_event other than NONE/XFER/
 // OVERFLOW/STALL. Stock IDF abort()s here; we complete the URB with an error.
 extern volatile uint32_t g_qmx_usb_pipe_event_unexpected;
