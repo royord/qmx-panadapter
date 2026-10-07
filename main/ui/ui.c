@@ -3411,6 +3411,11 @@ static lv_obj_t *s_lbl_cwpitch = NULL;
 static lv_obj_t *s_dropdown_cmap = NULL;
 static lv_obj_t *s_dropdown_bpregion = NULL;  // band-plan region picker
 static lv_obj_t *s_dropdown_kx3baud  = NULL;  // KX3 CAT baud picker
+static lv_obj_t *s_dropdown_radiotype = NULL; // Radio type (QMX / KX3) picker
+/* The radio kind the current section layout was made for. drawer_open() uses it
+ * to notice a kind change that happened while the drawer was closed - the CAT
+ * probe can re-classify the radio at any time (radio_note_cat_found). */
+static radio_kind_t s_drawer_kind_laid = (radio_kind_t)-1;
 static lv_obj_t *s_dropdown_swrlim   = NULL;  // SWR protection limit picker
 static lv_obj_t *s_cb_bt             = NULL;  // Bluetooth mouse enable
 // "Restart now", shown only while the setting and the running radio disagree.
@@ -3562,6 +3567,7 @@ static lv_obj_t *s_check_cw_decode;
 static lv_obj_t *s_check_pskrep;
 static lv_obj_t *s_check_wspr_net;
 static void drawer_refresh_checkboxes(void);
+static void drawer_radiotype_sync(void);
 static void drawer_slider_qmx_rf_cb(lv_event_t *e);
 static void drawer_refresh_qmx_rf(void);
 static void gain_resolve_start(void);   // repaint a read-back that answers late
@@ -12028,6 +12034,33 @@ static void drawer_refresh_checkboxes(void)
        control that does nothing. */
 }
 
+/* Keep the "Radio type" dropdown stating the SAME truth the layout just used.
+ *
+ * drawer_sec_visible() gates "KX3 CAT baud" and "I/Q dongle" on
+ * radio_get_kind() == RADIO_KX3, so those two and the layout always agree from
+ * the layout's point of view - but nothing used to push that choice INTO the
+ * dropdown, and there are two ways for the pair to part company in front of
+ * the operator:
+ *
+ *   1. The drawer is BUILT inside ui_init(), which app_main() calls before
+ *      radio_init() loads the kind from NVS. See radio_get_kind()'s comment:
+ *      the build read the static RADIO_QMX default, so a KX3 board showed a
+ *      dropdown reading "QMX / QMX+" with the KX3-only sections beside it -
+ *      which reads exactly as "these are not gated" (bench, 2026-10-07).
+ *   2. The CAT probe re-classifies the radio while the drawer is closed
+ *      (radio_note_cat_found -> radio_set_kind), with nobody to relayout.
+ *
+ * Called at the top of drawer_set_mode() - the layout that decides the gating -
+ * which drawer_open() runs too, whenever it finds the kind has moved since the
+ * last layout. */
+static void drawer_radiotype_sync(void)
+{
+    if (!s_dropdown_radiotype) return;   /* not built yet - the build sets it */
+    uint16_t sel = (radio_get_kind() == RADIO_KX3) ? 1 : 0;
+    if (lv_dropdown_get_selected(s_dropdown_radiotype) != sel)
+        lv_dropdown_set_selected(s_dropdown_radiotype, sel);
+}
+
 static void drawer_refresh_cw_profiles(void)
 {
     for (int i = 0; i < CW_PROFILE_COUNT; i++) {
@@ -12379,6 +12412,7 @@ static void drawer_build(void)
         lv_dropdown_set_selected(dd, radio_get_kind() == RADIO_KX3 ? 1 : 0);
         lv_obj_add_event_cb(dd, drawer_dropdown_radiotype_cb, LV_EVENT_VALUE_CHANGED, NULL);
         lv_obj_add_event_cb(dd, drawer_dropdown_cmap_open_cb, LV_EVENT_CLICKED, NULL);
+        s_dropdown_radiotype = dd;
         y += 100;
     }
 
@@ -14259,6 +14293,15 @@ static void drawer_open(void)
        is not charged to the gesture. */
     drawer_timing_begin("open");
 #endif
+    /* The radio kind can change while the drawer is closed - the CAT probe
+     * re-classifies the radio from its answer (radio_note_cat_found), and the
+     * boot-time read used to disagree with NVS (see radio_get_kind()). The
+     * KX3-only sections are laid out for whatever kind was last seen, so restack
+     * here rather than show sections the "Radio type" dropdown beside them
+     * denies. drawer_set_mode() zeroes the remembered scroll offset itself when
+     * the kind moved, so the scroll below lands on the new layout. */
+    if (s_drawer_kind_laid != radio_get_kind())
+        drawer_set_mode(ui_mode_get());
     /* Back where it was left this session (0 on the first open after a boot,
        and after anything that restacked the sections). The original reason this
        line existed still holds and is now handled at the source: a restack
@@ -14391,6 +14434,10 @@ static void drawer_set_mode(ui_mode_t mode)
 {
     const bool ft8 = (mode == UI_MODE_FT8);   /* legacy local, still used below */
     if (!s_drawer) return;
+    /* The Radio type dropdown must say what the layout below is about to act
+     * on - see drawer_radiotype_sync(). First, so the gating decisions and the
+     * label can never be read apart. */
+    drawer_radiotype_sync();
     /* A different screen means a different set of sections at different heights,
        so the remembered scroll position (see s_drawer_scroll_y) now points at
        something else entirely - forget it. Guarded on the mode having actually
@@ -14401,6 +14448,16 @@ static void drawer_set_mode(ui_mode_t mode)
         static ui_mode_t s_laid_out_for = (ui_mode_t)-1;
         if (s_laid_out_for != mode) {
             s_laid_out_for = mode;
+            s_drawer_scroll_y = 0;
+        }
+        /* The same is true of a RADIO KIND change: "KX3 CAT baud" and "I/Q
+         * dongle" appear or go with it, so the remembered offset lands on
+         * different content. s_drawer_kind_laid is also what drawer_open()
+         * compares against to notice a kind change that arrived while the
+         * drawer was closed (the CAT probe can re-classify at any time). */
+        radio_kind_t k = radio_get_kind();
+        if (s_drawer_kind_laid != k) {
+            s_drawer_kind_laid = k;
             s_drawer_scroll_y = 0;
         }
     }

@@ -74,7 +74,27 @@ void radio_init(void)
     load_all();
 }
 
-radio_kind_t radio_get_kind(void) { return s_kind; }
+/* Self-loading, like radio_cat_vid_pid()/radio_iq_vid_pid()/radio_cat_iface()
+ * already are - because NOT every caller runs after main.c's radio_init().
+ *
+ * app_main() calls ui_init() (which builds the settings drawer, reads the kind
+ * for the "Radio type" dropdown AND lays out the KX3-only sections) at a point
+ * where radio_init() has not run yet. Reading the raw static there means the
+ * drawer is built against RADIO_QMX, the static default, and only afterwards
+ * load_all() installs the real kind - so on a board whose NVS says KX3 the
+ * dropdown said "QMX / QMX+" while the very next layout pass revealed
+ * "KX3 CAT baud" and "I/Q dongle" beside it (bench, 2026-10-07: "these should
+ * only be available when the KX3 is selected" - they were gated on exactly that
+ * test; the LABEL next to them was the stale half).
+ *
+ * The first call opens NVS; after that s_loaded makes this a flag test, so the
+ * per-packet callers in cat.c cost nothing. main.c still calls radio_init()
+ * explicitly - this does not replace that, it makes the ordering irrelevant. */
+radio_kind_t radio_get_kind(void)
+{
+    radio_init();
+    return s_kind;
+}
 
 const char *radio_kind_name(void)
 {
