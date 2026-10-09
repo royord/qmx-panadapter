@@ -2375,7 +2375,9 @@ esp_err_t uac_host_printf_device_param(uac_host_device_handle_t uac_dev_handle)
         printf("--------alt interface[%d]--------- \nchannels = %d \nbit_resolution = %d \nsample_freq: \n",
                i, iface_alt_params.channels, iface_alt_params.bit_resolution);
         if (iface_alt_params.sample_freq_type) {
-            for (int j = 0; j < iface_alt_params.sample_freq_type; j++) {
+            int n_freq = iface_alt_params.sample_freq_type;
+            if (n_freq > UAC_FREQ_NUM_MAX) n_freq = UAC_FREQ_NUM_MAX;
+            for (int j = 0; j < n_freq; j++) {
                 printf("\t%" PRIu32 "\n", iface_alt_params.sample_freq[j]);
             }
         } else {
@@ -2417,7 +2419,9 @@ esp_err_t uac_host_device_start(uac_host_device_handle_t uac_dev_handle, const u
                 iface->iface_alt[i].dev_alt_param.bit_resolution == stream_config->bit_resolution) {
             // check if the sample frequency is in the list or in the range
             if (iface->iface_alt[i].dev_alt_param.sample_freq_type > 0) {
-                for (int j = 0; j < iface->iface_alt[i].dev_alt_param.sample_freq_type; j++) {
+                int n_freq = iface->iface_alt[i].dev_alt_param.sample_freq_type;
+                if (n_freq > UAC_FREQ_NUM_MAX) n_freq = UAC_FREQ_NUM_MAX;
+                for (int j = 0; j < n_freq; j++) {
                     if (iface->iface_alt[i].dev_alt_param.sample_freq[j] == stream_config->sample_freq) {
                         iface->cur_alt = i;
                         iface->iface_alt[i].cur_sampling_freq = stream_config->sample_freq;

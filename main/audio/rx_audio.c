@@ -17,6 +17,7 @@
 #include "dsps_fir.h"
 
 #include "dsp.h"          // DSP_FFT_SIZE, DSP_SAMPLE_RATE_HZ, DSP_FFT_TASK_PRIORITY, dsp_rxaudio_*
+#include "sig_gen.h"      // I/Q test-tone generator - the task-loop branch below, rx_audio_siggen_set()
 #include "cat.h"          // cat_get_mode_str(), cat_get_cw_offset_hz()
 #include "settings.h"
 #include "ui.h"           // ui_get_passband_width_hz() - the QMX's actual selected filter width
@@ -862,12 +863,44 @@ static void rx_audio_task(void *arg)
     int64_t s_last_ring_retry_us = 0;
 
     while (1) {
-        if (!s_enabled) {
+        // The running/fading test doubles as the sleep guard: the generator
+        // can be requested while RX audio is off (its own switch, not this
+        // one - see rx_audio_siggen_set), and a stop-fade must be allowed to
+        // finish before the task blocks again or its tail would be cut into
+        // a step.
+        if (!s_enabled && !sig_gen_running()) {
             if (active_prev) { dsp_rxaudio_forward_enable(false); active_prev = false; }
             // Fully asleep - zero wakeups, zero cost - until
             // rx_audio_set_enabled(true) gives this notification. This is the
             // default state on every unit that never turns RX audio on.
             ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
+
+        // ---- I/Q test-tone generator (sig_gen.c) ----------------------------
+        // BEFORE the enabled check above and BEFORE the mode gate below, on
+        // purpose: this is a bench signal, not a demodulation. It has to play
+        // in any mode (FT8/WSPR force DiGi, where `active` is false and the
+        // normal path would idle) and with RX audio switched off. While it
+        // runs it owns the output outright - demodulation stops rather than
+        // interleaving with it, and the forward ring is released exactly the
+        // way the `!active` branch below releases it, so re-entry after the
+        // tone stops goes through the same clean re-init as any other idle
+        // gap. No rate-match accounting: the tone IS the 48 kHz clock, there
+        // is no upstream source it could drift against.
+        if (sig_gen_running()) {
+            if (active_prev) { dsp_rxaudio_forward_enable(false); active_prev = false; }
+            sig_gen_render(s_out, DSP_FFT_SIZE);
+            s_loop_count++;
+            rxcap_push(s_out, DSP_FFT_SIZE);   /* record exactly what is played */
+            int64_t w0 = esp_timer_get_time();
+            esp_codec_dev_write(s_codec, s_out, DSP_FFT_SIZE * 2 * (int)sizeof(int16_t));
+            uint32_t w_us = (uint32_t)(esp_timer_get_time() - w0);
+            if (w_us > s_write_us_max) s_write_us_max = w_us;
+            s_write_us_sum += w_us;
+            // Pacing is the blocking write above (same call the normal path
+            // makes): with the DMA ring ~80 ms deep, writing frames back to
+            // back blocks until there is room, which is exactly 48 kHz.
             continue;
         }
 
@@ -1641,8 +1674,71 @@ static void preopen_task(void *arg)
     vTaskDelete(NULL);
 }
 
+// ---- Headphone routing -----------------------------------------------------
+// The Tab5 jack has a mechanical insert-detect input (PI4IOE1 P7,
+// bsp_headphone_detect) and the internal speaker amplifier enable is on the
+// same expander (PI4IOE1 P1, bsp_set_speaker_enable). The M5Stack BSP ships
+// both but nothing in main/ used them: the amp stayed ON from boot forever, so
+// the I/Q test tone (and every other audio path) played through the built-in
+// speaker even with headphones seated in the jack. This tiny poller follows the
+// hardware's intent - speaker amp OFF while a plug is in (the jack is fed
+// directly by the ES8388, so audio continues in the headphones), back ON when
+// the jack empties - for ALL audio, not just the siggen tone.
+//
+// Detect-pin polarity: MEASURED on the bench 2026-10-08 (operator's plug/unplug
+// A/B). The jack's detect line reads HIGH while a plug is seated
+// (HP_JACK_ACTIVE_LOW = 0). The first build assumed the usual pull-up +
+// switch-to-GND convention (low = seated); the bench showed the exact inversion
+// - plugged drove the amp ON, unplugged held it OFF. The raw bit is still
+// logged on the first pass so any future board change is visible in one boot.
+#define HP_POLL_MS        200
+#define HP_JACK_ACTIVE_LOW 0
+
+static bool hp_jack_seated(void)
+{
+    bool det = bsp_headphone_detect();   // true = P7 held high
+    return HP_JACK_ACTIVE_LOW ? !det : det;
+}
+
+static void hp_route_task(void *arg)
+{
+    bool first = true;
+    bool prev  = false;
+    for (;;) {
+        bool seated = hp_jack_seated();
+        if (first || seated != prev) {
+            prev = seated;
+            bsp_set_speaker_enable(!seated);   // internal speaker amp
+            if (first) {
+                first = false;
+                ESP_LOGI(TAG, "hp route: jack %s at boot (det=%d), speaker amp %s, stack hiwater %u B",
+                         seated ? "seated" : "empty", (int)bsp_headphone_detect(),
+                         seated ? "off" : "on",
+                         (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
+            } else {
+                ESP_LOGI(TAG, "hp route: jack %s, speaker amp %s",
+                         seated ? "seated" : "empty", seated ? "off" : "on");
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(HP_POLL_MS));
+    }
+}
+
 void rx_audio_preopen(void)
 {
+    // Headphone routing only drives the PI4IOE1 amp/detect lines - it does not
+    // need the codec open below, so start it first and let it survive any
+    // preopen failure. Idempotent: this is a boot-time call in main.c.
+    static bool hp_started = false;
+    if (!hp_started) {
+        if (xTaskCreatePinnedToCore(hp_route_task, "hp_route", 3072, NULL,
+                                    tskIDLE_PRIORITY + 2, NULL, 1) != pdPASS) {
+            ESP_LOGW(TAG, "hp route task create failed - speaker amp stays in boot state");
+        } else {
+            hp_started = true;
+        }
+    }
+
     TaskHandle_t self = xTaskGetCurrentTaskHandle();
     if (xTaskCreatePinnedToCore(preopen_task, "rxaud_pre", RXAUD_PREOPEN_STACK,
                                 self, 5, NULL, 1) != pdPASS) {
@@ -1663,14 +1759,17 @@ static void preopen_body(void)
     // from that pool; doing it after the UAC stream is up fails (NO_MEM) and
     // esp_codec_dev_open then crashes on the un-checked error. We keep the
     // codec open for the whole session; the task only writes when RX audio is
-    // active. Gated on the persisted enable flag so units that never use RX
-    // audio don't claim I2S/DMA at all (and there's zero risk to USB host).
+    // active. The I/Q test-tone generator (sig_gen.c) must be able to reach the
+    // Tab5 audio out on ANY boot: its on/off arrives at runtime, so it cannot
+    // influence a boot-time decision, and opening the codec mid-session fails
+    // (the USB host already owns the DMA RAM - see the note above). The codec is
+    // therefore opened unconditionally here. The minimal TX-only channel below
+    // (~1.5 KB DMA, one GDMA channel) was engineered to leave room for the USB
+    // host's endpoint allocation, so the boots that used to skip this gain the
+    // tone path without new USB risk. Only the RX DEMO path stays gated (RX
+    // audio on / s_enabled); this preopen just owns the out pipe.
     qmx_settings_t cfg;
     settings_load_all(&cfg);
-    if (!cfg.rx_audio_en) {
-        ESP_LOGI(TAG, "preopen skipped (RX audio disabled)");
-        return;
-    }
     s_volume = cfg.rx_audio_vol;
 
     // Same reasoning as the I2S channel below: claim the forward ring's 24 KB
@@ -1786,6 +1885,30 @@ void rx_audio_set_enabled(bool en)
 }
 
 bool rx_audio_is_enabled(void) { return s_enabled; }
+
+// ---- I/Q test-tone generator (sig_gen.c) ------------------------------------
+// The OFF path has no preconditions anywhere - the whole point of this feature
+// was a HARD off switch, and a switch that can decline to switch off is not
+// one. ON is refused only when there is genuinely no path to the speaker (the
+// codec never opened; it only ever opens at boot - see rx_audio_preopen), and
+// the drawer turns that refusal into a toast. Either direction wakes the task.
+bool rx_audio_siggen_set(bool on)
+{
+    if (on && !s_codec_ready) {
+        ESP_LOGW(TAG, "I/Q test tone refused: codec failed to open at boot "
+                 "(see rx_audio_preopen) - no path to the Tab5 audio out");
+        return false;
+    }
+    sig_gen_set_enabled(on);
+    // Wake the task out of EITHER sleep state: the indefinite block (RX audio
+    // off) and the 200 ms mode poll (on, but in a mode with nothing to
+    // demodulate). If the task is mid-frame the notification just accumulates
+    // and is consumed by the next sleep - harmless on every other path.
+    if (s_task) xTaskNotifyGive(s_task);
+    return true;
+}
+
+bool rx_audio_siggen_is_on(void) { return sig_gen_enabled(); }
 
 void rx_audio_set_volume(uint8_t vol)
 {

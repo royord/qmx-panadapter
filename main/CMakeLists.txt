@@ -75,6 +75,7 @@ idf_component_register(
         "radio/radio.c"
         "audio/audio.c"
         "audio/rx_audio.c"
+        "audio/sig_gen.c"
         "dsp/dsp.c"
         "dsp/iq_balance.c"
         "dsp/spur_map.c"

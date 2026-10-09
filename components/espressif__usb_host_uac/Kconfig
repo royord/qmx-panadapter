@@ -12,10 +12,12 @@ menu "USB Host UAC"
             The driver will only use the first UAC_DEV_ADDR_LIST_MAX devices.
     config UAC_FREQ_NUM_MAX
         int "Max Number of Frequencies each Alt-interface supports"
-        default 4
+        default 8
         help
             Max Number of Frequencies each Alt-interface supports. If the device supports more frequencies,
             the driver will only use the first UAC_FREQ_NUM_MAX frequencies.
+            Most line-in dongles advertise the standard seven rates (8k..48k), so
+            8 fits the whole list; the parser and lookup loops clamp to this cap.
     config UAC_NUM_ISOC_URBS
         int "Number of UAC ISOC URBs"
         default 3

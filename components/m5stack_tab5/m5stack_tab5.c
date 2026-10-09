@@ -450,6 +450,28 @@ bool bsp_headphone_detect()
     return ret;
 }
 
+void bsp_set_speaker_enable(bool en)
+{
+    uint8_t write_buf[2] = {0};
+    uint8_t read_buf[1]  = {0};
+
+    // PI4IOE1 P1 = internal speaker power-amplifier enable (see the pa_pin=-1
+    // note by bsp_audio_codec_speaker_init). Read-modify-write so the LCD/TP
+    // reset pins on the same expander are never clobbered. High = amp enabled.
+    write_buf[0] = PI4IO_REG_OUT_SET;
+    i2c_master_transmit_receive(i2c_dev_handle_pi4ioe1, write_buf, 1, read_buf, 1, I2C_MASTER_TIMEOUT_MS);
+
+    write_buf[0] = PI4IO_REG_OUT_SET;
+    write_buf[1] = read_buf[0];
+    if (en) {
+        setbit(write_buf[1], 1);
+    } else {
+        clrbit(write_buf[1], 1);
+    }
+
+    i2c_master_transmit(i2c_dev_handle_pi4ioe1, write_buf, 2, I2C_MASTER_TIMEOUT_MS);
+}
+
 bool bsp_usb_c_detect()
 {
     uint8_t write_buf[2] = {0};

@@ -89,6 +89,17 @@ static void to_upper_inplace(char *s)
     for (; *s; s++) *s = (char)toupper((unsigned char)*s);
 }
 
+/* Persist and leave. Shared by Save and Auto-detect so both log the same way
+ * and neither can drift from the other. */
+static void persist_and_close(uint16_t vid, uint16_t pid, const char *toast)
+{
+    ESP_LOGI(TAG, "Save: I/Q dongle %04X:%04X%s", (unsigned)vid, (unsigned)pid,
+             (vid | pid) ? "" : " (cleared - not configured)");
+    radio_set_dongle_vid_pid(vid, pid);
+    modal_close();
+    ui_toast_ms(toast, 4000);
+}
+
 static void save_btn_cb(lv_event_t *e)
 {
     (void)e;
@@ -109,15 +120,25 @@ static void save_btn_cb(lv_event_t *e)
         return;
     }
 
-    ESP_LOGI(TAG, "Save: I/Q dongle %04X:%04X%s", (unsigned)vid, (unsigned)pid,
-             (vid | pid) ? "" : " (cleared - not configured)");
-    radio_set_dongle_vid_pid(vid, pid);
-    modal_close();
+    persist_and_close(vid, pid,
+        (vid | pid) ? "I/Q source saved - unplug the dongle, plug it back in"
+                    : "I/Q source cleared - the panadapter will stay silent");
+}
 
-    if (vid | pid)
-        ui_toast_ms("I/Q source saved - unplug the dongle, plug it back in", 4000);
-    else
-        ui_toast_ms("I/Q source cleared - the panadapter will stay silent", 4000);
+/* The one-tap door for an operator who does not know their dongle's VID/PID -
+ * which is everyone, and is exactly the case the manual entry cannot help with.
+ * 0:0 is "not configured", the value audio.c treats as "adopt the next UAC
+ * capture device that connects"; audio.c then persists whatever passes its
+ * bit-depth and 48 kHz checks. Clearing two hex fields on a touch keyboard is
+ * the step that was not happening on the bench (KX3, 2026-10-08), so it gets a
+ * button instead. */
+static void autodetect_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_textarea_set_text(s_ta_vid, "");
+    lv_textarea_set_text(s_ta_pid, "");
+    persist_and_close(0, 0,
+        "Auto-detect armed - unplug the dongle, plug it back in");
 }
 
 static void cancel_btn_cb(lv_event_t *e)
@@ -243,9 +264,38 @@ static void modal_build(void)
     lv_obj_set_style_text_font(note, &lv_font_montserrat_20, 0);
     lv_obj_align(note, LV_ALIGN_TOP_LEFT, 0, 244);
 
+    /* Spelled out so a blank field is not read as a mistake: blank = 0:0 =
+     * "adopt the next dongle", the same thing the Auto-detect button does. */
+    lv_obj_t *hint = lv_label_create(panel);
+    lv_label_set_text(hint, "Blank fields mean auto-detect - or tap Auto-detect.");
+    lv_obj_set_style_text_color(hint, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_20, 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 0, 274);
+
+    /* ⛔ The button row sits at y=308, NOT pinned to the panel bottom. The hex
+     * keyboard is 280 px tall at the bottom of the 720 px screen (top edge at
+     * y=440) and the panel runs from y=24 to y=564, so the panel's bottom
+     * ~100 px - where Save and Cancel used to live - are UNDER the keyboard the
+     * moment a field is tapped to edit. Save was unreachable exactly when it
+     * was needed, which is why the bench never saw a "Save:" line (KX3,
+     * 2026-10-08). Same trap as ui_osk_show() documents for every text field. */
+    lv_obj_t *auto_btn = lv_btn_create(panel);
+    lv_obj_set_size(auto_btn, 260, 72);
+    lv_obj_align(auto_btn, LV_ALIGN_TOP_LEFT, 0, 308);
+    lv_obj_set_style_bg_color(auto_btn, lv_color_hex(0x1f6f8b), 0);
+    lv_obj_set_style_border_color(auto_btn, lv_color_hex(0x3aa0c4), 0);
+    lv_obj_set_style_border_width(auto_btn, 2, 0);
+    lv_obj_set_style_radius(auto_btn, 8, 0);
+    lv_obj_add_event_cb(auto_btn, autodetect_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *auto_btn_lbl = lv_label_create(auto_btn);
+    lv_label_set_text(auto_btn_lbl, "Auto-detect");
+    lv_obj_set_style_text_color(auto_btn_lbl, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(auto_btn_lbl, &lv_font_montserrat_24, 0);
+    lv_obj_center(auto_btn_lbl);
+
     lv_obj_t *cancel_btn = lv_btn_create(panel);
-    lv_obj_set_size(cancel_btn, 240, 72);
-    lv_obj_align(cancel_btn, LV_ALIGN_BOTTOM_LEFT, 80, 0);
+    lv_obj_set_size(cancel_btn, 200, 72);
+    lv_obj_align(cancel_btn, LV_ALIGN_TOP_MID, 0, 308);
     lv_obj_set_style_bg_color(cancel_btn, lv_color_hex(0x962020), 0);
     lv_obj_set_style_border_color(cancel_btn, lv_color_hex(0xc04040), 0);
     lv_obj_set_style_border_width(cancel_btn, 2, 0);
@@ -258,8 +308,8 @@ static void modal_build(void)
     lv_obj_center(cancel_lbl);
 
     lv_obj_t *save_btn = lv_btn_create(panel);
-    lv_obj_set_size(save_btn, 240, 72);
-    lv_obj_align(save_btn, LV_ALIGN_BOTTOM_RIGHT, -80, 0);
+    lv_obj_set_size(save_btn, 200, 72);
+    lv_obj_align(save_btn, LV_ALIGN_TOP_RIGHT, 0, 308);
     lv_obj_set_style_bg_color(save_btn, lv_color_hex(0x2e8b3a), 0);
     lv_obj_set_style_border_color(save_btn, lv_color_hex(0x4caf50), 0);
     lv_obj_set_style_border_width(save_btn, 2, 0);

@@ -38,7 +38,8 @@ void rx_audio_init(void);
 
 // Open the ES8388/I2S output path early - call this BEFORE bsp_usb_host_start()
 // so I2S can claim its DMA-capable RAM before the USB UAC stream consumes the
-// pool. No-op (and no I2S/DMA claimed) unless RX audio is persisted-enabled.
+// pool. Opens unconditionally since the siggen session: the I/Q test tone has
+// to be able to reach the audio out on boots that never enabled RX audio.
 void rx_audio_preopen(void);
 
 // Enable / disable RX audio output (persisted to NVS). Enabling wakes the
@@ -50,6 +51,23 @@ bool rx_audio_is_enabled(void);
 // Output volume, 0..100 (persisted to NVS).
 void rx_audio_set_volume(uint8_t vol_0_100);
 uint8_t rx_audio_get_volume(void);
+
+// ---- I/Q test-tone generator (sig_gen.c) ------------------------------------
+// Turns the Tab5-side test tone on/off - a quadrature tone (L = I = cos,
+// R = Q = sin) written straight to the codec by rx_audio_task, taking the
+// output over from demodulation while it runs. See sig_gen.h.
+//
+// ON returns false only if the codec failed to open at boot (rx_audio_preopen
+// opens it unconditionally now, so the normal case is always true). This is an
+// honest refusal ("no path to the speaker"), not a silent success nobody can
+// hear. OFF always succeeds from any state; it fades out over ~10 ms instead
+// of cutting.
+//
+// ⛔ RAM-only, both directions: the request lives in sig_gen.c and is cleared
+// by every reboot. Nothing here reads or writes NVS - by requirement, the
+// generator never survives a restart.
+bool rx_audio_siggen_set(bool on);
+bool rx_audio_siggen_is_on(void);
 
 // ---- Live tuning (RAM only, NOT persisted - dev/field iteration without a
 // rebuild+reflash+QMX-power-cycle, see main/net/webserver.c's "rxaudio"

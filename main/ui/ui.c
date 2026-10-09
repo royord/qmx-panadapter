@@ -2965,7 +2965,7 @@ static bool s_drawer_swipe_vertical = false;  /* this drag went vertical */
  * 46 entries (0..45) so this one REQUIRES the raise on the next line. */
 #define DRAWER_SEC_KX3IQ      46
 // ⛔ THE NEXT ONE MUST RAISE N_DRAWER_SECTIONS TOO - see CLAUDE.md's "fixed-
-// size array indexed by an enum will be overrun" section. IDs are 0..47.
+// size array indexed by an enum will be overrun" section. IDs are 0..48.
 /* Radio type (QMX / KX3). Without this nothing ever leaves RADIO_QMX: the KX3
  * sections are gated on radio_get_kind()==KX3, the CAT probe only runs when the
  * pinned CAT VID/PID is 0:0, and a QMX profile pins the QMX's own VID/PID - so a
@@ -2973,7 +2973,15 @@ static bool s_drawer_swipe_vertical = false;  /* this drag went vertical */
  * (bench, 2026-10-06). The kind has to be chosen by the operator. Id 47; the
  * bound is raised to 48 with it. */
 #define DRAWER_SEC_RADIOTYPE  47
-#define N_DRAWER_SECTIONS     48
+/* Tab5-side I/Q test-tone generator (sig_gen.c): a 1 kHz quadrature tone
+ * (L = I = cos, R = Q = sin) on the ES8388 output, for exercising the whole
+ * audio path with no radio in the loop - memory/project_kx3_support.md open
+ * item 3, "Offered, not built" until now. Bench tool, so Advanced-only by
+ * default, same as the RX audio section beside it. State is RAM-only (never
+ * NVS), so the checkbox seeds from rx_audio_siggen_is_on(), not settings.
+ * Id 48; the bound is raised to 49 with it. */
+#define DRAWER_SEC_SIGGEN     48
+#define N_DRAWER_SECTIONS     49
 static lv_obj_t *s_drawer_sections[N_DRAWER_SECTIONS];
 static int       s_drawer_section_y[N_DRAWER_SECTIONS];
 static int       s_drawer_section_h[N_DRAWER_SECTIONS];
@@ -3012,6 +3020,10 @@ static const drawer_item_t GRP_RADIO[] = {
     { DRAWER_SEC_KX3BAUD, "KX3 CAT baud", true },
     { DRAWER_SEC_KX3IQ,   "KX3 I/Q dongle", true },
     { DRAWER_SEC_RXAUDIO, "RX audio (speaker/headphone)", false },
+    /* The test tone rides the same physical output as RX audio, so it files
+     * directly beneath it - the two sections read as one "what comes out of
+     * this port" story. Bench tool: Advanced by default like its neighbour. */
+    { DRAWER_SEC_SIGGEN, "I/Q test tone", false },
     /* Above CW centre (operator, 2026-09-07). It was filed under Spectrum with
      * the drawing controls, but it is not one: it trims the 12 kHz IF offset so
      * a signal lands where the dial says it is, which is the same conversation
@@ -3315,6 +3327,15 @@ static bool drawer_sec_visible(int id, ui_mode_t mode, bool tune_ok)
     if (id == DRAWER_SEC_RADIOTYPE) return true;   /* every page: it is how a KX3 profile is reached */
     if (id == DRAWER_SEC_KX3BAUD) return radio_get_kind() == RADIO_KX3;
     if (id == DRAWER_SEC_KX3IQ)   return radio_get_kind() == RADIO_KX3;
+    /* The I/Q test tone is deliberately not gated on mode. Its branch in
+     * rx_audio_task sits BEFORE every mode/enabled check (see the task loop),
+     * so it plays from any page - FT8/WSPR force DiGi, which would otherwise
+     * leave the output idle, and that is exactly when the tone is useful. And
+     * what plays from any page must be stoppable from any page: the running
+     * banner's tap does that. An explicit line rather than the fall-through,
+     * because the fall-through is a trap class in this function (see the ⛔
+     * comment below) - being here is a decision, not an accident. */
+    if (id == DRAWER_SEC_SIGGEN) return true;
     /* ⛔ THE WHOLE FT8 GROUP IS OFF THE WSPR PAGE (operator, 2026-09-11: "in
      * settings drawer remove ... FT8 section"). It used to show there for two
      * reasons, both recorded so nobody re-adds them blind:
@@ -3451,6 +3472,7 @@ static bool      s_sim_mode_locked = false;      // true while in FT4 - the phan
 static lv_obj_t *s_check_rxaudio = NULL;
 static lv_obj_t *s_slider_rxaudio_vol = NULL;
 static lv_obj_t *s_lbl_rxaudio_vol = NULL;
+static lv_obj_t *s_check_siggen = NULL;  /* I/Q test-tone generator switch (DRAWER_SEC_SIGGEN) */
 
 static lv_obj_t *s_slider_wf_black = NULL;
 static lv_obj_t *s_lbl_wf_black = NULL;
@@ -3591,6 +3613,13 @@ static void drawer_activation_btn_cb(lv_event_t *e);
 static void drawer_refresh_activation(void);
 static void drawer_check_rxaudio_cb(lv_event_t *e);
 static void drawer_slider_rxaudio_vol_cb(lv_event_t *e);
+/* I/Q test-tone generator: checkbox callback (drawer_build), the banner's
+ * tap-to-stop (banner block, before ui_init builds it), and sync_cb - the
+ * latter two because the banner can stop the tone while the drawer is closed,
+ * and the checkbox must be told about it. */
+static void drawer_check_siggen_cb(lv_event_t *e);
+static void siggen_banner_tap_cb(lv_event_t *e);
+static void sync_cb(lv_obj_t *cb, bool on);
 static void drawer_slider_wf_black_cb(lv_event_t *e);
 static void drawer_slider_wf_contrast_cb(lv_event_t *e);
 static void drawer_dropdown_wf_window_cb(lv_event_t *e);
@@ -3979,6 +4008,59 @@ static void iq_warn_banner_keepalive_cb(lv_timer_t *t)
     if (!s_iq_warn_active || !s_iq_warn_banner) return;
     if (reader_view_is_active()) return;   // don't draw over the docs Reader
     lv_obj_move_foreground(s_iq_warn_banner);
+}
+
+// ---- I/Q test-tone generator: the "it is running" banner --------------------
+//
+// The "visible while running" half of the off-switch requirement: while the
+// tone plays, a full-width amber banner spans the top of the screen (amber is
+// deliberately neither the warning red of the IQ banner nor the calm blue of
+// the pause banner - nothing is wrong, but the operator asked for a signal on
+// the audio out and should be reminded it is there, in ANY mode, because the
+// generator branch runs in any mode). Tapping it is the second off switch -
+// the hard stop always works, from any page, even with the drawer closed.
+// Same keepalive re-foreground pattern as s_iq_warn_banner: later-built
+// modals are screen children too and would otherwise cover it.
+static lv_obj_t *s_siggen_banner = NULL;
+
+static void siggen_banner_keepalive_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!rx_audio_siggen_is_on() || !s_siggen_banner) return;
+    if (reader_view_is_active()) return;   // don't draw over the docs Reader
+    lv_obj_move_foreground(s_siggen_banner);
+}
+
+/* Show/hide the running banner AND keep the drawer's switch agreeing with it.
+ * Two entry points take the generator down - this banner's tap (any page, even
+ * with the drawer closed) and the drawer checkbox - so one place must own the
+ * banner AND the box's state, or the box silently lies about reality. The
+ * checkbox callback drives the same path with the new state, so the two can
+ * never disagree. display_lock is recursive, so this is safe from a drawer /
+ * LVGL event and from any future web caller alike. */
+static void ui_set_siggen_running(bool on)
+{
+    if (!display_lock(20)) return;
+    if (s_siggen_banner) {
+        if (on) {
+            lv_obj_clear_flag(s_siggen_banner, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(s_siggen_banner);
+        } else {
+            lv_obj_add_flag(s_siggen_banner, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    sync_cb(s_check_siggen, on);
+    display_unlock();
+}
+
+static void siggen_banner_tap_cb(lv_event_t *e)
+{
+    (void)e;
+    // The off path has no preconditions anywhere (see rx_audio.h) - this is
+    // the hard OFF and it always succeeds, from any state, on any page.
+    rx_audio_siggen_set(false);
+    ui_set_siggen_running(false);
+    ui_toast("I/Q test tone stopped");
 }
 
 // ---- Operator pause: "release the radio" -----------------------------------
@@ -7035,6 +7117,35 @@ void ui_init(lv_display_t *disp)
         lv_obj_center(lbl);
     }
     lv_timer_create(iq_warn_banner_keepalive_cb, 1000, NULL);
+
+    // "I/Q test tone running" banner (see the block comment by the keepalive
+    // above it: the visible-while-running guarantee + tap-to-stop). Amber so
+    // it is neither the IQ warning's red nor the pause banner's blue. The
+    // label names the way out - the whole point of an always-on indicator is
+    // that the operator does not have to remember how to stop it.
+    s_siggen_banner = lv_obj_create(scr);
+    lv_obj_set_size(s_siggen_banner, LV_PCT(100), 40);
+    lv_obj_set_pos(s_siggen_banner, 0, 0);
+    lv_obj_set_style_bg_color(s_siggen_banner, lv_color_hex(0xA05A00), 0);
+    lv_obj_set_style_bg_opa(s_siggen_banner, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_siggen_banner, 0, 0);
+    lv_obj_set_style_radius(s_siggen_banner, 0, 0);
+    lv_obj_clear_flag(s_siggen_banner, LV_OBJ_FLAG_SCROLLABLE);
+    // Tappable: it spans the top of the screen ONLY while the tone runs, so
+    // it cannot steal touches the rest of the time (same reasoning as the IQ
+    // warning banner above).
+    lv_obj_add_flag(s_siggen_banner, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_siggen_banner, siggen_banner_tap_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_flag(s_siggen_banner, LV_OBJ_FLAG_HIDDEN);
+    {
+        lv_obj_t *lbl = lv_label_create(s_siggen_banner);
+        lv_label_set_text(lbl, LV_SYMBOL_PLAY " I/Q test tone is playing on the audio out - "
+                            "tap here to stop");
+        lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
+        lv_obj_center(lbl);
+    }
+    lv_timer_create(siggen_banner_keepalive_cb, 1000, NULL);
 
     // "Radio released" banner (see ui_set_cat_paused). Same geometry and
     // keepalive as the IQ banner, deliberately a calm blue rather than the
@@ -12023,6 +12134,11 @@ static void drawer_refresh_checkboxes(void)
     sync_cb(s_check_charge_limit,   c.charge_limit_en);
     sync_cb(s_cb_bt,                c.bt_mouse_en);
     sync_cb(s_check_rit_pill,       c.rit_pill_show);
+    /* The tone is RAM-only (never NVS) so it is asked rather than copied,
+       like the module-owned three below - and the banner's tap-to-stop can
+       have switched it off while the drawer was closed, so the box must be
+       re-stated against reality on every open. */
+    sync_cb(s_check_siggen,         rx_audio_siggen_is_on());
     /* These three are owned by a module rather than read straight from the
        struct, so they are asked rather than copied. */
     sync_cb(s_switch_iq,            iq_balance_is_enabled());
@@ -13448,6 +13564,33 @@ static void drawer_build(void)
         y += 130;
     }
 
+    // I/Q test-tone generator (sig_gen.c): the same physical output as RX
+    // audio, so it sits directly beneath it. Header row carries the on/off
+    // checkbox; the note below says what a tone on this port means. RAM-only
+    // state, so the box seeds from rx_audio_siggen_is_on() - never settings -
+    // and defaults to off on every boot. Every page (drawer_sec_visible).
+    {
+        lv_obj_t *sec = drawer_section(DRAWER_SEC_SIGGEN, y, 116);
+        lv_obj_t *lbl = lv_label_create(sec);
+        lv_label_set_text(lbl, "I/Q test tone");
+        lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_28, 0);
+        lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, 10);
+        s_check_siggen = make_drawer_checkbox(sec, rx_audio_siggen_is_on(),
+                                              drawer_check_siggen_cb, NULL);
+        lv_obj_align(s_check_siggen, LV_ALIGN_TOP_RIGHT, 0, 6);
+
+        lv_obj_t *note = lv_label_create(sec);
+        lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(note, DRAWER_W - 80);
+        lv_obj_set_style_text_color(note, lv_color_hex(UI_COLOR_TEXT_MUTED), 0);
+        lv_obj_set_style_text_font(note, &lv_font_montserrat_20, 0);
+        lv_label_set_text(note, "1 kHz quadrature tone - L = I, R = Q - on the "
+                                "audio out. RAM only: a restart always clears it.");
+        lv_obj_align(note, LV_ALIGN_TOP_LEFT, 0, 52);
+        y += 116;
+    }
+
     // IF calibration section (per-unit QMX oscillator trim)
     {
         lv_obj_t *sec = drawer_section(DRAWER_SEC_IFCAL, y, 130);
@@ -14697,9 +14840,28 @@ static void drawer_check_rxaudio_cb(lv_event_t *e)
 {
     bool en = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
     rx_audio_set_enabled(en);
-    // The codec only opens at boot (see rx_audio_preopen()'s comment) - turning
-    // this on from OFF mid-session can't take effect until a restart.
-    if (en) ui_toast("RX audio: takes effect after a restart");
+    if (en) ui_toast("RX audio: on");
+}
+
+static void drawer_check_siggen_cb(lv_event_t *e)
+{
+    lv_obj_t *cbx = lv_event_get_target(e);
+    bool on = lv_obj_has_state(cbx, LV_STATE_CHECKED);
+    // rx_audio_siggen_set refuses only when the codec genuinely failed to open
+    // at boot (rx_audio_preopen now opens it unconditionally; this is the
+    // "no path to the speaker" case, not an RX-audio setting).
+    // That is an honest "there is no path to the speaker", not a checkbox
+    // that reports a tone nobody can hear, so untick and say why.
+    if (!rx_audio_siggen_set(on)) {
+        lv_obj_remove_state(cbx, LV_STATE_CHECKED);
+        ui_toast("I/Q test tone: no audio out (codec failed at boot)");
+        return;
+    }
+    // One caller for BOTH the banner and the box (ui_set_siggen_running) - the
+    // banner's tap-to-stop uses the same path, so no matter which switch is
+    // used, the state the operator sees is the state the audio task has.
+    ui_set_siggen_running(on);
+    if (on) ui_toast("I/Q test tone: 1 kHz on the audio out");
 }
 
 static void drawer_slider_rxaudio_vol_cb(lv_event_t *e)

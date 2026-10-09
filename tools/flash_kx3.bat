@@ -1,7 +1,9 @@
 @echo off
 rem Flash the KX3 / DigiRig Mobile firmware (branch kx3) onto an M5Stack Tab5.
 rem
-rem Usage:   flash_kx3.bat [COMPORT]        e.g.  flash_kx3.bat COM7
+rem Usage:   flash_kx3.bat [-app] [COMPORT]
+rem          e.g.  flash_kx3.bat COM7          (full flash)
+rem                flash_kx3.bat -app COM7     (app-only at 0x10000, keeps NVS)
 rem          With no argument every serial port is tried, lowest number first.
 rem
 rem Where it finds the firmware (first match wins):
@@ -13,14 +15,28 @@ rem                             build\bootloader\bootloader.bin and friends.
 rem
 rem Needs only Python + esptool (pip install esptool). No ESP-IDF required.
 rem
+rem *** BAUD 230400, NOT 460800 - see the bench notes in
+rem *** project_kx3_support.md ("Flashing facts learned"): at 460800 the
+rem *** USB-Serial/JTAG link DROPPED mid-write ("Lost connection") twice,
+rem *** leaving the app partition corrupt and the Tab5 boot-looping on the
+rem *** boot screen. 230400 has been reliable. For iterating firmware prefer
+rem *** flashing ONLY the app partition at 0x10000 (add the -app argument) -
+rem *** it is a much shorter write at the safe baud, and it keeps NVS (radio
+rem *** kind, dongle VID/PID, callsign).
+rem
 rem *** POWER-CYCLE THE RADIO AFTER THIS. Every flash wedges it (#74). ***
 setlocal enabledelayedexpansion
 title QMX Panadapter - Tab5 KX3 Flasher
+
+rem --- 0. arguments (parsed before the firmware search) -----------------------
+set "APP_ONLY="
+for %%A in (%*) do if /i "%%A"=="-app" set "APP_ONLY=1"
 
 echo(
 echo ============================================================
 echo    QMX Panadapter KX3 / DigiRig firmware flasher  ^(Tab5^)
 echo ============================================================
+if defined APP_ONLY echo    MODE: app-only flash at 0x10000 - NVS settings kept
 echo(
 
 rem --- 1. locate the firmware -------------------------------------------------
@@ -60,7 +76,7 @@ set "MISSING="
 if not exist "!BL!"   ( echo ERROR: missing !BL!   & set "MISSING=1" )
 if not exist "!PT!"   ( echo ERROR: missing !PT!   & set "MISSING=1" )
 if not exist "!APP!"  ( echo ERROR: missing !APP!  & set "MISSING=1" )
-if not exist "!OTAD!" (
+if not defined APP_ONLY if not exist "!OTAD!" (
     echo ERROR: missing !OTAD!
     echo   Without it the Tab5 can restart on the PREVIOUS firmware even
     echo   though this flash succeeded.
@@ -69,11 +85,21 @@ if not exist "!OTAD!" (
 if defined MISSING goto :end
 
 echo Firmware from: !SRC!
-echo   0x2000   bootloader.bin
-echo   0x8000   partition-table.bin
-echo   0x10000  qmx_panadapter.bin
-echo   0x920000 ota_data_initial.bin
+if defined APP_ONLY (
+    echo   0x10000  qmx_panadapter.bin   ^(app only - NVS settings kept^)
+) else (
+    echo   0x2000   bootloader.bin
+    echo   0x8000   partition-table.bin
+    echo   0x10000  qmx_panadapter.bin
+    echo   0x920000 ota_data_initial.bin
+)
 echo(
+
+if defined APP_ONLY (
+    set "FLASH_ARGS=0x10000 "!APP!""
+) else (
+    set "FLASH_ARGS=0x2000 "!BL!" 0x8000 "!PT!" 0x10000 "!APP!" 0x920000 "!OTAD!""
+)
 
 rem --- 2. get esptool ---------------------------------------------------------
 set "ESPTOOL="
@@ -107,16 +133,16 @@ if not errorlevel 1 (
 echo Before you continue:
 echo   1. Plug the Tab5 into this PC with a USB-C DATA cable.
 echo   2. Close any serial monitor or other app using the port.
-echo   3. A full flash resets saved settings - including the KX3 I/Q dongle
-echo      VID:PID and your callsign/grid. Have them ready to re-enter.
+echo   3. A FULL flash resets saved settings - including the KX3 I/Q dongle
+echo      VID:PID and your callsign/grid. Have them ready to re-enter, or
+echo      use  flash_kx3.bat -app COMxx  to keep them.
 echo(
 pause
 
 rem --- 3. choose the port(s) --------------------------------------------------
 set "PORTS="
-if not "%~1"=="" (
-    set "PORTS=%~1"
-) else (
+for %%A in (%*) do if /i not "%%A"=="-app" set "PORTS=!PORTS! %%A"
+if not defined PORTS (
     set "PLIST=%TEMP%\qmx_kx3_ports_%RANDOM%.txt"
     powershell -NoProfile -Command "[System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object Length,{ $_ } | Set-Content -Encoding ascii -LiteralPath '!PLIST!'"
     if exist "!PLIST!" (
@@ -135,19 +161,24 @@ if defined PORTS (
     for %%P in (!PORTS!) do (
         if not "!RC!"=="0" (
             echo   trying %%P ...
-            %ESPTOOL% --chip esp32p4 -p %%P -b 460800 --before %DEFAULT_RESET% --after %HARD_RESET% --connect-attempts 1 !WRITE_FLASH! %FLASH_OPTS% 0x2000 "!BL!" 0x8000 "!PT!" 0x10000 "!APP!" 0x920000 "!OTAD!"
+            %ESPTOOL% --chip esp32p4 -p %%P -b 230400 --before %DEFAULT_RESET% --after %HARD_RESET% --connect-attempts 1 !WRITE_FLASH! %FLASH_OPTS% !FLASH_ARGS!
             if not errorlevel 1 set "RC=0"
         )
     )
 ) else (
-    %ESPTOOL% --chip esp32p4 -b 460800 --before %DEFAULT_RESET% --after %HARD_RESET% --connect-attempts 1 !WRITE_FLASH! %FLASH_OPTS% 0x2000 "!BL!" 0x8000 "!PT!" 0x10000 "!APP!" 0x920000 "!OTAD!"
+    %ESPTOOL% --chip esp32p4 -b 230400 --before %DEFAULT_RESET% --after %HARD_RESET% --connect-attempts 1 !WRITE_FLASH! %FLASH_OPTS% !FLASH_ARGS!
     if not errorlevel 1 set "RC=0"
 )
 
 echo(
 if "!RC!"=="0" (
     echo ============================================================
-    echo    SUCCESS - the Tab5 is restarting with the KX3 firmware.
+    if defined APP_ONLY (
+        echo    SUCCESS - app partition flashed at 0x10000.
+        echo    NVS settings ^(radio kind, dongle, callsign^) were kept.
+    ) else (
+        echo    SUCCESS - the Tab5 is restarting with the KX3 firmware.
+    )
     echo(
     echo    NOW POWER-CYCLE THE RADIO: unplug its USB AND DC power,
     echo    wait a few seconds, reconnect. Every flash wedges it.

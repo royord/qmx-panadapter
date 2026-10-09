@@ -32,6 +32,15 @@ static const char *TAG = "cat";
 #define CAT_POLL_INTERVAL_MS 50   // Phase 5.10H: was 200 -> 100 -> 50 (FA every 150 ms)
 #define CAT_RX_BUFFER_SIZE 128
 
+/* KX3: how often the poll task re-asks FR; to keep the receive-VFO state
+ * fresh, and 30 ms then lets the async reply land before acting on it. The
+ * Elecraft K3S/K3/KX3 Programmer's Reference is explicit that "FA" (the
+ * frequency write behind every touch-to-tune here) addresses VFO A ONLY, so a
+ * KX3 left receiving on VFO B or in split silently defeats tap-to-tune.
+ * 3 s is ~20 full FA/MD/FW rotation cycles; the pipe cost of one extra 3-byte
+ * question on that cadence is negligible. */
+#define KX3_VFO_REFRESH_US (3 * 1000000)
+
 #define EVT_DEV_CONNECTED  BIT0
 #define EVT_DEV_GONE       BIT1
 /* How long the radio may say nothing while we are polling it every 50 ms
@@ -109,8 +118,14 @@ static int  s_cw_offset_hz = 700;   // CW LO offset read from QMX at connect, de
 // Which VFO the radio RECEIVES on, from "FR;": 0 = VFO A, 1 = VFO B, 2 = Split.
 // -1 = not asked yet / no answer. We poll and write FA, i.e. VFO A ONLY, so a radio
 // receiving on B makes every frequency the Tab5 sets invisible and inaudible while
-// band select still appears to work - see ensure_rx_vfo_a(). (Markus DL8MBY.)
-static int  s_rx_vfo_mode = -1;
+// band select still appears to work. kx3_vfo_watchdog() (KX3 only) refreshes this
+// every KX3_VFO_REFRESH_US and returns the radio to VFO A; cat_set_frequency()
+// re-asserts FR0; before an FA; write when this says the radio is elsewhere.
+// (Markus DL8MBY.)
+static volatile int s_rx_vfo_mode = -1;
+// Last FR; refresh timestamp for the KX3 VFO-A watchdog (see kx3_vfo_watchdog(),
+// defined ahead of poll_task). int64_t microseconds from esp_timer_get_time().
+static int64_t s_kx3_vfo_last_fr_us = 0;
 // Does the radio report a permanently fitted GPS (QMX+ Internal)? Read once at
 // link-up from its GPS & Ser. Ports menu. False until asked, and false on any
 // firmware that does not report the item - the safe direction (#174).
@@ -2162,6 +2177,42 @@ static bool iq_mode_handshake(int max_attempts)
     return s_iq_mode_confirmed;
 }
 
+/* KX3 VFO-A watchdog. Elecraft K3S/K3/KX3 Programmer's Reference (FA / FR):
+ *   - "FAxxxxxxxxxxx;" - the command every frequency commit in this firmware
+ *     writes (touch-to-tune tap, drag settle, band change, spot, memory
+ *     recall, wheel, web UI) - addresses VFO A ONLY;
+ *   - "FRn;" reports which VFO the radio receives on (0 = A, 1 = B, 2 = split);
+ *   - "Use FR0; to cancel SPLIT" is the reference's own cure for a radio left
+ *     on B or split.
+ * kx3_link_up() asserts VFO A once at connect; this low-rate refresh re-learns
+ * FR; and, if the operator has since flipped the KX3 to VFO B/split on the
+ * front panel, takes it back to VFO A. Without it, the next touch-to-tune
+ * writes FA to a VFO nobody is listening to, which reads as "tapping does
+ * nothing" (the display moves, the audio does not - see s_rx_vfo_mode).
+ * Never acts while WE hold the CW-offset split (s_split_engaged): that dance
+ * owns the VFO and manages its own teardown.
+ * Poll-task only (it owns the pipe), and internally timer-gated to
+ * KX3_VFO_REFRESH_US, so calling it every rotation costs nothing for ~59 of
+ * every 60 iterations; the 40 ms wait after FR; is one rotation tick on a 3 s
+ * cadence and lets the async reply land before s_rx_vfo_mode is read. */
+static void kx3_vfo_watchdog(void)
+{
+    if (radio_get_kind() != RADIO_KX3) return;   // QMX has no operator-flippable VFO B
+    if (s_split_engaged) return;                 // our CW-offset split owns the VFO
+    int64_t now = esp_timer_get_time();
+    if (now - s_kx3_vfo_last_fr_us < KX3_VFO_REFRESH_US) return;
+    s_kx3_vfo_last_fr_us = now;
+    esp_err_t e = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"FR;", 3, 200);
+    if (e != ESP_OK) return;                     // link trouble - don't pile on
+    vTaskDelay(pdMS_TO_TICKS(40));               // let the reply arrive (async RX)
+    if (s_rx_vfo_mode != 0) {
+        ESP_LOGW(TAG, "KX3 VFO A watchdog: radio receiving on VFO mode %d - FR0; "
+                      "(Elecraft ref: 'Use FR0; to cancel SPLIT')", s_rx_vfo_mode);
+        cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"FR0;", 4, 200);
+        s_rx_vfo_mode = 0;   // optimistically A; the next refresh confirms (self-healing)
+    }
+}
+
 static void poll_task(void *arg)
 {
     ESP_LOGI(TAG, "Poll task started (%d ms interval, alternating FA/MD)", CAT_POLL_INTERVAL_MS);
@@ -2494,6 +2545,10 @@ static void poll_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
             continue;
         }
+        // KX3 only (internally timer-gated to KX3_VFO_REFRESH_US): keep the
+        // receive VFO on A so the touch-to-tune FA; writes land where the
+        // operator is listening. Runs on the poll task, which owns the pipe.
+        kx3_vfo_watchdog();
         // Phase 5.10G: 3-way rotation FA / MD / FW (passband width). A 4th
         // phase (PC;SW;) is added while cat_tune_poll_set_active(true) - live
         // power/SWR readout during QMX SWR Tune mode (1_04+, see
@@ -3249,6 +3304,32 @@ esp_err_t cat_set_frequency(uint32_t freq_hz)
         return ESP_ERR_TIMEOUT;
     }
     s_last_tx_us = now;
+
+    // KX3 spec (Elecraft K3S/K3/KX3 Programmer's Reference, FA / FR): "FA"
+    // addresses VFO A ONLY, and "Use FR0; to cancel SPLIT" is the reference's
+    // own cure for a radio left receiving on VFO B (FR1) or split (FR2).
+    // Every frequency commit here funnels through this single write (panadapter
+    // tap, drag settle, band change, spot, memory recall, wheel, web UI), so if
+    // the KX3 is not on VFO A the operator hears "tapping does nothing" while
+    // the readout moves. kx3_vfo_watchdog() keeps s_rx_vfo_mode fresh and
+    // returns the radio to VFO A within a few seconds of any front-panel flip;
+    // this guard covers the writes in between. FR0; while already on VFO A is a
+    // no-op per the reference (it merely selects A), so this only ever writes
+    // when the last FR; answer said the radio was elsewhere. Never while WE
+    // hold the CW-offset split (s_split_engaged) - that dance owns the VFO and
+    // manages its own teardown.
+    if (radio_get_kind() == RADIO_KX3 && !s_split_engaged && s_rx_vfo_mode != 0) {
+        ESP_LOGW(TAG, "KX3 receiving on VFO mode %d - FR0; (VFO A) before FA%011lu;",
+                 s_rx_vfo_mode, (unsigned long)freq_hz);
+        esp_err_t efr0 = cdc_acm_host_data_tx_blocking(
+            s_cdc_dev, (const uint8_t *)"FR0;", 4, 200);
+        if (efr0 == ESP_OK) {
+            s_rx_vfo_mode = 0;
+            vTaskDelay(pdMS_TO_TICKS(30));   // let the switch land before FA
+        } else {
+            ESP_LOGW(TAG, "FR0; TX failed 0x%x - writing FA anyway", efr0);
+        }
+    }
 
     // Format: "FA" + 11 digits zero-padded + ";"
     char cmd[16];

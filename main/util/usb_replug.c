@@ -145,6 +145,7 @@ static void usb_stale_detect_task(void *arg)
     int      prev_devices = 0;
     int64_t  last_replug_us = 0;
     int64_t  last_toast_us  = 0;
+    bool     ever_active = false; // any driver was live at least once THIS boot
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(DET_CHECK_MS));
 
@@ -156,6 +157,10 @@ static void usb_stale_detect_task(void *arg)
         // replugged it mid-handshake (hardware-hit 2026-08-03) - killing a
         // healthy connect and wedging the port.
         if (cat_is_ready() || usb_hid_mouse_present() || audio_uac_active()) {
+            // Alive = this boot has a real, openable device. The zombie branch
+            // below is ONLY for something that was alive and then died
+            // mid-stream, so remember it for the whole boot.
+            ever_active = true;
             baseline = fails;
             wedge_checks = 0;
             zombie_checks = 0;
@@ -185,6 +190,23 @@ static void usb_stale_detect_task(void *arg)
          * "Failed to add new device") and abort()ed the whole Tab5 - the repeating
          * reboot at ~67 s of uptime, bench 2026-10-07. Nothing here is stuck. */
         if (radio_get_kind() == RADIO_KX3) {
+            zombie_checks = 0;
+            prev_devices = 0;
+            continue;
+        }
+        /* FOREIGN-DEVICE GUARD (bench 2026-10-07: repeating ~68 s reboot).
+         * "Present but never opened" only deserves the VBUS-cut replug when it
+         * is a genuine ZOMBIE - a radio that was OPEN this boot and then died
+         * mid-stream (the QMX power-off + failed UAC teardown this branch was
+         * proven to cure). A device that was NEVER openable this boot is
+         * foreign: the DigiRig's serial half under a QMX profile, a USB stick,
+         * anything that is not the radio we are waiting for. Replugging one of
+         * those cuts VBUS out from under a hub tree that is mid-enumeration and
+         * abort()s the whole Tab5 in IDF hub.c:435 ("HCD Pipe alloc error" ->
+         * "Failed to add new device" -> ESP_ERROR_CHECK on dev_tree_node_dev_gone).
+         * So: no ever-open this boot -> leave the bus alone. The 3-strikes
+         * toast below stays reserved for radio-like zombies. */
+        if (!ever_active) {
             zombie_checks = 0;
             prev_devices = 0;
             continue;

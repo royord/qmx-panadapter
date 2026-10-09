@@ -408,6 +408,8 @@ void bsp_generate_poweroff_signal();
 
 bool bsp_headphone_detect();
 
+void bsp_set_speaker_enable(bool en);
+
 void bsp_set_ext_antenna_enable(bool en);
 
 void bsp_set_wifi_power_enable(bool en);

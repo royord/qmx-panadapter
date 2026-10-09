@@ -330,8 +330,9 @@ void app_main(void)
     status_bar_start();
 
     // Opens the ES8388/I2S output path before USB host claims DMA-capable RAM
-    // (see rx_audio.h). No-op unless RX audio is persisted-enabled, so this
-    // costs nothing on any unit that has never turned it on.
+    // (see rx_audio.h). Unconditional since the siggen session: the I/Q test
+    // tone must always be able to reach the Tab5 audio out, on boots that never
+    // enabled RX audio too (see rx_audio_preopen).
     rx_audio_preopen();
 
     // KX3 profile: present the root port as Full-Speed only. A DigiRig Mobile

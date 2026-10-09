@@ -277,6 +277,7 @@ restore as a text file; and a settings reset that does not need a reflash.
 
 - [Quick Guide](#quick-guide) — get on air in 10 minutes
 - [Getting help](#getting-help) — the manual on the device, and the guidance panel
+- [KX3 support](#kx3-support) — running the panadapter from an Elecraft KX3 (experimental, builds from source only)
 - [Panadapter](#panadapter) — spectrum, waterfall, zoom, touch-to-tune, S-meter, memory channels
 - [Live spots](#live-spots) — POTA, RBN and DX cluster callsigns drawn on the spectrum
 - [Spot map](#spot-map) — who is hearing YOU: RBN, PSK Reporter and WSPR reports of your own signal, on a world map
@@ -454,6 +455,36 @@ Every completed QSO is written to an ADIF log downloadable from the web UI. See 
 **Warnings you can tap.** A warning you cannot act on is half a warning. The red **"QMX IQ mode not confirmed"** banner across the top of the screen is a button — tap it for the section on that exact fault. The **"Waiting for QMX"** message carries a small **Need help?** button; it says *help* rather than *what is wrong* on purpose, since a radio that is off is often off deliberately.
 
 If a chapter does not answer your question, that is a documentation bug worth reporting — the wording of these rows is written from what operators actually say.
+
+---
+
+## KX3 support
+
+**Experimental — in development on branch `kx3`, not part of any release build.** Everything else on this page describes the released QMX firmware; this section is a status note for the KX3 work, which builds from source only.
+
+The KX3 differs from the QMX twice over, and both matter for cabling:
+
+- its I/Q output is **analog only** — the "RX I/Q" 2.5 mm jack (the quadrature outputs in the KX3 owner's manual), not a USB stream;
+- so the Tab5's USB port carries **CAT** (on the KX3's own USB serial port, or through a USB-serial dongle) while the **I/Q** arrives from a *separate* stereo line-in USB audio dongle plugged into that jack.
+
+That is two USB devices on the host port (typically through a hub), where the QMX is one composite cable carrying both.
+
+**Do not use a DigiRig Mobile for the KX3 I/Q.** A DigiRig works for **CAT only** — its serial half (a CP2102) is supported. Its built-in audio is a **mono** mic line (CM108, one channel) and cannot carry the stereo I/Q pair. The KX3 I/Q needs a separate **stereo line-in** dongle (a PCM2902-class adapter; I on the left channel, Q on the right).
+
+Using the KX3 profile, once:
+
+1. Settings drawer → **Radio → Radio type → KX3**. The KX3 sections ("KX3 CAT baud", "KX3 I/Q dongle") and the CAT probe all gate on this. It takes effect without a reboot — the CAT link retries every couple of seconds.
+2. Power the KX3 and connect its CAT: the radio's own USB serial port, or the CAT dongle's serial half.
+3. Plug the stereo line-in dongle into the KX3's **RX I/Q** jack and into the Tab5. The first stereo UAC device that passes the 16-bit / 48 kHz checks is **auto-adopted** as the I/Q source and remembered for next boot; the drawer picker still overrides.
+
+What the firmware does: the Tab5 probes the CAT device at your configured baud and then 38400 / 9600 / 19200 / 4800, sending `VN;` first and `FA;` as the plan B, classifies the radio from the reply ("QMX" in the answer → QMX; anything else that answers → Elecraft family), and remembers the VID/PID for next boot. KX3 mode also runs the Tab5's USB root port **Full-Speed-only** (the DWC patch in `tools/patches/`), because the KX3's serial dongles are Full-Speed devices often sitting behind a High-Speed hub that the stock ESP-IDF USB host cannot traverse.
+
+Where things stand:
+
+- Firmware is implemented — radio-type selector, CAT probe (including the CP210x vendor-request handling a DigiRig's serial half needs), stereo dongle auto-adopt. **No working radio/cable setup has reached the bench yet:** the CAT dongle enumerates and the probe goes out, but nothing answers. Check the radio side first: radio powered up, cable in the right jack, DigiRig set to logic-level mode, and the KX3 **CAT** menu configured.
+- A device that is plugged in but never opens (a foreign dongle, a USB stick) is **left alone** — the Tab5 never power-cycles the port for a device it would not open. (That is also the fix for the long-standing bench reboot: an earlier version raced that replug into an ESP-IDF `hub.c` abort on a ~68 s cycle.)
+
+**I/Q test tone** — the settings drawer's **I/Q test tone** section plays a 1 kHz quadrature tone on the Tab5's own audio out (L = I = cos, R = Q = sin) and shows an amber tap-to-stop banner while it runs. It exercises the whole audio path end to end with **no radio in the loop**, so a dead cable is told apart from a dead Tab5. RAM-only by design: a restart always clears it, so it can never be left on by accident.
 
 ---
 
@@ -1029,6 +1060,18 @@ The QMX's +12 kHz IF injection varies slightly between units. If signals appear 
 │              │   USB-C (any power cable)       ┌─────────────┐
 │              │ ──────────────────────────────► │  5 V source │
 └──────────────┘                                 └─────────────┘
+```
+
+**KX3 path (experimental — see [KX3 support](#kx3-support))**, instead of the single QMX cable:
+
+- **Elecraft KX3** — CAT on the radio's own USB serial port, or through a USB-serial dongle
+- **stereo line-in USB audio dongle** — I/Q from the KX3's **RX I/Q** jack (a DigiRig Mobile is CAT-only; its audio is mono, so it cannot carry I/Q)
+
+```
+┌──────────────┐   USB hub ─► CAT: KX3's own USB serial, or a USB-serial dongle
+│  M5Stack     │
+│  Tab5        │   USB hub ─► stereo line-in UAC dongle ─► KX3 "RX I/Q" jack
+└──────────────┘
 ```
 
 ### What works without the QMX connected
