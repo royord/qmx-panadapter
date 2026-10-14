@@ -1,11 +1,13 @@
 #include "cat.h"
-#include "radio.h"   // which radio we are wired to - CAT identity + IQ source
+#include "radio.h"        // which radio we are wired to - CAT identity + IQ source
+#include "util/cat_restore.h"   // what the band scan sends to undo itself
 
 #include <string.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <ctype.h>   // isxdigit - validating the UI; unique id
+#include <sys/time.h>  // gettimeofday - the GP probe compares against SNTP
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -79,6 +81,16 @@ static size_t s_mm_resp_len = 0;
 static char   s_tm_resp[16] = {0};  // last TM response, set by process_cat_message
 static size_t s_tm_resp_len = 0;
 static volatile int64_t s_tm_resp_us = 0;  // esp_timer time the TM response landed (GPS-tick sync)
+
+/* GP reply: "GP+DD.DDDDDD+DDD.DDDDDD+YYYYMMDDHHMMSS;" - 39 chars nominal, but
+ * the length is NOT asserted. The sign convention changed under us once
+ * already (the 1.04_004 manual says longitude EAST is negative; QRP Labs later
+ * fixed that as a bug and this bench runs 1_04_010), so anything that depends
+ * on the width or the signs of the coordinate fields is a hostage. Only the
+ * trailing 14 digits are parsed, and they are what we came for. */
+static char   s_gp_resp[48] = {0};
+static size_t s_gp_resp_len = 0;
+static volatile int64_t s_gp_resp_us = 0;
 static char   s_pc_resp[16] = {0};  // last PC (power output) response
 static size_t s_pc_resp_len = 0;
 static char   s_sw_resp[16] = {0};  // last SW (SWR) response
@@ -95,6 +107,11 @@ static char   s_qmx_uid[28] = {0};
 // decibels"), so dB = this / 4 and the drawer slider works in dB to match the
 // radio's display exactly.
 static volatile int s_af_gain = -1;
+/* Last keyer speed read back via KS;, in WPM. -1 = never read.
+ * ⛔ NOT 0 for "unknown": 0 is straight-key mode on this radio (op
+ * manual 4.5), so a 0 sentinel here would make a real setting
+ * indistinguishable from never having asked. */
+static volatile int s_keyer_wpm = -1;
 // Last RF gain read back via RG;, in dB (the radio's own unit here - unlike AG
 // there is no quarter-dB scaling). -1 = never read. This is the per-band "RF
 // gain (dB)" from the QMX's Band Configuration, 0-99, default 54.
@@ -130,13 +147,109 @@ static int64_t s_kx3_vfo_last_fr_us = 0;
 // link-up from its GPS & Ser. Ports menu. False until asked, and false on any
 // firmware that does not report the item - the safe direction (#174).
 static bool s_qmx_gps_source_internal = false;
+/* Has the radio ANSWERED the GPS-source question yet? Distinct from the answer
+ * itself: "no permanent GPS" and "not asked yet" are both false, and treating
+ * them the same is what let us overwrite a GPS radio's clock in the first ~20 s
+ * of a session, before the query had landed. See push_to_qmx() in time_sync.c. */
+static bool s_qmx_gps_source_known = false;
+
+/* Position from the last GP reply we understood. 0,0 is a real place in the
+ * Atlantic, so "never had one" is a flag, not a magic value. */
+static double s_qmx_gps_lat, s_qmx_gps_lon;
+static bool   s_qmx_gps_pos_valid = false;
 static cat_band_entry_t s_band_list[CAT_MAX_BANDS];
 static int              s_band_count = 0;
 
+/* === BAND-LIST TEST STUB (2026-10-04, Brian WA6JFK). KEPT DELIBERATELY. ===
+ *
+ * ⛔ NOT a temp instrument - do NOT delete it at a cleanup. It was written to
+ * test one fix and kept on purpose (operator's decision, 2026-10-04), because
+ * it is the ONLY way to exercise a short-band radio on this bench and the bug
+ * class it tests has now recurred three times. Nothing here is on a hot path:
+ * one `>= 0` compare in cat_get_band_list().
+ *
+ * The fix for "the browser offers bands the radio does not have" cannot be
+ * tested on this bench: the QMX+ here reports all 12 bands, so filtered and
+ * unfiltered produce an identical dropdown. This pretends the radio has a
+ * SHORT band list so the difference becomes visible.
+ *
+ * ⛔ RAM ONLY, NEVER NVS, and cleared by any reboot. A persisted band stub
+ * would be indistinguishable from a radio fault later, and the whole point of
+ * this fix is that a wrong band list is hard to spot.
+ *
+ * Set with {"action":"band_stub","names":"160,80,60,40,30,20"}; an empty or
+ * absent "names" clears it and the real list comes back. */
+static cat_band_entry_t s_band_stub[CAT_MAX_BANDS];
+static int              s_band_stub_count = -1;   /* <0 = inactive */
+
+int cat_band_stub_set(const char *csv)
+{
+    if (!csv || !*csv) {
+        s_band_stub_count = -1;
+        ESP_LOGW(TAG, "BAND STUB CLEARED - the real radio band list is back");
+        return -1;
+    }
+    char tmp[128];
+    snprintf(tmp, sizeof(tmp), "%s", csv);
+    int n = 0;
+    for (char *tok = strtok(tmp, ","); tok && n < CAT_MAX_BANDS; tok = strtok(NULL, ",")) {
+        while (*tok == ' ') tok++;
+        char *e = tok + strlen(tok);
+        while (e > tok && (e[-1] == ' ' || e[-1] == 'm' || e[-1] == 'M')) *--e = 0;
+        if (!*tok) continue;
+        snprintf(s_band_stub[n].name, sizeof(s_band_stub[n].name), "%s", tok);
+        /* center_hz is left 0: nothing in the filtering path reads it, and a
+         * made-up centre would be a second lie to debug later. */
+        s_band_stub[n].center_hz = 0;
+        n++;
+    }
+    s_band_stub_count = n;
+    ESP_LOGW(TAG, "BAND STUB ACTIVE: %d band(s) - the radio's real list is HIDDEN", n);
+    return n;
+}
+
 const cat_band_entry_t *cat_get_band_list(int *out_count)
 {
+    if (s_band_stub_count >= 0) {          /* TEMP TEST STUB - see above */
+        if (out_count) *out_count = s_band_stub_count;
+        return s_band_stub;
+    }
     if (out_count) *out_count = s_band_count;
     return s_band_list;
+}
+
+/* Does the RADIO have this band? (2026-10-04, Brian WA6JFK.)
+ *
+ * WHY THIS IS A SHARED PREDICATE AND NOT THREE COPIES OF THE TEST:
+ * every Tab5 screen already filters its band buttons against the live CAT
+ * band list - ft8_screen_view.c's build_preset_column() walks it by name,
+ * wspr_screen_view.c's wspr_bands_available() does the same - and the web
+ * server did not. It served static tables straight to the browser, so the
+ * page offered bands the radio does not have, and picking one sent an FA for
+ * a frequency the QMX cannot tune. Brian reported 6 m / 10 m / 12 m from the
+ * web UI landing on a frequency nowhere near the band.
+ *
+ * ⛔ nradio == 0 MEANS "CAT HAS NOT TOLD US YET", NOT "NO BANDS". It must
+ * allow everything, exactly as wspr_bands_available() already does - the band
+ * list arrives seconds after the browser can first ask, and filtering against
+ * an empty list would serve an empty dropdown and read as a worse bug than
+ * the one being fixed. Same rule as the CW filter widths at webserver.c:4428,
+ * where "the radio did not say" means show all eight.
+ *
+ * This is the third browser-vs-Tab5 asymmetry of the same shape, after
+ * Samuel W7STF's set_mode and set_freq. The others were a dropped call; this
+ * one is a missing filter. */
+bool cat_radio_has_band(const char *name)
+{
+    if (!name || !*name) return false;
+    int n = 0;
+    const cat_band_entry_t *b = cat_get_band_list(&n);
+    if (n <= 0 || !b) return true;        /* not known yet - allow all */
+    /* .name is a fixed char array in cat_band_entry_t, never a pointer, so
+     * there is nothing to null-check here - GCC 12+ rejects the attempt. */
+    for (int i = 0; i < n; i++)
+        if (strcmp(b[i].name, name) == 0) return true;
+    return false;
 }
 static uint64_t s_last_tx_us = 0;   // for rate-limiting cat_set_frequency
 // True only while WE hold the radio in split for the CW transmit offset. Lives
@@ -144,7 +257,8 @@ static uint64_t s_last_tx_us = 0;   // for rate-limiting cat_set_frequency
 // further up this file, refuses a RIT offset while it is set - the two controls
 // are mutually exclusive (see that function).
 static bool     s_split_engaged = false;
-static volatile bool s_poll_paused = false;  // v0.12.0: cooperative pause for FT8 TX bursts
+static volatile uint32_t s_poll_holds  = 0;      /* cat_hold_t bits - see cat.h */
+static volatile bool     s_poll_paused = false;  /* == (s_poll_holds != 0), read on the poll path */
 
 // Pending mode digit (Kenwood MD digit '1'-'9') requested from the LVGL thread.
 // 0 = nothing pending. Drained by the poll task to avoid a CDC race.
@@ -207,6 +321,11 @@ static volatile bool s_force_rx_pending = false;
 static volatile uint32_t s_pending_af_gain_p1 = 0;
 // Set when someone wants the radio's current AF gain read back (drawer open).
 static volatile bool s_af_gain_query_pending = false;
+/* +1 encoded for the same reason as the AF gain above: 0 has to mean
+ * "nothing pending" while a genuine request of 0 WPM (straight key)
+ * still goes through. */
+static volatile uint32_t s_pending_keyer_p1 = 0;
+static volatile bool s_keyer_query_pending = false;
 /* Pending CW profile (#359), drained by the poll task. centre_hz 0 = nothing
  * queued. One slot: a second request before the first is applied simply
  * replaces it, which is what a picker's double-tap should do anyway. */
@@ -434,6 +553,8 @@ void cat_user_pause_set(bool paused)
         s_pending_rf_gain_p1    = 0;
         s_af_gain_query_pending = false;
         s_rf_gain_query_pending = false;
+        s_pending_keyer_p1      = 0;
+        s_keyer_query_pending   = false;
         ESP_LOGI(TAG, "CAT paused by operator - radio released (no polling)");
     } else {
         // Coming back: the radio may have been through its own menu, which can
@@ -447,6 +568,22 @@ void cat_user_pause_set(bool paused)
 
 int cat_get_af_gain(void) { return s_af_gain; }
 
+void cat_request_keyer_wpm(uint16_t wpm)
+{
+    /* No clamp. The CAT manual states no range for KS, so a ceiling here
+     * would be invented, and an invented ceiling silently refusing a speed
+     * the radio would have accepted is worse than letting the radio answer
+     * for itself. The read-back below is what the surfaces then show. */
+    s_pending_keyer_p1 = (uint32_t)wpm + 1;
+}
+
+void cat_query_keyer_wpm(void)
+{
+    s_keyer_query_pending = true;
+}
+
+int cat_get_keyer_wpm(void) { return s_keyer_wpm; }
+
 void cat_query_af_gain(void)
 {
     // Just asks; process_cat_message() stores the answer in s_af_gain. Queued
@@ -457,6 +594,7 @@ void cat_query_af_gain(void)
 
 int cat_get_cw_offset_hz(void) { return s_cw_offset_hz; }
 bool cat_qmx_gps_source_internal(void) { return s_qmx_gps_source_internal; }
+bool cat_qmx_gps_source_known(void)    { return s_qmx_gps_source_known; }
 const char *cat_get_qmx_fw(void) { return s_qmx_fw; }
 const char *cat_get_qmx_uid(void) { return s_qmx_uid; }
 bool cat_get_iq_mode_confirmed(void) { return s_iq_mode_confirmed; }
@@ -566,10 +704,37 @@ esp_err_t cat_pwr_swr_async_read(float *power_w, float *swr)
     return ESP_OK;
 }
 
-void cat_poll_set_paused(bool paused)
+/* See cat.h for the measurement that made this a count instead of a flag. */
+static const char *hold_name(uint32_t mask)
 {
-    s_poll_paused = paused;
-    ESP_LOGI(TAG, "background poll %s", paused ? "PAUSED (TX burst owns the link)" : "resumed");
+    if (mask == 0)                                     return "nobody";
+    if (mask == CAT_HOLD_TX_BURST)                     return "a TX burst";
+    if (mask == CAT_HOLD_TIME_SYNC)                    return "the time sync";
+    return "a TX burst + the time sync";
+}
+
+void cat_poll_hold(cat_hold_t who)
+{
+    const uint32_t before = s_poll_holds;
+    s_poll_holds |= (uint32_t)who;
+    s_poll_paused = (s_poll_holds != 0);
+    if (s_poll_holds != before)
+        ESP_LOGI(TAG, "background poll HELD by %s", hold_name(s_poll_holds));
+}
+
+void cat_poll_release(cat_hold_t who)
+{
+    const uint32_t before = s_poll_holds;
+    s_poll_holds &= ~(uint32_t)who;
+    s_poll_paused = (s_poll_holds != 0);
+    if (s_poll_holds != before)
+        ESP_LOGI(TAG, "background poll released by %s - now held by %s",
+                 hold_name((uint32_t)who), hold_name(s_poll_holds));
+}
+
+bool cat_poll_held_by_other(cat_hold_t me)
+{
+    return (s_poll_holds & ~(uint32_t)me) != 0;
 }
 
 static void link_task(void *arg);
@@ -584,6 +749,30 @@ static esp_err_t cat_finish_open(cdc_acm_dev_hdl_t h);
 static void cat_probe_new_dev_sink(usb_device_handle_t usb_dev);
 static void process_cat_message(const char *msg, size_t len);
 static void diag_log_rx(const char *msg, size_t len);
+
+/* ⭐ "IS THE TAB5 EVEN LISTENING YET?" - see cat_host_is_up().
+ *
+ * Dennis WN4FLA and Gyula HA3HZ, 2026-09-30/10-01: the "Now turn on or reboot
+ * your QMX/+" overlay appears the instant the screen does, which is BEFORE this
+ * function has run. At that point the Tab5 has not opened the CDC host at all,
+ * so a QMX that is switched on and perfectly healthy is still reported as
+ * missing - the prompt is describing the Tab5's own start-up, not the radio.
+ *
+ * Measured on bench dev: cat_init() returns at 7,403 ms. Everything before that
+ * is the Tab5's own boot and nothing about the radio can be concluded from it.
+ *
+ * ⛔ DELIBERATELY NO SETTLE TIMER ON TOP. Once the host is open the prompt is
+ * legitimate again - the radio may genuinely be off, or still enumerating - and
+ * a fixed "wait N seconds more" would be inventing a number. The same bench
+ * shows 45 s between cat_init() and the first CAT answer when the QMX needed a
+ * power cycle, so any settle long enough to cover enumeration would be long
+ * enough to hide a genuinely dead radio. */
+static volatile bool s_cat_host_up;
+
+bool cat_host_is_up(void)
+{
+    return s_cat_host_up;
+}
 
 esp_err_t cat_init(void)
 {
@@ -638,10 +827,19 @@ err = cdc_acm_host_install(NULL);
         link_task, "cat_link", 5120, NULL, 5, NULL, 1);
     if (ok != pdPASS) return ESP_FAIL;
 
+    // The radio we are actually wired to, not a hard-coded QMX (kx3): a KX3's CAT
+    // is a CP2102 bridge whose VID/PID nobody can be expected to know, so
+    // radio_cat_vid_pid() returns whatever radio.c has pinned or, at 0:0, sends
+    // the link task down the protocol-probe path instead.
     uint16_t cvid, cpid;
     radio_cat_vid_pid(&cvid, &cpid);
-    ESP_LOGI(TAG, "CAT link task started, waiting for %s (VID=0x%04X PID=0x%04X)",
-             radio_kind_name(), cvid, cpid);
+    if (cvid | cpid)
+        ESP_LOGI(TAG, "CAT link task started, waiting for %s (VID=0x%04X PID=0x%04X)",
+                 radio_kind_name(), cvid, cpid);
+    else
+        ESP_LOGI(TAG, "CAT link task started, %s identity not pinned - probing by protocol",
+                 radio_kind_name());
+    s_cat_host_up = true;
     return ESP_OK;
 }
 
@@ -920,7 +1118,31 @@ static void process_cat_message(const char *msg, size_t len)
             hz = hz * 10 + (d - '0');
         }
         ui_update_passband_width(hz);
+        /* ⛔ ON THE EDGE, NOT ON EVERY FW. This handler runs for every FW
+         * response, and the poll task cycles FA/MD/FW continuously - so
+         * setting the query here unconditionally asked the radio for its
+         * keyer speed every 200 ms forever. MEASURED on the bench the first
+         * time it was flashed: a KS; query and a read-back on every poll
+         * cycle, filling the log and spending the CAT pipe on a value that
+         * changes when the operator turns a knob.
+         *
+         * Ask once, when the link actually comes up, so the web settings
+         * page has a real number the first time it is opened rather than
+         * reporting -1 and only showing the speed on a second load. */
+        bool was_ready = s_cat_ready;
         s_cat_ready = true;
+        if (!was_ready) s_keyer_query_pending = true;
+        return;
+    }
+    /* GP response: GPS coordinates + date + time, straight from the receiver
+     * rather than from the radio's own clock. That distinction is the whole
+     * point - see cat_gps_gp_sync(). Accepted on the prefix and a plausible
+     * length only; the fields are picked apart in cat_gps_gp_parse(). */
+    if (len >= 16 && len < sizeof(s_gp_resp) && msg[0] == 'G' && msg[1] == 'P') {
+        s_gp_resp_us  = esp_timer_get_time();
+        s_gp_resp_len = len;
+        memcpy(s_gp_resp, msg, len);
+        s_gp_resp[len] = '\0';
         return;
     }
     // TM response: "TMhhmmss;" - 9 chars, real-time-clock time-of-day.
@@ -998,6 +1220,18 @@ static void process_cat_message(const char *msg, size_t len)
         if (v >= 0 && v <= CAT_AF_GAIN_MAX) {
             s_af_gain = v;
             ESP_LOGI(TAG, "AF gain read back: %d (%.2f dB)", v, v * 0.25);
+        }
+        return;
+    }
+    /* KS response: "KSnnn;" - keyer speed in WPM. The radio is the authority
+     * on what it accepted, so this is what every surface displays, not the
+     * number that was sent. 0 is straight-key mode and is a legal answer. */
+    if (len >= 3 && msg[0] == 'K' && msg[1] == 'S') {
+        int v = atoi(msg + 2);
+        if (v >= 0 && v <= 999) {
+            s_keyer_wpm = v;
+            if (v == 0) ESP_LOGI(TAG, "Keyer speed read back: 0 (straight key)");
+            else        ESP_LOGI(TAG, "Keyer speed read back: %d WPM", v);
         }
         return;
     }
@@ -2362,6 +2596,33 @@ static void poll_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
             continue;
         }
+        if (s_keyer_query_pending) {
+            s_keyer_query_pending = false;
+            static const char q[] = "KS;";
+            esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)q, 3, 200);
+            ESP_LOGI(TAG, "Keyer speed query KS; (%s)", err == ESP_OK ? "sent" : "fail");
+            vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
+            continue;
+        }
+        uint32_t ks_p1 = s_pending_keyer_p1;
+        if (ks_p1 != 0) {
+            s_pending_keyer_p1 = 0;
+            unsigned ks = (unsigned)(ks_p1 - 1);
+            /* 3 digits, the Kenwood TS-480 form this radio emulates and the
+             * same shape its AG/RG commands use. */
+            char cmd[16];
+            int n = snprintf(cmd, sizeof cmd, "KS%03u;", ks);
+            esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd,
+                                                          (size_t)n, 200);
+            ESP_LOGI(TAG, "Keyer speed -> %s (%s)", cmd, err == ESP_OK ? "ok" : "fail");
+            /* ⛔ ALWAYS READ BACK. A successful CDC write only proves the
+             * bytes reached the radio - the lesson Q9/IQ mode taught the hard
+             * way - and here it also resolves the undocumented range: if the
+             * QMX clamps, the surfaces show what it clamped to. */
+            if (err == ESP_OK) s_keyer_query_pending = true;
+            vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
+            continue;
+        }
         if (s_rf_gain_query_pending) {
             s_rf_gain_query_pending = false;
             static const char q[] = "RG;";
@@ -2684,7 +2945,7 @@ static void poll_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* KX3 session link-up — the compact counterpart to the QMX welcome block
+/* KX3 session link-up - the compact counterpart to the QMX welcome block
  * above. The KX3 and the I/Q dongle are TWO separate USB devices, so:
  *   - CAT has nothing to enable for the panadapter (no Q9 IQ mode);
  *   - there is no USB-audio TX path open, so nothing to defend against via VOX;
@@ -2749,6 +3010,79 @@ static void kx3_link_up(void)
          * wspr/ft8 lanes - feeds off this flag). */
         if (s_rx_vfo_mode >= 0) s_cat_ready = true;
     }
+}
+
+/* ⭐ PUT THE RADIO BACK WHERE THE BAND SCAN FOUND IT. Same contract as
+ * qmx_term.c's restore, and written the same way round: only act if it actually
+ * moved, so a radio the menus left alone is never written to.
+ *
+ * Sent directly rather than via cat_set_frequency_forced() / cat_request_mode():
+ * both of those route through poll_task, which does not exist yet at this point
+ * in link-up. The blocking write is the same one the scan itself uses, so if the
+ * scan could talk to the radio, so can this.
+ *
+ * ⛔ THE DECISION IS IN util/cat_restore.c, NOT HERE, because this branch cannot
+ * be reached on the bench: the band menus do not move this QMX's dial, so
+ * frequency and mode read identical before and after and nothing is ever
+ * restored. The save half is proven on hardware; this half is proven by
+ * test/cat_restore_harness.c and by the deliberate entry point below.
+ *
+ * ⚠ The WRITES have still never gone out after a real scan. */
+static void band_scan_restore(uint32_t pre_freq, char pre_mode_digit)
+{
+    const cat_restore_plan_t plan =
+        cat_restore_plan(pre_freq, pre_mode_digit, s_last_freq_hz, s_last_mode_digit);
+
+    if (plan.send_freq) {
+        char fa[20];
+        snprintf(fa, sizeof(fa), "FA%011lu;", (unsigned long)plan.freq_hz);
+        ESP_LOGW(TAG, "the band scan left the radio on %lu Hz - restoring %lu Hz",
+                 (unsigned long)s_last_freq_hz, (unsigned long)plan.freq_hz);
+        if (cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)fa,
+                                          strlen(fa), 200) == ESP_OK) {
+            s_last_freq_hz = plan.freq_hz;
+            ui_update_frequency(plan.freq_hz);
+        } else {
+            ESP_LOGW(TAG, "restore of %lu Hz could not be sent", (unsigned long)plan.freq_hz);
+        }
+    }
+
+    if (plan.send_mode) {
+        char md[8];
+        snprintf(md, sizeof(md), "MD%c;", plan.mode_digit);
+        ESP_LOGW(TAG, "the band scan left the radio in mode '%c' - restoring '%c'",
+                 s_last_mode_digit ? s_last_mode_digit : '?', plan.mode_digit);
+        if (cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)md,
+                                          strlen(md), 200) != ESP_OK)
+            ESP_LOGW(TAG, "restore of mode '%c' could not be sent", plan.mode_digit);
+    }
+}
+
+/* ⛔ DELIBERATE TEST ENTRY POINT - the only way this restore has ever run.
+ *
+ * The bench QMX's band menus leave the dial where it was, so the restore branch
+ * is unreachable here no matter how many link-ups are watched. This runs the
+ * REAL function with a "where it was" the caller supplies, so a known-wrong
+ * value makes the radio move and the FA;/MD; writes can be seen on the dial and
+ * in the log. It does not simulate the restore - it IS the restore.
+ *
+ * POST /api/cmd {"action":"band_scan_restore_test","hz":<Hz>,"mode":"<digit>"}
+ *
+ * Nothing calls it in normal operation. It sends no TX and touches only VFO A
+ * and the mode. */
+void cat_band_scan_restore_test(uint32_t pre_freq, char pre_mode_digit)
+{
+    if (!s_cdc_dev) {
+        ESP_LOGW(TAG, "restore test: no CAT link");
+        return;
+    }
+    ESP_LOGW(TAG, "restore test: pretending the scan found %lu Hz mode '%c' "
+                  "(radio now reads %lu Hz mode '%c')",
+             (unsigned long)pre_freq,
+             (pre_mode_digit >= '1' && pre_mode_digit <= '9') ? pre_mode_digit : '?',
+             (unsigned long)s_last_freq_hz,
+             s_last_mode_digit ? s_last_mode_digit : '?');
+    band_scan_restore(pre_freq, pre_mode_digit);
 }
 
 static void link_task(void *arg)
@@ -3078,11 +3412,16 @@ static void link_task(void *arg)
                          * meaning. Anything else (Paddle port) means no permanent
                          * GPS, which is the safe default. */
                         s_qmx_gps_source_internal = (strstr(s_mm_resp, "Internal") != NULL);
+                        s_qmx_gps_source_known    = true;
                         ESP_LOGI(TAG, "QMX GPS source: %s%s", s_mm_resp + 2,
                                  s_qmx_gps_source_internal ? "  (permanent GPS)" : "");
                     } else {
                         /* Older firmware may not have the item at all. Not an
-                         * error, and not a reason to claim anything either way. */
+                         * error, and not a reason to claim anything either way -
+                         * but it IS an answer: this radio will never tell us, so
+                         * stop deferring the time push on its account. */
+                        s_qmx_gps_source_internal = false;
+                        s_qmx_gps_source_known    = true;
                         ESP_LOGI(TAG, "GPS source not reported by this firmware - "
                                       "falling back to clock-agreement detection");
                     }
@@ -3103,6 +3442,46 @@ static void link_task(void *arg)
             // first try once the menu is ready; keep some margin but don't
             // make the user stare at "---" for 10+ seconds.
             vTaskDelay(pdMS_TO_TICKS(2000));
+
+            /* ⛔ REMEMBER WHERE THE RADIO WAS - THE SCAN BELOW MOVES IT.
+             *
+             * The band scan walks the QMX's own "Band config." menus, and
+             * qmx_term.c's header already records what that costs: "leave the
+             * menus, and the radio is on 160 m whatever band it started on."
+             * qmx_term.c saves and restores frequency and mode around a menu
+             * visit for exactly this reason. This scan drives the same menus
+             * and restored nothing, so every CAT link-up quietly dumped the
+             * operator on 160 m in whatever mode the menus left behind.
+             *
+             * John W5JSS, 2026-10-01: his WSPR page was set to 20 m and his
+             * radio kept turning up on 1.837700 MHz in CW. His capture shows
+             * the menu pages streaming past - 80m/3573000, 60m/5358500,
+             * 40m/7074000, 30m/10136000, his own configured band centres -
+             * and his radio on 160 m afterwards. It was blamed on a CAT
+             * fault, then on his QMX's Virtual U3S beacon; it was neither,
+             * and he disabled a beacon that was innocent.
+             *
+             * Asked directly rather than read from cat_get_frequency(): this
+             * runs BEFORE poll_task starts, so the cached values are stale or
+             * empty. process_cat_message() fills them from the RX callback,
+             * which does not need the poll task. */
+            uint32_t pre_freq = 0;
+            char     pre_mode_digit = 0;
+            {
+                const char *q = "FA;MD;";
+                if (cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)q,
+                                                  strlen(q), 200) == ESP_OK) {
+                    for (int wi = 0; wi < 25 && !s_last_freq_hz; wi++)
+                        vTaskDelay(pdMS_TO_TICKS(20));
+                    vTaskDelay(pdMS_TO_TICKS(60));   /* let MD land too */
+                }
+                pre_freq       = s_last_freq_hz;
+                pre_mode_digit = s_last_mode_digit;
+                ESP_LOGI(TAG, "band scan: radio is on %lu Hz mode '%c' - will restore after",
+                         (unsigned long)pre_freq,
+                         (pre_mode_digit >= '1' && pre_mode_digit <= '9') ? pre_mode_digit : '?');
+            }
+
             {
                 s_band_count = 0;
                 int consecutive_empty = 0;
@@ -3197,6 +3576,16 @@ static void link_task(void *arg)
                 }
                 ESP_LOGI(TAG, "Band list: %d bands found", s_band_count);
             }
+
+            /* MERGE NOTE (kx3 -> main, 2026-10-14): band_scan_restore() is
+             * main's and it belongs INSIDE the radio_iq_over_usb() branch, which
+             * is what kx3 wrapped the whole QMX block in. A KX3 has no
+             * MM-addressable menu tree, so it never runs the scan above, never
+             * captured pre_freq/pre_mode_digit, and must never reach this call
+             * with those two variables at their uninitialised values - restoring
+             * "where the radio was" from a frequency nobody read is a write to
+             * the operator's dial. The KX3's link-up is the else instead. */
+            band_scan_restore(pre_freq, pre_mode_digit);
             } else {
                 kx3_link_up();
             }
@@ -3557,7 +3946,20 @@ esp_err_t cat_query_qmx_time(int *out_hour, int *out_min, int *out_sec)
     if (radio_get_kind() != RADIO_QMX) return ESP_ERR_NOT_SUPPORTED;
     if (!s_cdc_dev || !s_cat_ready) return ESP_ERR_INVALID_STATE;
 
-    cat_poll_set_paused(true);
+    /* ⛔ NOT WHILE A BURST IS KEYED. This was missing, and it is what let the
+     * RTC read clear a WSPR burst's hold 30 s into a 110.6 s transmission -
+     * see cat.h. cat_gps_tick_sync() has always had this check; this one
+     * never did, and the two run back to back. */
+    if (cat_poll_held_by_other(CAT_HOLD_TIME_SYNC)) {
+        /* ⛔ SAY SO. A silent refusal reads exactly like a periodic pass that
+         * never ran, and "no lines during the burst" would then be evidence of
+         * nothing at all. This is the line that proves the guard was reached
+         * and did its job. */
+        ESP_LOGI(TAG, "QMX RTC read skipped - %s holds the link", hold_name(s_poll_holds));
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    cat_poll_hold(CAT_HOLD_TIME_SYNC);
     s_tm_resp_len = 0;
     esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"TM;", 3, 200);
     if (err == ESP_OK) {
@@ -3565,7 +3967,7 @@ esp_err_t cat_query_qmx_time(int *out_hour, int *out_min, int *out_sec)
             vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
-    cat_poll_set_paused(false);
+    cat_poll_release(CAT_HOLD_TIME_SYNC);
 
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "TM; query TX failed: 0x%x", err);
@@ -3601,10 +4003,325 @@ static bool parse_tm_resp(int *h, int *m, int *s)
 // GPS second-tick sync. Rapidly polls TM; and catches the instant the seconds
 // field ticks over (N -> N+1) - that flip is the true GPS second boundary. On
 // success returns the h/m/s AT the flip (the NEW second) and *out_flip_us = the
-// esp_timer time the flipping TM response LANDED (stamped in the RX handler, so
-// it carries no wait-loop polling granularity). The caller then phase-locks the
+// best ESTIMATE of when that flip happened: the midpoint between the poll that
+// still read the old second and the poll that read the new one (see the block
+// comment at the flip below - handing back the arrival time instead biased
+// every reading late by a poll period plus a round trip). The caller then
+// phase-locks the
 // system clock to that beat instead of the naive whole-second apply, giving
 // roughly +/-(one TM round-trip) accuracy - drift-free and WiFi-independent.
+/* ⭐ PARSE ONLY WHAT WE CAME FOR.
+ *
+ * Documented format (CAT manual 1.04_004 p3):
+ *     GP+DD.DDDDDD+DDD.DDDDDD+YYYYMMDDHHMMSS;
+ * The coordinate fields are deliberately NOT parsed here. The manual states
+ * that longitude EAST is negative, QRP Labs later fixed that sign as a bug,
+ * and the bench radio is on 1_04_010 - so the sign convention of those fields
+ * is version-dependent and nothing should depend on it until it is measured on
+ * a real radio. The date and time are unambiguous: the last 14 characters
+ * before the semicolon, YYYYMMDDHHMMSS.
+ *
+ * WITH NO FIX THE RADIO ANSWERS `GP;` - the bare command, no data. Measured
+ * 2026-10-07 with the antenna off the bench QMX+: 40 polls, 40 empty replies,
+ * nothing parsed. At 3 characters it does not even pass the length gate in the
+ * RX handler, so it never reaches s_gp_resp; cat_gps_gp_sync() times out after
+ * 1.3 s and the caller falls back to TM;. The manual does not say this.
+ *
+ * So the range checks below are not what stands between us and a bad time on a
+ * fix-less radio - nothing arrives to check. They are there for a reply that
+ * DOES arrive and is wrong, which has been seen once (see the exactly-one-
+ * second guard in cat_gps_gp_sync()).
+ */
+bool cat_gps_gp_parse(const char *resp, size_t len,
+                      int *y, int *mo, int *d, int *h, int *mi, int *s)
+{
+    if (!resp || len < 16) return false;
+    if (resp[0] != 'G' || resp[1] != 'P') return false;
+
+    /* Drop the terminator if the caller kept it. */
+    if (resp[len - 1] == ';') len--;
+    if (len < 16) return false;
+
+    const char *dt = resp + len - 14;           /* YYYYMMDDHHMMSS */
+    for (int i = 0; i < 14; i++) {
+        if (dt[i] < '0' || dt[i] > '9') return false;
+    }
+    #define D2(p) ((dt[p] - '0') * 10 + (dt[(p) + 1] - '0'))
+    *y  = D2(0) * 100 + D2(2);
+    *mo = D2(4);
+    *d  = D2(6);
+    *h  = D2(8);
+    *mi = D2(10);
+    *s  = D2(12);
+    #undef D2
+
+    /* A GPS that has no fix can still answer with zeros or garbage. Range-check
+     * rather than trust: a wrong date from here would be worse than none, since
+     * the whole reason for using GP is that it is the TRUSTWORTHY source. */
+    if (*y < 2024 || *y > 2099) return false;
+    if (*mo < 1 || *mo > 12 || *d < 1 || *d > 31) return false;
+    if (*h > 23 || *mi > 59 || *s > 60) return false;
+
+    /* ⭐ The reply carries the POSITION too, and nothing read it until the GPS
+     * page needed it (2026-10-08). Format: "GP+DD.DDDDDD+DDD.DDDDDD+YYYY..." -
+     * DECIMAL DEGREES with an explicit sign, NOT the degrees-and-minutes that
+     * NMEA uses. The two are only distinguishable by where they came from, so
+     * this is converted nowhere: it is stored exactly as the radio sent it and
+     * the page formats it.
+     *
+     * Stashed rather than returned, because every existing caller wants the
+     * clock and changing six call sites to carry two doubles they ignore is
+     * how a parser grows a signature nobody can read. */
+    {
+        const char *p1 = resp + 2;
+        char *end1 = NULL, *end2 = NULL;
+        double la = strtod(p1, &end1);
+        double lo = (end1 && *end1) ? strtod(end1, &end2) : 0.0;
+        /* Both signs must have been consumed and the remainder must be the
+         * 14-digit timestamp with its own sign - otherwise this is a reply
+         * shape we do not understand and the position is not claimed. */
+        if (end1 && end2 && end2 != end1 &&
+            la >= -90.0 && la <= 90.0 && lo >= -180.0 && lo <= 180.0 &&
+            !(la == 0.0 && lo == 0.0)) {
+            s_qmx_gps_lat = la;
+            s_qmx_gps_lon = lo;
+            s_qmx_gps_pos_valid = true;
+        }
+    }
+    return true;
+}
+
+bool cat_qmx_gps_position(double *lat, double *lon)
+{
+    if (!s_qmx_gps_pos_valid) return false;
+    if (lat) *lat = s_qmx_gps_lat;
+    if (lon) *lon = s_qmx_gps_lon;
+    return true;
+}
+
+/* ⭐ THE SAME BRACKETING TRICK AS cat_gps_tick_sync(), BUT ON GP INSTEAD OF TM.
+ *
+ * 2026-10-07, measured on Steffen's QMX+: its GPS viewer showed a 3D fix on 14
+ * satellites and the correct UT time, while TM; walked away from UTC at a
+ * steady 445 ppm - 134 ms per 5-minute tick, over five consecutive ticks. The
+ * radio sets its internal clock from GPS at power-on and then free-runs, and
+ * TM; reports that internal clock. GP reports the RECEIVER, and carries the
+ * DATE, which TM; never did.
+ *
+ * ⛔ BUT GP IS NOT THE BETTER CLOCK, WHICH IS WHAT THIS COMMENT FIRST CLAIMED.
+ * Measured the same evening against the PC clock, three runs: GP's second
+ * boundary is 863-998 ms LATE while TM;'s is within ~100 ms. The receiver
+ * reports the PREVIOUS second - ordinary NMEA behaviour. Applying GP as a
+ * boundary left the bench Tab5 1.25 s slow. So the 445 ppm free-run above is
+ * real and is still the reason GP exists, but it is paid for in the 5-minute
+ * re-lock, not by replacing the phase source. apply_qmx_gp() in time_sync.c
+ * holds the measurement and uses this for the DATE and the GPS verdict only.
+ *
+ * The bracketing below is unchanged and still correct for what it measures:
+ * the instant GP's SS field CHANGES, taken at the midpoint of the two replies
+ * that straddle it. That instant is simply ~1 s behind the UTC second.
+ */
+esp_err_t cat_gps_gp_sync(int *out_y, int *out_mo, int *out_d,
+                          int *out_h, int *out_mi, int *out_s, int64_t *out_flip_us)
+{
+    if (!s_cdc_dev || !s_cat_ready) return ESP_ERR_INVALID_STATE;
+    /* GP arrived in 1.04_004. Older radios answer with an error, and asking
+     * them repeatedly in a 1.3 s loop is not free. */
+    if (!cat_qmx_fw_at_least(1, 4, 4)) return ESP_ERR_NOT_SUPPORTED;
+    if (cat_poll_held_by_other(CAT_HOLD_TIME_SYNC)) {
+        ESP_LOGI(TAG, "GP tick skipped - %s holds the link", hold_name(s_poll_holds));
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    cat_poll_hold(CAT_HOLD_TIME_SYNC);
+    int       prev_tod     = -1;        /* seconds of day, not just SS */
+    int64_t   prev_resp_us = 0;
+    int64_t   bracket_us   = 0;
+    int64_t   last_seen    = 0;
+    int       polls = 0, parses = 0, rejected = 0;
+    esp_err_t result       = ESP_ERR_TIMEOUT;
+    int64_t   start        = esp_timer_get_time();
+
+    while (esp_timer_get_time() - start < 1300000) {
+        s_gp_resp_len = 0;
+        if (cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"GP;", 3, 100) != ESP_OK)
+            break;
+        polls++;
+        for (int i = 0; i < 25 && s_gp_resp_len == 0; i++) vTaskDelay(pdMS_TO_TICKS(2));
+        int y, mo, d, h, mi, s;
+        if (!cat_gps_gp_parse(s_gp_resp, s_gp_resp_len, &y, &mo, &d, &h, &mi, &s)) continue;
+        /* One arrival read twice would give a false 1-2 ms bracket - see the
+         * same guard in cat_gps_tick_sync(). */
+        if (s_gp_resp_us == last_seen) continue;
+        last_seen = s_gp_resp_us;
+        parses++;
+
+        /* ⭐ A FLIP IS AN ADVANCE OF EXACTLY ONE SECOND. ANYTHING ELSE IS A
+         * CORRUPT REPLY, AND THIS IS THE ONLY PLACE THAT CAN TELL.
+         *
+         * Measured 2026-10-07: one GP reply carried a second NINE seconds out
+         * of place, between two correct replies 6 ms apart. The field passed
+         * cat_gps_gp_parse() because 00-60 is a valid second - a range check
+         * cannot see it. Landing on a flip, it would have set the clock 9 s
+         * wrong, which for FT8 is worse than no sync at all.
+         *
+         * The sequence is the discriminator: replies here are 6-20 ms apart,
+         * so a genuine boundary always advances the time-of-day by exactly +1.
+         * Comparing SECONDS OF DAY rather than the SS field also catches
+         * corruption in the hour and minute, which SS alone never would.
+         *
+         * A rejected reply resets the bracket rather than just being skipped:
+         * its arrival stamp cannot be used as the "before" side of a boundary
+         * when the reading itself is not trusted. The cost is a missed tick,
+         * retried 5 minutes later. The cost of the alternative is a wrong
+         * clock that nothing downstream questions. */
+        int tod = h * 3600 + mi * 60 + s;
+        if (prev_tod >= 0) {
+            int step = tod - prev_tod;
+            if (step < 0) step += 86400;          /* midnight */
+            if (step == 1) {
+                *out_y = y; *out_mo = mo; *out_d = d;
+                *out_h = h; *out_mi = mi; *out_s = s;
+                bracket_us   = s_gp_resp_us - prev_resp_us;
+                *out_flip_us = prev_resp_us + bracket_us / 2;
+                result = ESP_OK;
+                break;
+            }
+            if (step != 0) {
+                rejected++;
+                ESP_LOGW(TAG, "GP reply rejected: %02d:%02d:%02d jumps %d s from "
+                              "%02d:%02d:%02d in %lld ms - corrupt, not a boundary",
+                         h, mi, s, step, prev_tod / 3600, (prev_tod / 60) % 60,
+                         prev_tod % 60, (long long)((s_gp_resp_us - prev_resp_us) / 1000));
+                prev_tod     = -1;                /* distrust the bracket too */
+                prev_resp_us = 0;
+                continue;
+            }
+        }
+        prev_tod     = tod;
+        prev_resp_us = s_gp_resp_us;
+    }
+
+    cat_poll_release(CAT_HOLD_TIME_SYNC);
+    if (result == ESP_OK) {
+        ESP_LOGI(TAG, "GP tick: %04d-%02d-%02d %02d:%02d:%02d boundary caught "
+                      "(bracket %lld ms, polls %d/%d, %d rejected)",
+                 *out_y, *out_mo, *out_d, *out_h, *out_mi, *out_s,
+                 (long long)(bracket_us / 1000), parses, polls, rejected);
+    } else {
+        ESP_LOGW(TAG, "GP tick: no second flip in 1.3 s (polls %d, parsed %d, "
+                      "%d rejected) - no fix, or this radio answers GP differently",
+                 polls, parses, rejected);
+    }
+    return result;
+}
+
+/* ⭐ CHARACTERISE GP; ON DEMAND - the instrument, not another 5-minute wait.
+ *
+ * cat_gps_gp_sync() answers "what time is it" and stops at the first boundary.
+ * This answers the two questions that one cannot:
+ *
+ *   1. DOES GP ADVANCE AT 1 Hz? Measured 2026-10-07 on the bench QMX+: one
+ *      sync attempt made 78 polls, parsed 60 replies, and saw NO second change
+ *      in 1.3 s. Sixty distinct arrivals reporting the same second is not a
+ *      clock being read - it is a value being held. So the "flip" we catch may
+ *      be the radio refreshing its copy, not the true UTC boundary.
+ *   2. HOW LATE IS THE FLIP? The same boot applied a GP time 399 ms behind
+ *      SNTP - the same order as the TM; bias the midpoint fix removed. A fixed
+ *      lag can be compensated; a random one means the phase claim must go.
+ *
+ * It polls as fast as the link allows for `secs` seconds and hands back every
+ * distinct arrival, so the step pattern is visible rather than averaged. No
+ * clock is set and nothing is written - it only reads.
+ *
+ * delta_ms, per flip: the system clock (SNTP) minus the instant GP says the
+ * second began. POSITIVE means GP's boundary arrived LATE.
+ */
+esp_err_t cat_gps_gp_probe(int secs, int gap_ms, bool use_tm, cat_gp_probe_t *out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+    out->n = 0; out->polls = 0; out->nflip = 0;
+    if (!s_cdc_dev || !s_cat_ready) return ESP_ERR_INVALID_STATE;
+    if (!use_tm && !cat_qmx_fw_at_least(1, 4, 4)) return ESP_ERR_NOT_SUPPORTED;
+    if (cat_poll_held_by_other(CAT_HOLD_TIME_SYNC)) return ESP_ERR_INVALID_STATE;
+    if (secs < 1) secs = 1;
+    if (secs > 10) secs = 10;   /* it holds the CAT poll for the whole burst */
+    if (gap_ms < 0)   gap_ms = 0;
+    if (gap_ms > 500) gap_ms = 500;
+
+    cat_poll_hold(CAT_HOLD_TIME_SYNC);
+    const int64_t start     = esp_timer_get_time();
+    int64_t       last_seen = 0;
+    int           prev_ss   = -1;
+    int64_t       prev_us   = 0;
+
+    while (esp_timer_get_time() - start < (int64_t)secs * 1000000LL) {
+        if (gap_ms > 0) vTaskDelay(pdMS_TO_TICKS(gap_ms));
+        if (use_tm) s_tm_resp_len = 0; else s_gp_resp_len = 0;
+        if (cdc_acm_host_data_tx_blocking(s_cdc_dev,
+                (const uint8_t *)(use_tm ? "TM;" : "GP;"), 3, 100) != ESP_OK)
+            break;
+        out->polls++;
+        for (int i = 0; i < 25 && (use_tm ? s_tm_resp_len : s_gp_resp_len) == 0; i++)
+            vTaskDelay(pdMS_TO_TICKS(2));
+        int y, mo, d, h, mi, s;
+        int64_t arrival_us;
+        if (use_tm) {
+            if (!parse_tm_resp(&h, &mi, &s)) continue;
+            arrival_us = s_tm_resp_us;
+        } else {
+            if (!cat_gps_gp_parse(s_gp_resp, s_gp_resp_len, &y, &mo, &d, &h, &mi, &s)) continue;
+            arrival_us = s_gp_resp_us;
+        }
+        if (arrival_us == last_seen) continue;        /* one arrival, one reading */
+        last_seen = arrival_us;
+
+        if (out->n < CAT_GP_PROBE_MAX) {
+            out->t_ms[out->n] = (int16_t)((arrival_us - start) / 1000);
+            out->ss[out->n]   = (uint8_t)s;
+            out->n++;
+        }
+
+        /* ⚠ NO +1 GUARD HERE, DELIBERATELY. cat_gps_gp_sync() rejects any step
+         * that is not exactly one second; this is the instrument that FOUND
+         * that defect, and an instrument that filters cannot show it again.
+         * A step_ms far from 1000 in the output is the symptom to look for. */
+        if (prev_ss >= 0 && s != prev_ss && out->nflip < CAT_GP_PROBE_FLIPS) {
+            int64_t mid_us = prev_us + (arrival_us - prev_us) / 2;
+            /* Where the system clock was at that same instant. */
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            int64_t sys_at_mid_us = (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec
+                                    - (esp_timer_get_time() - mid_us);
+            int  sys_ss   = (int)((sys_at_mid_us / 1000000LL) % 60);
+            int  frac_ms  = (int)((sys_at_mid_us % 1000000LL) / 1000);
+            int  dsec     = sys_ss - s;
+            if (dsec >  30) dsec -= 60;
+            if (dsec < -30) dsec += 60;
+            int k = out->nflip++;
+            out->flip_t_ms[k]   = (int16_t)((mid_us - start) / 1000);
+            out->flip_ss[k]     = (uint8_t)s;
+            out->bracket_ms[k]  = (int16_t)((arrival_us - prev_us) / 1000);
+            out->delta_ms[k]    = (int16_t)(dsec * 1000 + frac_ms);
+            /* Gap since the PREVIOUS flip - 1000 ms if GP really ticks at 1 Hz. */
+            out->step_ms[k]     = (k > 0) ? (int16_t)(out->flip_t_ms[k] - out->flip_t_ms[k - 1]) : 0;
+        }
+        prev_ss = s;
+        prev_us = arrival_us;
+    }
+
+    cat_poll_release(CAT_HOLD_TIME_SYNC);
+    ESP_LOGI(TAG, "%s probe: %d s, gap %d ms, %d polls, %d readings, %d flips",
+             use_tm ? "TM" : "GP", secs, gap_ms, out->polls, out->n, out->nflip);
+    for (int k = 0; k < out->nflip; k++) {
+        ESP_LOGI(TAG, "probe flip %d: ss=%02u at %d ms (bracket %d ms, step %d ms, "
+                      "SNTP-GP %+d ms)",
+                 k, out->flip_ss[k], out->flip_t_ms[k],
+                 out->bracket_ms[k], out->step_ms[k], out->delta_ms[k]);
+    }
+    return (out->n > 0) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
+
 // Pauses the poll for the whole burst and blocks up to ~1.3 s (enough to span
 // one second boundary). ESP_OK only if a flip was caught. Bails if another op
 // already owns the CDC pipe (FT8 TX pauses the same poll flag).
@@ -3613,12 +4330,29 @@ esp_err_t cat_gps_tick_sync(int *out_hour, int *out_min, int *out_sec, int64_t *
     /* TM-based; the KX3 has no CAT clock to phase-lock against. */
     if (radio_get_kind() != RADIO_QMX) return ESP_ERR_NOT_SUPPORTED;
     if (!s_cdc_dev || !s_cat_ready) return ESP_ERR_INVALID_STATE;
-    if (s_poll_paused)              return ESP_ERR_INVALID_STATE;  // FT8 TX / other op owns the pipe
+    if (cat_poll_held_by_other(CAT_HOLD_TIME_SYNC)) {
+        ESP_LOGI(TAG, "GPS tick skipped - %s holds the link", hold_name(s_poll_holds));
+        return ESP_ERR_INVALID_STATE;   // a burst owns the pipe
+    }
 
-    cat_poll_set_paused(true);
-    int       prev_sec = -1;
-    esp_err_t result   = ESP_ERR_TIMEOUT;
-    int64_t   start    = esp_timer_get_time();
+    cat_poll_hold(CAT_HOLD_TIME_SYNC);
+    int       prev_tod      = -1;       /* seconds of day - see the GP version */
+    int64_t   prev_resp_us  = 0;
+    int64_t   bracket_us    = 0;
+    int       rejected      = 0;
+    esp_err_t result        = ESP_ERR_TIMEOUT;
+    int64_t   start         = esp_timer_get_time();
+
+    /* ⭐ ONE ARRIVAL MUST NOT BE READ TWICE. s_tm_resp_len is zeroed below, the
+     * async RX handler refills it AND stamps s_tm_resp_us, and a reply landing
+     * after this pass's 50 ms wait is still sitting there when the next pass
+     * looks. Taken as a second reading it yields a 1-2 ms "bracket", which two
+     * CAT round trips cannot be, and the midpoint is then a whole poll interval
+     * wrong. Instrumented 2026-10-07 after the tick was accepted on exactly 1
+     * poll in 5; the sawtooth itself turned out to be our own clock push
+     * (676031f), but the reuse is real, so the stamp is checked rather than
+     * assumed. The same guard is in cat_gps_gp_sync(). */
+    int64_t last_seen  = 0;
 
     while (esp_timer_get_time() - start < 1300000) {   // ~1.3 s cap: spans any 1 s boundary
         s_tm_resp_len = 0;
@@ -3628,18 +4362,69 @@ esp_err_t cat_gps_tick_sync(int *out_hour, int *out_min, int *out_sec, int64_t *
         for (int i = 0; i < 25 && s_tm_resp_len == 0; i++) vTaskDelay(pdMS_TO_TICKS(2));
         int h, m, s;
         if (!parse_tm_resp(&h, &m, &s)) continue;
-        if (prev_sec >= 0 && s != prev_sec) {          // the tick
+        if (s_tm_resp_us == last_seen) continue;   // same arrival, not a new reading
+        last_seen = s_tm_resp_us;
+        /* ⭐ EXACTLY +1 SECOND, OR IT IS NOT A BOUNDARY. The corrupt reply was
+         * caught on GP (nine seconds out of place between two correct ones
+         * 6 ms apart), but nothing makes TM; immune: it is the same radio, the
+         * same link, and parse_tm_resp() range-checks the same way. Swept here
+         * rather than waiting to be bitten. See cat_gps_gp_sync() for the
+         * measurement and for why a rejected reply drops the bracket. */
+        int tod  = h * 3600 + m * 60 + s;
+        int step = (prev_tod >= 0) ? (tod - prev_tod) : 0;
+        if (step < 0) step += 86400;                  // midnight
+        if (prev_tod >= 0 && step != 0 && step != 1) {
+            rejected++;
+            ESP_LOGW(TAG, "TM reply rejected: %02d:%02d:%02d jumps %d s from "
+                          "%02d:%02d:%02d - corrupt, not a boundary",
+                     h, m, s, step, prev_tod / 3600, (prev_tod / 60) % 60, prev_tod % 60);
+            prev_tod     = -1;
+            prev_resp_us = 0;
+            continue;
+        }
+        if (prev_tod >= 0 && step == 1) {             // the tick
+            /* ⭐ MIDPOINT, NOT THE ARRIVAL - 2026-09-23.
+             *
+             * This used to hand back s_tm_resp_us, the arrival of the reading
+             * that FIRST showed the new second, and apply_gps_tick() treats
+             * what it is given as the instant the second flipped (h:m:s.000).
+             * Those are not the same thing and the difference is one-directional:
+             * the flip happens, then we only learn about it on the NEXT poll,
+             * and only after a CAT round trip. Both terms are positive, so the
+             * reported flip was always LATE, never early - a systematic bias,
+             * not noise.
+             *
+             * Measured on bench dev with a QMX+ whose GPS was genuinely locked:
+             * a rock-steady 445-478 ms disagreement with SNTP across eight
+             * consecutive 5-minute checks, drifting only ~16 ppm (the Tab5's
+             * own crystal against GPS) - far too stable to be jitter, and it
+             * held the unit below the 300 ms confirm threshold for ever, so a
+             * good GPS never got recognised. Steffen OZ1LAV and John Schindler
+             * (W5JSS) both sat at "no GPS" on real GPS-equipped radios.
+             *
+             * What we actually know is a BRACKET: the second changed somewhere
+             * between the poll that still read s-1 and the poll that read s.
+             * Both readings carry the same round trip, so it cancels in the
+             * midpoint, which is an unbiased estimate of the true flip with an
+             * error of at most half the bracket. bracket_us is logged so the
+             * remaining uncertainty is visible rather than assumed. */
             *out_hour = h; *out_min = m; *out_sec = s;
-            *out_flip_us = s_tm_resp_us;               // exact arrival of the flipping reading
+            bracket_us   = s_tm_resp_us - prev_resp_us;
+            *out_flip_us = prev_resp_us + bracket_us / 2;
             result = ESP_OK;
             break;
         }
-        prev_sec = s;
+        prev_tod     = tod;
+        prev_resp_us = s_tm_resp_us;
     }
 
-    cat_poll_set_paused(false);
-    if (result == ESP_OK)
-        ESP_LOGI(TAG, "GPS tick: %02d:%02d:%02d boundary caught", *out_hour, *out_min, *out_sec);
+    cat_poll_release(CAT_HOLD_TIME_SYNC);
+    if (result == ESP_OK) {
+        ESP_LOGI(TAG, "GPS tick: %02d:%02d:%02d boundary caught (bracket %lld ms, "
+                      "+/-%lld ms, %d rejected)",
+                 *out_hour, *out_min, *out_sec,
+                 (long long)(bracket_us / 1000), (long long)(bracket_us / 2000), rejected);
+    }
     else
         ESP_LOGW(TAG, "GPS tick: no second flip caught in 1.3 s (err=%d)", result);
     return result;

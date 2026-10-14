@@ -3,6 +3,7 @@
 // TA; "Transmit Audio" technique as ft8_tx.c).
 
 #include "wspr_tx.h"
+#include "ui.h"        // ui_toast_ms - a refusal the operator can act on must reach the screen
 #include "ui/power_cal_modal.h"   // power_cal_dbm_for_watts - the ONE watts->dBm rule
 #include "wspr_proto.h"
 #include "wspr_fano.h"
@@ -84,6 +85,38 @@ static SemaphoreHandle_t s_lock = NULL;
 static wspr_tx_state_t   s_state = WSPR_TX_IDLE;
 static wspr_tx_request_t s_armed;
 static volatile bool     s_disarm_requested = false;
+
+/* ⭐ THE MODE WE BORROWED THE RADIO FROM, so we can give it back (2026-09-23).
+ *
+ * WSPR has to transmit in DiGi, so arm() switches the radio there. Nothing
+ * ever switched it back, and on a scheduled beacon that means the radio is
+ * pushed into DiGi every cycle and simply left there - the QMX remembers the
+ * mode in its own memory, so it then powers up in DiGi too. The operator's
+ * report: "the CW (or mode in general) is always waking up in DiGi mode".
+ * Nothing was failing to persist his mode; WSPR was actively overwriting it.
+ *
+ * Empty string = we did not switch (the radio was already in DiGi, e.g. the
+ * operator is working FT8 on purpose), so there is nothing to hand back and
+ * we must not touch the mode. One-shot: cleared as it is used, so a restore
+ * can never fire twice or fight a mode the operator chose meanwhile. */
+static char s_mode_before[12] = { 0 };
+
+/* Give the radio back. Uses cat_request_mode(), which defers the write to the
+ * poll task that owns the CDC pipe, NOT cat_set_mode() - we are called right
+ * after run_burst() has been driving TX;/TA;/RX; down that same pipe, and the
+ * deferred path is the one this project already established as safe there
+ * (see memory_modal.c's note on the direct-call race). */
+static void release_mode_after_burst(void)
+{
+    if (!s_mode_before[0]) return;
+    char want[sizeof(s_mode_before)];
+    snprintf(want, sizeof(want), "%s", s_mode_before);
+    s_mode_before[0] = '\0';
+    const char *now = cat_get_mode_str();
+    if (now && strcmp(now, want) == 0) return;   /* already back, nothing to do */
+    ESP_LOGI(TAG, "burst finished - handing the radio back to %s", want);
+    cat_request_mode(want);
+}
 static volatile bool     s_abort_requested  = false;
 /* Latched once at the top of run_burst(), not read per symbol: settings_load_all()
  * 162 times a burst would be absurd, and the answer cannot meaningfully change
@@ -192,20 +225,26 @@ int wspr_tx_seconds_until_next_slot(void)
 
 // ---- CAT send helpers - mirror ft8_tx.c's tx_cmd()/tx_cmd_critical() ----
 
-static void tx_cmd(int64_t t0, const char *fmt_freq)
+// Returns whether the send actually reached the radio, so callers that need
+// to know (the tone loop's failure count; formerly nobody did) can find out
+// without re-deriving it from the log. A dry run or sim counts as "sent".
+static bool tx_cmd(int64_t t0, const char *fmt_freq)
 {
     if (s_burst_sim) {   /* simulation: the radio must not hear a thing */
         ESP_LOGI(TAG, "[SIM t+%6lldus] %s", (long long)(esp_timer_get_time() - t0), fmt_freq);
-        return;
+        return true;
     }
 #if WSPR_TX_SEND_LIVE
     esp_err_t err = cat_send_raw_cmd("%s", fmt_freq);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "send failed (0x%x): %s - continuing burst (radio may be disconnected)",
                  err, fmt_freq);
+        return false;
     }
+    return true;
 #else
     ESP_LOGI(TAG, "[DRY RUN t+%6lldus] %s", (long long)(esp_timer_get_time() - t0), fmt_freq);
+    return true;
 #endif
 }
 
@@ -323,8 +362,14 @@ static void run_burst(const wspr_tx_request_t *req)
      * operator set by hand, or a band never calibrated). */
     char wbuf[20] = "";
     int8_t pa_dbm = -1;
+    /* Hoisted out of the block below so the REFUSAL can name them. John W5JSS,
+     * 2026-09-26, reading his own log: "It's not clear what the band is." He
+     * had two bands in play and the message named neither, so he could not
+     * tell which one to calibrate and lost an evening to it. */
+    uint32_t dial_hz  = cat_get_frequency();
+    const char *band  = adif_log_band_for_freq(dial_hz);
+    if (!band || !band[0]) band = "?";
     if (pa_x10 > 0) {
-        const char *band = adif_log_band_for_freq(cat_get_frequency());
         uint16_t w_x100;
         if (band && band[0] && power_cal_watts_for_voltage(band, (uint16_t)pa_x10, &w_x100)) {
             if (w_x100 < 100) snprintf(wbuf, sizeof(wbuf), " = %u mW", (unsigned)w_x100 * 10);
@@ -379,11 +424,23 @@ static void run_burst(const wspr_tx_request_t *req)
      * be the fault this paragraph replaced. Only a KNOWN voltage we cannot
      * price refuses. */
     if (pa_x10 > 0 && pa_dbm < 0) {
-        ESP_LOGE(TAG, "WSPR TX REFUSED: this band is not calibrated, so the radio's "
-                      "%d.%d V cannot be turned into watts - and the message would "
-                      "still declare %d dBm to the world. Run Calibrate Power on "
-                      "this band first.",
-                 pa_x10 / 10, pa_x10 % 10, req->power_dbm);
+        ESP_LOGE(TAG, "WSPR TX REFUSED on %s (%lu.%06lu MHz): this band is not "
+                      "calibrated, so the radio's %d.%d V cannot be turned into "
+                      "watts - and the message would still declare %d dBm to the "
+                      "world. Run Calibrate Power on %s first.",
+                 band, (unsigned long)(dial_hz / 1000000UL),
+                 (unsigned long)(dial_hz % 1000000UL),
+                 pa_x10 / 10, pa_x10 % 10, req->power_dbm, band);
+        /* ⭐ AND ON THE SCREEN. John W5JSS, 2026-09-25: his beacon went quiet,
+         * the QMX showed no S, nothing was spotted, and he spent an evening on
+         * the radio hardware before falling back to Virtual U3S. The firmware
+         * had made a correct decision and written it only to a log file nobody
+         * reads until they think to send it - the same gap the v1.16.4 brownout
+         * toast closed. A refusal the operator can ACT on has to reach them.
+         * 12 s: long enough to catch across the room, short enough not to sit
+         * over the waterfall. */
+        ui_toast_ms("WSPR did not transmit: this band is not calibrated. "
+                    "Run Calibrate Power on it.", 12000);
         s_state = WSPR_TX_IDLE;
         return;
     }
@@ -394,6 +451,9 @@ static void run_burst(const wspr_tx_request_t *req)
                       "wrong - and key the finals for ~110 s at more than declared. "
                       "Set Declared power to match, or recalibrate this band.",
                  wbuf[0] ? wbuf + 3 : "?", pa_dbm, req->power_dbm);
+        /* Same reasoning as the calibration refusal above. */
+        ui_toast_ms("WSPR did not transmit: the radio's power does not match "
+                    "the declared power. Fix Declared power or recalibrate.", 12000);
         /* run_burst() returns void and owns the state machine, so the refusal
          * looks exactly like a burst that ended: back to IDLE, nothing keyed,
          * and the slot loop schedules the next cycle as usual. */
@@ -417,13 +477,39 @@ static void run_burst(const wspr_tx_request_t *req)
     // Exclusive use of the CDC-ACM link for the whole burst - see
     // ft8_tx.c's identical reasoning. Cooperative flag only, never
     // vTaskSuspend.
-    if (!s_burst_sim) cat_poll_set_paused(true);
+    if (!s_burst_sim) cat_poll_hold(CAT_HOLD_TX_BURST);
 
     int64_t t0 = esp_timer_get_time();
     sleep_until(t0, 0);
-    tx_cmd(t0, "TX;");
+
+    /* ⛔ VERIFY THE KEY-DOWN, DON'T ASSUME IT. Steffen OZ1LAV, 2026-09-28: the
+     * WSPR screen said "transmitted" for five bursts where the radio's
+     * current draw stayed at RX level the whole time - his log showed
+     * exactly why: TX; (key-down) is CAT like any other command, the CDC
+     * link had gone flaky, and the old tx_cmd() helper logged a warning on
+     * failure and carried on regardless, sending 162 tone commands to a
+     * radio that was never keyed, then logging "burst complete" as if
+     * nothing had gone wrong. FT8 checks its transmission against a live
+     * power readback; WSPR checked nothing at all for the one command its
+     * whole burst depends on.
+     *
+     * tx_cmd_critical() is the same retry-hard-then-force-RX helper this
+     * file already uses for the STOP command, reused here because a failed
+     * key-down deserves the same treatment: know for certain, and leave the
+     * radio in a safe, known state either way. */
+    bool keyed = tx_cmd_critical(t0, "TX;");
+    if (!keyed) {
+        ESP_LOGE(TAG, "WSPR TX FAILED: key-down (TX;) never reached the radio - "
+                      "NOTHING WAS TRANSMITTED this cycle");
+        ui_toast_ms("WSPR did not transmit: the key-down command never reached "
+                    "the radio (CAT link trouble). Nothing was sent.", 12000);
+        if (!s_burst_sim) cat_poll_release(CAT_HOLD_TX_BURST);
+        s_state = WSPR_TX_IDLE;
+        return;
+    }
 
     bool aborted = false;
+    int  tone_failures = 0;
     for (int i = 0; i < WSPR_NSYM; i++) {
         if (s_abort_requested) {
             ESP_LOGW(TAG, "WSPR TX abort requested at symbol %d/%d - keying up now", i, WSPR_NSYM);
@@ -437,7 +523,7 @@ static void run_burst(const wspr_tx_request_t *req)
         sleep_until(t0, (int64_t)i * WSPR_SYMBOL_PERIOD_US);
         char buf[32];
         snprintf(buf, sizeof(buf), "TA%.2f;", (double)freq);
-        tx_cmd(t0, buf);
+        if (!tx_cmd(t0, buf)) tone_failures++;
 
         /* MEASURE what actually goes out, mid-burst while the radio is keyed -
          * SW; reads nothing once back in Receive. The async pair is used, not
@@ -491,9 +577,28 @@ static void run_burst(const wspr_tx_request_t *req)
     vTaskDelay(pdMS_TO_TICKS(WSPR_TX_ENVELOPE_SETTLE_MS));
     tx_cmd_critical(t0, "RX;");
 
-    if (!s_burst_sim) cat_poll_set_paused(false);
-    ESP_LOGI(TAG, "WSPR TX burst %s (%.1f s)", aborted ? "ABORTED" : "complete",
-             (double)(esp_timer_get_time() - t0) / 1e6);
+    if (!s_burst_sim) cat_poll_release(CAT_HOLD_TX_BURST);
+    /* ⭐ "complete" must not mean "every symbol went out" when it didn't. A
+     * tone command lost mid-burst does not un-key the radio - the QMX keeps
+     * transmitting the LAST tone it received until the next one arrives, so
+     * a handful of misses blur a few symbols rather than silencing the
+     * burst, but enough of them and the decode at the far end fails even
+     * though the radio was genuinely on the air the whole time. Surfaced as
+     * a count rather than silently folded into "complete", which is what
+     * hid this class of problem the first time. */
+    if (tone_failures > 0 && !aborted) {
+        ESP_LOGW(TAG, "WSPR TX burst complete but DEGRADED (%.1f s): %d/%d tone "
+                      "command(s) never reached the radio - decode at the far end "
+                      "may fail even though the radio was keyed",
+                 (double)(esp_timer_get_time() - t0) / 1e6, tone_failures, WSPR_NSYM);
+        if (tone_failures >= WSPR_NSYM / 10) {   // >10% lost: worth a toast, not just a log line
+            ui_toast_ms("WSPR burst sent but the CAT link dropped several tone "
+                        "commands - it may not decode.", 8000);
+        }
+    } else {
+        ESP_LOGI(TAG, "WSPR TX burst %s (%.1f s)", aborted ? "ABORTED" : "complete",
+                 (double)(esp_timer_get_time() - t0) / 1e6);
+    }
 }
 
 static void wspr_tx_worker_task(void *arg)
@@ -513,6 +618,7 @@ static void wspr_tx_worker_task(void *arg)
             s_state = WSPR_TX_IDLE;
             s_disarm_requested = false;
             unlock();
+            release_mode_after_burst();   // nothing transmitted - give it back
             psram_task_park();
             return;
         }
@@ -567,6 +673,7 @@ static void wspr_tx_worker_task(void *arg)
     lock();
     s_state = WSPR_TX_IDLE;
     unlock();
+    release_mode_after_burst();
     psram_task_park();
 }
 
@@ -586,6 +693,31 @@ bool wspr_tx_arm(const wspr_tx_request_t *req, char *out_err, size_t out_err_len
     if (cat_user_pause_active()) {
         if (out_err) snprintf(out_err, out_err_len, "Radio released - take it back first");
         return false;
+    }
+
+    /* ⭐ WARN ABOUT THE FINALS AT ARM TIME, NOT ONLY IN A DRAWER.
+     *
+     * A ">1 W" label exists in the WSPR drawer (ui.c), shown only when the dBm
+     * dropdown is already above 30 - so an operator who set the level once and
+     * never reopened that section never sees it. John W5JSS, 2026-09-26, had
+     * already blown BS170s, turned his PA voltage down, and was still running
+     * 2 W: "so it should be pretty safe". The PA voltage is not what protects
+     * them. A WSPR burst is 110.6 s of CONTINUOUS key-down - about nine times
+     * an FT8 slot with no gap to cool - and lowering the voltage does not
+     * shorten that. The operator's own radio read 0.310 A idle after running
+     * 2.5 W where a healthy one draws 0.100 A, which is leaky finals. Stan has
+     * said the QMX's own WSPR beacon runs at 1 W.
+     *
+     * This WARNS, it does not refuse: the declared power is the operator's
+     * call, and a refusal here would break anyone legitimately running a
+     * higher-power rig. It just has to be impossible to miss. */
+    if (req->power_dbm > 30) {
+        ESP_LOGW(TAG, "WSPR at %d dBm is above 1 W. A burst is 110.6 s of "
+                      "continuous key-down - about nine times an FT8 slot with "
+                      "no gap to cool - and a lower PA voltage does not shorten "
+                      "that. This is how BS170s are lost. The QMX's own beacon "
+                      "runs at 1 W.", req->power_dbm);
+        ui_toast_ms("WSPR above 1 W - 110 s of key-down risks the finals", 12000);
     }
 
     // In a DRY-RUN build, a missing radio is not a reason to refuse. tx_cmd()
@@ -620,6 +752,13 @@ bool wspr_tx_arm(const wspr_tx_request_t *req, char *out_err, size_t out_err_len
         const char *mode = cat_get_mode_str();
         if (strcmp(mode, "DiGi") != 0) {
             ESP_LOGI(TAG, "arm: QMX mode is '%s' - switching to Digi...", mode);
+            /* Remember what we are taking it away from, so the burst can give
+             * it back - see s_mode_before. Only recorded when we actually
+             * switch: if the radio is already in DiGi the operator put it
+             * there and it is not ours to change. cat_get_mode_str()'s output
+             * ("CW", "CW-R", "LSB", "USB", ...) feeds straight back into
+             * cat_request_mode(), which upper-cases and maps it. */
+            if (mode && mode[0]) snprintf(s_mode_before, sizeof(s_mode_before), "%s", mode);
             cat_set_mode("FT8"); // hamlib_mode_to_digit() maps this to digit '6' = DiGi
             bool confirmed = false;
             for (int i = 0; i < WSPR_TX_MODE_POLL_TRIES; i++) {
@@ -629,6 +768,7 @@ bool wspr_tx_arm(const wspr_tx_request_t *req, char *out_err, size_t out_err_len
             if (!confirmed) {
                 ESP_LOGW(TAG, "arm: QMX would not confirm Digi mode (still '%s')", cat_get_mode_str());
                 if (out_err) snprintf(out_err, out_err_len, "QMX won't switch to Digi mode - check the radio");
+                release_mode_after_burst();   // put back whatever we disturbed
                 return false;
             }
             ESP_LOGI(TAG, "arm: QMX confirmed Digi mode");
@@ -639,6 +779,7 @@ bool wspr_tx_arm(const wspr_tx_request_t *req, char *out_err, size_t out_err_len
     if (s_state != WSPR_TX_IDLE) {
         unlock();
         if (out_err) snprintf(out_err, out_err_len, "A WSPR transmission is already armed/active");
+        release_mode_after_burst();   // this arm is not happening; undo its switch
         return false;
     }
     s_armed = *req;
@@ -677,6 +818,7 @@ bool wspr_tx_arm(const wspr_tx_request_t *req, char *out_err, size_t out_err_len
         s_state = WSPR_TX_IDLE;
         unlock();
         if (out_err) snprintf(out_err, out_err_len, "Failed to start WSPR TX worker task");
+        release_mode_after_burst();   // no burst will run - give the mode back
         return false;
     }
 

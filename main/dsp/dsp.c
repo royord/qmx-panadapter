@@ -32,12 +32,18 @@
 #include "ui_mode.h"
 #include "iq_balance.h"
 #include "spur_map.h"
+#include "storage/settings.h"   // rx_source_is_real: latched in dsp_init()
 
 
 /* The dial the CURRENT spectrum's samples were captured under (#298). Set in
  * the FFT loop from audio_dial_for_last_read(), which indexes by sample number
  * rather than wall time - the pipeline latency was measured varying better than
  * 2:1, so no time-based constant can stand in for this. */
+/* Is the sample source REAL (one channel) rather than complex IQ? Latched
+ * once in dsp_init() because the source itself is latched at boot - see
+ * rx_source_t. Read on the hot path, so it is a plain bool, not a call. */
+static bool s_src_is_real = false;
+bool dsp_source_is_real(void) { return s_src_is_real; }
 static volatile uint32_t s_spec_dial_hz = 0;
 uint32_t dsp_get_spectrum_dial_hz(void) { return s_spec_dial_hz; }
 
@@ -565,6 +571,13 @@ esp_err_t dsp_init(void)
              (int)(DSP_FFT_SIZE * 2 * sizeof(float)),
              (int)(DSP_FFT_SIZE * sizeof(float)));
 
+    /* Latched once: the input source cannot change without a restart
+     * (rx_source_t), so reading it here keeps settings off the hot path. */
+    s_src_is_real = rx_source_is_real(settings_get_rx_source());
+    if (s_src_is_real)
+        ESP_LOGW(TAG, "source is REAL (one channel): FT8/JS8/WSPR capture takes I "
+                      "directly, the fs/4 IF mixer is bypassed");
+
     dsp_build_window(s_window_type);
     ESP_LOGI(TAG, "Analysis window computed (type %u)", (unsigned)s_window_type);
 
@@ -975,24 +988,61 @@ const float *dsp_get_zoom_spectrum(void)
 
 // ---- RX audio out: real-time forward-ring API -------------------------
 
-// Allocate the ring now, before WiFi/BLE/spots fragment internal RAM for the
-// rest of the session. Found 2026-09-04: creating it lazily on first CW/SSB
+// Allocate the ring now, before WiFi/BLE/spots fragment RAM for the rest of
+// the session. Found 2026-09-04: creating it lazily on first CW/SSB
 // activation (the old behaviour of dsp_rxaudio_forward_enable() below) meant
 // the 24 KB contiguous request competed with a heap that only gets MORE
 // fragmented as the session runs, so a unit that had been up for a while
-// could never get it - the exact same class of race this file's rx_audio.c
-// preopen comment already describes for the I2S/DMA claim, just for a plain
-// internal-RAM block instead of DMA-capable RAM. Call this as early as
-// possible (rx_audio_preopen(), same place I2S grabs its DMA RAM before the
-// USB host starts). Idempotent; safe to call even if RX audio ends up never
-// enabled - 24 KB sitting idle is cheap next to losing RX audio for a whole
-// session with no recovery short of a reboot.
+// could never get it. Call this as early as possible (rx_audio_preopen(),
+// same place I2S grabs its DMA RAM before the USB host starts). Idempotent.
+//
+// ⭐ PSRAM, NOT MALLOC_CAP_INTERNAL (2026-09-30). This was internal RAM, and
+// the comment here used to end "24 KB sitting idle is cheap next to losing RX
+// audio for a whole session". That trade was measured against the wrong thing.
+// On ESP32-P4 internal RAM IS the MALLOC_CAP_DMA pool, so this 24 KB was being
+// taken straight out of the pool the SD card needs - and the SD path needs a
+// SMALL DMA allocation on EVERY 512 B block transfer, forever, not once.
+//
+// Gyula HA3HZ, qmx-diag-20260930-0914, RX audio on (CW to the Tab5 speaker):
+//
+//     rx_audio_preopen (I2S)   dma= 92767 (lblk 40960)   <- 21.6 KB I2S
+//     dsp: rxaudio_ring created early (24576 bytes)      <- + this 24 KB
+//     ...
+//     rx_audio_init            dma=  8179 (lblk  6400)   <- end of boot
+//
+// 8179 B of DMA-capable RAM left, 6400 B largest block. His card then mounted,
+// wrote README.txt + qso.adi (163655 B) + qmx-config.txt fine, and died on the
+// next transfer: spi_master.c's setup_priv_desc() could not get its per-block
+// bounce buffer, and it fails AFTER poll_data_token() has succeeded, i.e. with
+// the card already streaming. sdspi_host_start_command() then drops CS with
+// the card mid-block, so every later command reads a garbage R1 (0x108
+// ESP_ERR_INVALID_RESPONSE, CMD13 status 0xff3f = MISO stuck idle-high) and
+// sd_archive counts five of those and unmounts. Remount cannot recover it:
+// mount retry 1/12 failed on a 516 B DMA alloc, retry 2/12 on a 64 B one.
+// My bench never showed any of it - it ends boot at dma=40695 lblk=31744.
+//
+// So: one transient shortage kills the card for the whole session, and this
+// ring is the single biggest thing standing between the SD path and enough
+// headroom to survive. The ring itself has no reason to be DMA-capable - it is
+// a plain byte buffer of audio samples, written by audio_task (process_rx) and
+// read by rx_audio_task, both ordinary tasks, so PSRAM is safe here. It never
+// goes near an ISR. At 48 kHz stereo it carries 192 KB/s against PSRAM that
+// sustains far more, with ~14 MB free.
+//
+// This also retires the fragility the 2026-09-04 note was written about: a
+// 24 KB contiguous request is hard in a fragmented internal heap and trivial
+// in PSRAM, so the "unit that had been up for a while could never get it"
+// failure cannot happen either way round.
+//
+// ⚠ NOT yet confirmed to fix Gyula's card - his unit is the only place the
+// fault has ever been seen, and my bench has 5x his DMA headroom so it cannot
+// reproduce it. What IS measured here is the 24 KB coming back.
 void dsp_rxaudio_ring_preinit(void)
 {
     if (s_rxaudio_ring != NULL) return;
     s_rxaudio_ring = xRingbufferCreateWithCaps(
         RXAUDIO_RING_BYTES, RINGBUF_TYPE_BYTEBUF,
-        MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (s_rxaudio_ring == NULL) {
         ESP_LOGE(TAG, "rxaudio_ring preinit alloc failed");
         return;
@@ -1146,11 +1196,33 @@ static void fft_task(void *arg)
                     continue;
                 }
             }
-            for (int i = 0; i < DSP_FFT_SIZE; i += 4) {
-                s_ft8_mix_buf[i + 0] =  (float)samples[2*(i+0)];      // +I
-                s_ft8_mix_buf[i + 1] =  (float)samples[2*(i+1) + 1];  // +Q
-                s_ft8_mix_buf[i + 2] = -(float)samples[2*(i+2)];      // -I
-                s_ft8_mix_buf[i + 3] = -(float)samples[2*(i+3) + 1];  // -Q
+            /* ⛔ A REAL SOURCE HAS NO IF TO MIX DOWN.
+             *
+             * The QMX puts the signal of interest at +12 kHz in its IQ
+             * stream, so the loop below multiplies by e^-j*2pi*fs/4 and
+             * takes the real part - the {+I,+Q,-I,-Q} pattern - landing it
+             * at DC before the /4 decimation to a real 12 kHz baseband.
+             *
+             * The 3.5 mm jack delivers audio that is ALREADY at baseband.
+             * Mixing it would move 300-3000 Hz FT8 tones down to around
+             * -11.7 kHz and every decode would simply stop, with nothing
+             * anywhere reporting an error.
+             *
+             * Take I, which line_in.c fills with the original audio delayed
+             * by the Hilbert group delay - NOT the Hilbert output, whose
+             * response is weakest exactly where the FT8 tones are. A
+             * constant delay is invisible to a decoder that re-syncs every
+             * slot. The same /4 decimating LPF then runs unchanged. */
+            if (s_src_is_real) {
+                for (int i = 0; i < DSP_FFT_SIZE; i++)
+                    s_ft8_mix_buf[i] = (float)samples[2*i];
+            } else {
+                for (int i = 0; i < DSP_FFT_SIZE; i += 4) {
+                    s_ft8_mix_buf[i + 0] =  (float)samples[2*(i+0)];      // +I
+                    s_ft8_mix_buf[i + 1] =  (float)samples[2*(i+1) + 1];  // +Q
+                    s_ft8_mix_buf[i + 2] = -(float)samples[2*(i+2)];      // -I
+                    s_ft8_mix_buf[i + 3] = -(float)samples[2*(i+3) + 1];  // -Q
+                }
             }
             // NB: dsps_fird_f32's `len` is OUTPUT length: 256 out from 1024 in.
             int n_out = dsps_fird_f32(&s_ft8_fir, s_ft8_mix_buf,

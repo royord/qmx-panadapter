@@ -2,7 +2,7 @@
 
 A standalone real-time panadapter — spectrum analyser and waterfall — for the [QRP Labs QMX/QMX+](https://www.qrp-labs.com/qmxp.html) HF transceiver.
 
-Running on the [M5Stack Tab5](https://docs.m5stack.com/en/core/tab5) (ESP32-P4 with a 5" 720×1280 touch display), the panadapter connects to the QMX as a USB host, decodes the I/Q in real time, and renders a touch-driven interface with tap-to-tune, pinch-zoom, onboard FT8/FT4 decoding and transmit, ADIF logging, and a matching browser web UI.
+Running on the [M5Stack Tab5](https://docs.m5stack.com/en/core/tab5) (ESP32-P4 with a 5" 720×1280 touch display), the panadapter connects to the QMX as a USB host, decodes the I/Q in real time, and renders a touch-driven interface with tap-to-tune, pinch-zoom, onboard FT8/FT4/JS8 decoding and transmit, ADIF logging, and a matching browser web UI.
 
 **By Steffen Lav (OZ1LAV)**
 
@@ -33,6 +33,13 @@ Everything below is in the firmware **today**. Nothing needs a PC; only the item
   200 Hz there is little separation**, because the signals then share too much of the
   audio passband. Long-press the top bar on the Panadapter page for **Resource
   Management**, where audio is switched on and off. See [Audio](guide/audio.md).
+- **Receive from the 3.5 mm jack** *(beta — Tony, @tony1tf, #17)* — the panadapter can take
+  its signal from the Tab5's own headphone jack instead of the radio's USB audio. The jack
+  is one real audio channel, not I/Q, so the second is synthesised by a 255-tap filter.
+  Level meter, clip indicator, and the jack wiring drawn on screen.
+  ⚠ **Nothing has been decoded through it yet** — the path runs and the levels read
+  correctly, and that is all that is proven. ⛔ The USB radio connection is off in this
+  mode by design. See [Audio](guide/audio.md).
 - **QMX control** — frequency, mode (USB/LSB/CW/DiGi, plus AM on QMX firmware 1.04+),
   SSB filter width, CW passband, TX power and SWR, and QMX volume in decibels matching
   the radio's own display. Band presets with per-band frequency recall, 32 memory
@@ -42,7 +49,7 @@ Everything below is in the firmware **today**. Nothing needs a PC; only the item
   there. For a QMX+ with no control panel it is the only way in.
   See [Radio Menus](guide/radio-menus.md).
 - **FT8 & FT4 receive** — continuous on-device decoding of both modes, in the same view
-  as the panadapter. Callsign, country, signal report, slot-timing offset, audio tone,
+  as the panadapter (**JS8** is a third sub-mode of this page; see below). Callsign, country, signal report, slot-timing offset, audio tone,
   distance and bearing; include/exclude filters; band-aware worked-before exclusion; a
   pileup tracker; and the station you are working held at the top of the list.
 - **FT8 & FT4 transmit** — tap a station to send the correct *next* message; call CQ from
@@ -51,6 +58,16 @@ Everything below is in the firmware **today**. Nothing needs a PC; only the item
   polite hold for a station already working someone else; grey-listing; an optional
   unattended auto-answer robot; a drag-to-pick TX tone with a live occupancy strip, TX
   Hold and an ANY/EVEN/ODD time-window choice; and ARRL Field Day mode.
+- **JS8 — a keyboard mode, on the device** *(beta)*. JS8 carries **free text** on FT8's
+  modulation, so stations hold short conversations instead of trading a fixed exchange.
+  The whole of it runs on the Tab5: sync, LDPC error correction and the CRC check on the
+  way in, and the encoder and transmitter on the way out. It is a sub-mode of the same
+  page as FT8 and FT4 — pick **JS8** in the preset picker — and it adds a **Conversation**
+  tab beside **Stations**, so you can read what has been said as well as who is on the
+  band. To send, tap **Free text** under Call CQ, or use the composer on the web page;
+  both tell you how many frames the message takes and how many seconds it holds the
+  frequency *before* the radio is keyed. Directed messages and heartbeats are read and
+  shown with the sender's callsign and grid. See [JS8](guide/js8.md).
 - **WSPR** — a third page, reached by the same swipe. A propagation beacon rather than a
   contact mode: a very slow, very weak signal carrying your callsign, grid and power,
   which stations worldwide report hearing. What was heard each two-minute cycle with band,
@@ -98,9 +115,22 @@ Everything below is in the firmware **today**. Nothing needs a PC; only the item
   power-off, the QMX's clock as an offline fallback, automatic GPS phase-lock if your QMX
   has one, a manual set-and-sync panel, and FT8 timing that self-corrects from the decoded
   band consensus.
+- **A GPS of your own, and a sky view** — two receivers work and both are confirmed on
+  hardware: an **M5Stack Unit GPS v1.1** on PORT.A,
+  and a **Module GPS v2.1** on the 30-pin bus. Either gives you UTC **and the full date**
+  offline, which no other offline source on this device does, and fills your grid from the
+  fix without ever overwriting one you typed. **GPS Stats** — its own page under Radio in
+  the drawer, and on the web — draws the satellites in use on an elevation-ring sky view
+  beside the fix, the satellite count and which receiver is answering.
+  See [Time sync](guide/time-sync.md).
+- **CW keyer speed** *(Ralph Hellmig)* — a slider in the drawer above IF calibration, and
+  the same control in the browser. It sets the speed over CAT and shows what the radio
+  actually took, because the radio is the authority and does not store it. **0 means a
+  straight key**, not "unset". See [Radio menus](guide/radio-menus.md).
 - **microSD backup** — insert a card (restart afterwards) and your ADIF log, full config,
   LoTW certificate and key, and diagnostic log are mirrored automatically. Continuous with
-  WiFi off (green SD dot); one complete backup per start-up with WiFi on (yellow dot).
+  WiFi off; one complete backup per start-up with WiFi on. The SD dot is green while writes
+  are reaching the card and yellow when nothing has landed lately.
 - **Diagnostics** — an always-on log with nothing to enable: 5 MB in RAM, a rolling copy
   in flash that survives a power cut, and a full mirror to microSD. A crash survives the
   reboot and is reported on the next boot, so a diagnostic download is enough to answer
@@ -122,11 +152,11 @@ Everything below is in the firmware **today**. Nothing needs a PC; only the item
 
 ## Status
 
-**v1.16.2 — a complete, self-contained FT8/FT4 station with no PC in the loop, a second
+**v1.18.0 — a complete, self-contained FT8/FT4/JS8 station with no PC in the loop, a second
 operating position in any browser, a WSPR propagation beacon, and the radio's own menus
 on the screen.** The panadapter, FT8/FT4 receive and transmit, WSPR, ADIF logging and all
 four logbook uploads — QRZ, eQSL, ARRL LoTW and your own Cloudlog or Wavelog — are stable
-and in daily use. **Audio on the Tab5 is new in v1.16.0 and is a beta** — see below. **v1.16.2** fixes the audio itself: a peak limiter for strong signals, and the break-ups are gone.
+and in daily use. **JS8 Normal is new in v1.17.0 and is a beta**, and **audio on the Tab5 is a beta** — see below. **v1.18.0** lets you set a PA voltage the radio must never exceed, stops the Output power control writing a figure it invented over it, and reads the portable and special-event callsigns JS8 used to discard; **v1.17.1** fixes a web page that stopped reading the radio's status altogether in v1.17.0, and documents JS8 properly; **v1.17.0** decodes JS8 off air and sends free text back, adds a JS8 page with Stations and Conversation tabs, a GPS Stats page with a live sky view, CW keyer speed from the browser and the Tab5, and the 3.5 mm jack as a receive source; **v1.16.12** added support for a GPS receiver on PORT.A and reads the date from a GPS-equipped QMX+ over CAT; **v1.16.11** keeps the WiFi link alive on a busy network and lets you eject the microSD card safely; **v1.16.10** stops the Tab5 moving your radio to 160 m every time it connects.
 
 !!! warning "Coming from v1.14.x or earlier? One USB-C cable update first"
 
@@ -139,7 +169,17 @@ and in daily use. **Audio on the Tab5 is new in v1.16.0 and is a beta** — see 
     press **Enter** at the flash-type prompt, never **E**. New users are
     unaffected, and anyone already on v1.15.0 simply updates from the device.
 
-**v1.16.2 makes the audio usable.** A **peak limiter** stops a strong signal arriving at full scale and taking your ears off, without making quiet stations any quieter. The **break-ups are gone** — the QMX sends about 47,885 samples a second and the Tab5 plays exactly 48,000, and nothing reconciled the two, so a fragment of silence was played roughly every three seconds. **LSB is fixed** *(Gyula HA3HZ)*: the audio came from the wrong side of the dial. A **working microSD card is no longer thrown away** *(Dennis WN4FLA)*. **Pause is on the web page** with play/pause symbols and no longer costs you the contact *(Randy N4OPI, Gyula HA3HZ)*, and you can **reboot the Tab5 from the browser**. ⚠ Audio still stutters while a browser has the panadapter open — close the page while you listen.
+**With WiFi on, SD card writes no longer stop about 30 seconds after boot.** ⭐ The SD symbol ended up crossed out - a known fault under ⚠ for five releases *(Gyula HA3HZ, Randy N4OPI)*. The card driver needs a small block of memory the hardware can transfer directly to and from, for every 512-byte block it moves, and it asks part of the way *through* the transfer. A failed request drops the chip-select with the card mid-block; from there the two are out of step and the Tab5 unmounts the card after five failures. What was consuming that memory is **RX audio** - about 29 KB, of which 24 KB was a buffer sitting in exactly the memory the card driver competes for. Moved to external memory. With the old buffer in place the card failed in 40 seconds with 87 bytes left; it now keeps writing. **Turning RX audio off is no longer the price of a working card.** ⭐ Confirmed in the field on three units *(Randy N4OPI)*.
+
+**v1.16.8 makes static IP and preferred network genuinely reliable.** ⭐ Randy N4OPI spent several days field-testing one build after another - each round found a real bug hiding under the last one: reset buttons erasing the wrong settings partition, a config import leaving the static address bound to nothing, a settings save re-triggering static-IP logic that hadn't changed, and switching networks from the web UI killing the very HTTP connection that asked for the switch. Confirmed on his bench: switching or setting a static address no longer needs a reboot. Also: **screenshots download as PNG and no longer tear**, **WSPR no longer reports "transmitted" on a burst where the radio was never keyed**, and **FT8's re-send-to-a-partner tracks up to four at once** instead of one. ⚠ The WSPR waterfall still shows nothing during the wait between cycles, unlike WSJT-X *(Samuel W7STF)* - a real request, not attempted this cycle.
+
+**v1.16.7 solves the idle abort.** v1.16.6 reduced the exposure and said the shortage was unchanged; it was, and the unit aborted twice more. Measured properly: **no leak** (20.5 h trends upward), but the internal pool was emptied **24 times a minute** for 60-360 ms, down to 143 bytes. ⭐ The cause was the web interface building its JSON replies in that pool - 495 pieces of one reply, 8.7 KB across 311 allocations - while 14 MB of external memory sat unused. Fixed: **24.1 droughts per minute became none**, free internal memory at rest 28 KB to 56 KB. ⚠ SD writes stopping ~30 s after boot is a SEPARATE shortage and is unchanged.
+
+**v1.16.5 makes the decoder keep up with the band.** ⭐ **Decoding is two to three times faster and stops dropping stations on a busy band** — a slot's decode was taking 11-14 seconds, longer than an FT8 slot, so the message that decides your next transmission arrived after the moment to send it had passed. Work is now taken as each processor becomes free instead of split in half in advance: **11-14 s → 2.7-5.9 s**, **nothing dropped** where 56-68 candidates a slot were abandoned, **3-15 stations per slot instead of 0-3**. **FT4 stops recording 2.5 seconds of silence** before deciding what to say. **Pick your next station while the closing 73 is still going out** *(Randy N4OPI)*, and **a station calling you out of the blue starts a full automatic QSO**. **AGC presets — Fast, Med, Slow and Off** *(Samuel W7STF)*. **The WiFi page says which network you are actually on.** And **switching between FT8 and FT4 could crash the unit** — fixed.
+
+**v1.16.4 fixes four faults operators found in their own shacks.** **A station answering your CQ is answered in the very next slot — every time** *(Gyula HA3HZ)*: decoding is split across both processors and only one half could act on a caller, so the same situation replied immediately about half the time and a cycle late the rest. **Waiting for a busy station really is capped at six minutes now** — the counter reset instead of latching, so it could wait over half an hour and never got back to calling them either. **Headphones silence the internal speaker** *(Roy KI0ER)*. **Resource Management is renamed Audio Settings**, with its own button in the settings drawer. **Preferred network actually decides which WiFi you join** *(Randy N4OPI)*. **A restart caused by a power brownout says so** *(Samuel W7STF)*. ⭐ And the recurring **SD "dot goes yellow and writes stop" is root-caused** — the card driver is refused a memory buffer, so the write never reaches a card that is mounted and healthy. ⚠ Audio still breaks up while a browser has the panadapter open.
+
+**v1.16.3 finishes the audio fix and gathers the controls.** The **crackle is actually gone** — v1.16.2 shipped the first of five attempts at the clock correction and you could still hear it working. **All four level controls are in one window**: RX Volume moved into Resource Management, "Gain" is renamed **AGC Ceiling** and reaches 1500, and **Attack** and **Release** are adjustable for the first time. ⚠ The settings drawer's RX Audio section is gone, including its on/off box — long-press the top bar instead. **A GPS that locks late is no longer missed** *(John W5JSS)*: detection ran once 45 seconds after boot and never again; a QMX+ here locked 25 minutes in. **WSPR gives the radio back its mode** instead of leaving it in Digi. **Preferred network** decides which remembered WiFi wins *(Randy N4OPI)*. The **SD dot** is green only while writes are actually landing. ⚠ Audio still breaks up while a browser has the panadapter open — close the page while you listen.
 
 **v1.16.0 brings audio to the Tab5, as a beta.** The I/Q the radio already sends becomes sound on the device, and the first thing built on it is a **panoramic CW split** — two stations on different frequencies placed left and right across the stereo image rather than on top of each other, with **pan width**, **pan blend** and **overlap** adjustable live while you listen. **Binaural CW is a first implementation: use 300 Hz bandwidth and up, and do not expect much separation below 200 Hz.** Audio costs resources, so **long-press the top bar on the Panadapter page** to open **Resource Management**, where it is switched on and off and where you can see what it competes with. The whole audio part is **beta and subject to further development** — the next step is the same features in the web interface, with only the I/Q sent to the PC and processed there. Full detail in the [Audio guide](guide/audio.md). A **Pause button** also arrives for QSOs *(Randy N4OPI)*: skip one transmission to check your slot is still clear, then carry on with the same message.
 
@@ -286,7 +326,7 @@ given a static IP address.
 
 **Stuck, or not sure what something is called?** The Tab5 can help you itself — see [Getting Help](getting-help.md).
 
-**Want the whole guide at once?** Download the [User Guide PDF](QMX-Panadapter-UserGuide-v1.16.2.pdf) — the whole user guide as one printable document.
+**Want the whole guide at once?** Download the [User Guide PDF](QMX-Panadapter-UserGuide-v1.18.0.pdf) — the whole user guide as one printable document.
 
 **Builder?** Head to [Build from Source](build/build.md) for ESP-IDF setup and the complete module map.
 

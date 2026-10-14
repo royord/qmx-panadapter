@@ -49,6 +49,27 @@ If you ever see **"USB stuck - power-cycle the QMX (reboot Tab5 if that fails)"*
    - Check the QMX's own **System Config -> IQ Mode** setting is enabled
 3. On firmware older than v0.19.3, this failure was silent — only visible in the diagnostic log as `QMX IQ mode NOT confirmed`. Updating is the simplest fix.
 
+### The radio jumps to 160 m whenever the Tab5 connects (fixed in v1.16.10)
+
+**On v1.16.9 and earlier, every CAT link-up moved your radio.** To show you a band
+list, the Tab5 reads it out of the QMX's own **Band config.** menus — and leaving
+those menus drops the radio on 160 m, in whatever mode the menus left behind. The
+Tab5 did not put it back. It happened on every connection, to everyone.
+
+What it looks like: you set up on 20 m, the Tab5 connects, and the radio is on
+1.837700 MHz in CW. If you run WSPR or a beacon it is worse than an annoyance —
+you transmit on a band you did not choose.
+
+**Update to v1.16.10**, which saves the frequency and mode before the scan and puts
+them back afterwards, and only if the scan actually moved them.
+
+!!! note "It is easy to blame the wrong thing"
+
+    This was reported as a dead CAT link, and then blamed on the radio's Virtual
+    U3S beacon — both wrong, and one operator switched off a beacon that was
+    innocent. The giveaway is in the timing: the band menus flick past in well
+    under two seconds, far faster than any beacon schedule.
+
 ### QMX loses CAT connection after 1–2 minutes
 
 **Symptoms:** Frequency/mode/BW stop updating, FT8 can't transmit.
@@ -79,6 +100,31 @@ If you ever see **"USB stuck - power-cycle the QMX (reboot Tab5 if that fails)"*
 3. Forget the network and reconnect: Settings -> WiFi -> tap network name -> Forget -> re-add
 4. Restart Tab5
 5. If still failing, grab the always-on **diagnostic log** — see [Collecting Diagnostics](#collecting-diagnostics)
+
+### The web page won't change my network, or Preferred network is ignored
+
+**Symptoms (v1.16.3):** you type a different network into **Network name** and
+save, and it goes back to the old one. Or you set **Preferred network** and the
+Tab5 keeps joining whichever network it used last.
+
+**Two separate faults, both fixed after v1.16.3.**
+
+- **Network name was discarded whenever the password field was blank** — even
+  though that field tells you to leave it blank to keep the stored password. So
+  switching to a network the Tab5 already knew did nothing, with no error
+  message, and the page then showed the old name again.
+- **Preferred network was only consulted after the Tab5 had failed to connect
+  twice.** It worked when your usual network was down, and did nothing when
+  both were up and the usual one answered first — which is the normal case. It
+  also needed a reboot to take effect.
+
+**Fix:** update the firmware. Then leave the password blank when you switch to
+a network the Tab5 already knows, and pick the preferred network from the list
+of remembered names now shown under both fields. Only a name on that list
+works.
+
+**If you must stay on v1.16.3:** choose the network from the Tab5's own
+settings drawer instead of the web page.
 
 ### WiFi connects, then stops working after a few minutes
 
@@ -212,6 +258,126 @@ This is a firmware limitation, not a fault in your setup, and it is being worked
 4. If still failing, try `http://192.168.1.50:80` explicitly
 5. Restart the Tab5
 
+### The SD dot stays yellow, or the card crosses itself out (fixed in v1.16.9)
+
+**Symptoms:** A card is in the slot and the **SD** dot is yellow rather than green, and stays that way while the Tab5 is clearly busy.
+
+**What the colours mean.** From v1.16.3 the dot reports whether writes are actually reaching the card: **green** = something landed within the last 90 seconds, **yellow** = a card is mounted but nothing has lately, **grey with a stroke** = no card.
+
+**Causes:**
+
+1. **Nothing to write.** On a very quiet session there may genuinely be nothing due, and yellow is then correct and harmless. The diagnostic log normally writes every 30 seconds, so this is uncommon.
+2. **The card driver was starved of memory — fixed in v1.16.9.** This was the common one, and on v1.16.8 and earlier it is what you are almost certainly seeing. **Update to v1.16.9.** If you cannot yet, switching **RX audio** off restores the card, at the cost of the speaker and headphone audio.
+3. **A genuinely failing card or slot.** Rarer. The log will show mount-level errors (CRC, invalid response) rather than write failures.
+
+**Fix:**
+
+1. **Update to v1.16.9**, which fixes cause 2. Reseating, reformatting or replacing the card has never helped anybody and will not help here.
+2. If you are staying on an older release, either switch **RX audio** off, or run with WiFi off (the normal POTA/SOTA case), where mirroring is continuous and flawless.
+3. To tell cause 2 from cause 3, download the diagnostic log and look for `SDFAIL[slowopen] err=0x5` with a low `DMA free=` figure (cause 2) versus mount-time errors (cause 3).
+
+> Cause 2 is fixed in v1.16.9. It was never your card.
+
+**What is actually happening (established v1.16.4, fixed v1.16.9).** The card is never the
+problem in cause 2. The diagnostic log now shows the two lines together, in the
+same millisecond:
+
+```
+E dma_utils: esp_dma_capable_malloc(181): Not enough heap memory
+W sd_arch: slow diag mirror failed 3 times running - backing off 60s -> 120s
+```
+
+The card is mounted and healthy; the write is **refused before it ever reaches
+it**, because the card driver cannot obtain a memory buffer of the kind it
+needs. The Tab5 then backs off 30 s → 60 s → 120 s → 240 s rather than hammering
+a request that cannot succeed, and the dot goes yellow because that is the
+truth.
+
+The memory is spoken for by the audio path: v1.16.4's start-up ledger (see
+below) shows the audio output stage alone taking 46.5 KB of it. **This is why
+reformatting, reseating or replacing the card has never helped anybody.**
+
+**v1.16.9 fixes it.** 24 KB of that audio total was a buffer sitting in exactly
+the memory the card driver competes for, with no need to be there; it now
+lives in external memory, where 14 MB is spare. Measured on the bench: with the
+old buffer in place and RX audio on, the card failed 40 seconds after boot with
+**87 bytes** of that memory left. With it moved, the same unit keeps writing.
+
+### Reading the start-up memory ledger (v1.16.4)
+
+Every diagnostic log now opens with a table like this, one line per subsystem:
+
+```
+memledger: app_main entry          dma=157499 B (lblk 94208)
+memledger: rx_audio_preopen (I2S)  dma= 99323 B (lblk 47104)
+memledger: dsp_init                dma= 29923 B (lblk 25600)
+memledger: rx_audio_init           dma= 15259 B (lblk 13824)
+```
+
+`dma` is the memory left that hardware can transfer directly to and from;
+`lblk` is the largest single unbroken piece of it. **The second number is
+usually what matters** — several things need one contiguous block, so they can
+fail while the total still looks adequate.
+
+You do not need to act on it. It is there so that when something declines to
+start, the reason is already in the file you send.
+
+### The Tab5 restarts on its own while you are listening
+
+**Symptoms:** The Tab5 reboots without warning, often while audio is playing and
+sometimes several times in a row. Nothing on screen explains it.
+
+**Most likely cause: the 5 V supply is dipping, not a firmware crash.** The
+processor has its own brownout detector; when the rail falls below its
+threshold it stops the chip immediately. Nothing crashed — it lost power for a
+moment.
+
+**From v1.16.4 the Tab5 tells you.** If the previous restart was a brownout, a
+message says so for twelve seconds at start-up, and the diagnostic log records
+`reset_reason=brownout`. Garbled sections in the log are a corroborating sign:
+those are writes cut off mid-write by the power loss.
+
+**What to check, in this order:**
+
+1. **The USB-C supply.** It wants a genuine 5 V 3 A source. A laptop port or a
+   small phone charger is the usual culprit.
+2. **The cable.** A thin or long one drops more than people expect at 2–3 A.
+3. **That the battery is actually charging** — the Tab5 leans on it for peaks.
+
+**Loud audio is the heaviest moment**, so brownouts often strike while you are
+listening or adjusting levels. That is a symptom of a marginal supply, not a
+reason to keep the volume down: a healthy supply runs the Tab5 at full volume
+without complaint.
+
+> Raising **AGC Ceiling** to 1500 in v1.16.3 did not cause this, but it does let
+> you reach a louder output than the old 800 limit allowed — which on a marginal
+> supply can be what tips it over *(Samuel W7STF)*.
+
+### Bluetooth stays grey although the box is ticked
+
+**Symptoms:** **Bluetooth** is enabled in the settings drawer, but the symbol in
+the bottom bar is grey rather than yellow, and no mouse or keyboard is ever
+found.
+
+**Cause: there was not enough memory to start it.** Bluetooth needs a
+contiguous 24 KB of internal memory at start-up. If it is not there, the Tab5
+**declines to start Bluetooth** rather than crash, and your setting is left
+untouched — which is why the box still reads ticked.
+
+The diagnostic log says so plainly:
+
+```
+btmouse: internal heap still 21391 B after 60 s (need 24576)
+         - NOT starting BLE this boot
+```
+
+**What to do:** restart the Tab5 **before** switching on RX audio, and let it
+settle. Audio is the largest consumer of that memory, so a start-up with audio
+already enabled is the case most likely to squeeze Bluetooth out.
+
+> Known and measured. The margin is genuinely thin, and reducing the audio
+> path's memory footprint is being worked on.
+
 ### Settings disappear after restart
 
 **Symptoms:** You set your callsign/grid/WiFi password, but after power cycle they're gone.
@@ -267,7 +433,7 @@ Reported by Samuel W7STF after a seven-hour session; a reboot fixed it immediate
 If a reboot does *not* fix it, the usual causes are a charge-only USB-C cable or a
 serial monitor still holding the port.
 
-### Clearing a stuck configuration (web-based reset, new in v0.21.0)
+### Clearing a stuck configuration (web-based reset)
 
 **Symptoms:** the panadapter behaves as if a setting is wedged — e.g. WiFi won't come up no matter what, or a stored value seems stuck — and re-entering settings doesn't help.
 

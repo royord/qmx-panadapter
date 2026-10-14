@@ -1,6 +1,7 @@
 #include "settings.h"
 #include "util/format_freq.h"   // #302: g_freq_style, applied on set
 #include "util/gpio_relay.h"    // relay polarity, applied on set (same reason)
+#include "unit_gps/unit_gps.h"  // PORT.A's other backend - the mode sequencer below
 #include "ui.h"                 // CW_CENTER_* - the grid the radio accepts (#359)
 #include "sd_archive.h"
 
@@ -32,6 +33,15 @@ static const char *TAG = "settings";
 #define KEY_WIFI_SSID   "wifi_ssid"
 #define KEY_MY_CALL     "my_call"
 #define KEY_MY_GRID     "my_grid"
+/* Provenance, NOT a user setting: the grid the GPS last wrote into
+ * my_grid. gps_autogrid.c needs it to tell "the operator typed over my
+ * value" from "we have not written this square yet", and that answer must
+ * survive a reboot or the operator's correction is undone a minute after
+ * every boot. Deliberately absent from config_io_export() and from the web
+ * settings: it is device state, and carrying it to another radio would
+ * suppress that radio's first fill. A settings factory reset erases the
+ * whole user_nvs partition, so it is forgotten there, which is right. */
+#define KEY_GPS_GRID_A  "gps_grid_a"
 #define KEY_WIFI_PASS   "wifi_pass"
 #define KEY_WIFI_IP     "wifi_ip"
 #define KEY_WIFI_MASK   "wifi_mask"
@@ -46,6 +56,8 @@ static const char *TAG = "settings";
 #define KEY_BRIGHTNESS "brightness"
 #define KEY_LAST_MODE  "last_mode"
 #define KEY_LAST_TIME  "last_time"
+#define KEY_DATE_SRC   "date_src"   /* who last set the DATE - date_src_t */
+#define KEY_GNSS_MBUS  "gnss_mbus"  /* Module GPS v2.1 on the M-Bus (GPIO38) */
 #define KEY_CQ_MSG0    "cq_msg0"
 #define KEY_CQ_MSG1    "cq_msg1"
 #define KEY_CQ_MSG2    "cq_msg2"
@@ -82,7 +94,8 @@ static const char *TAG = "settings";
 #define KEY_WF_CONTRAST  "wf_contr"
 #define KEY_WF_BLEND     "wf_blend"
 #define KEY_WF_WINDOW    "wf_window"
-#define KEY_WF_SPEED     "wf_speed"
+#define KEY_WF_SPEED     "wf_speed"   /* LEGACY 1..4x multiplier - read once, then never written again */
+#define KEY_WF_ROWS      "wf_rows"    /* waterfall rows per second, 1..40 */
 #define KEY_DISP_FLIP    "disp_flip"
 #define KEY_QMX_VOL      "qmx_vol_db"
 #define KEY_CW_TX_OFF    "cw_tx_off"
@@ -92,6 +105,10 @@ static const char *TAG = "settings";
 #define KEY_RXA_PWIDTH   "rxa_pw"
 #define KEY_RXA_PBLEND   "rxa_pb"
 #define KEY_RXA_POVLP    "rxa_po"
+#define KEY_RXA_ATTACK   "rxa_atk"
+#define KEY_RXA_RELEASE  "rxa_rel"
+#define KEY_RXA_AGCOFF   "rxa_agcoff"
+#define KEY_HP_MUTE      "hp_mute"
 #define KEY_ACT_TYPE     "act_type"
 #define KEY_ACT_REF      "act_ref"
 #define KEY_BP_REGION    "bp_region"
@@ -116,6 +133,8 @@ static const char *TAG = "settings";
 #define KEY_OTA_AUTODL     "ota_autodl"
 #define KEY_DRAWER_EXPERT  "drw_expert"
 #define KEY_WIFI_KNOWN     "wifi_known"
+#define KEY_WIFI_PREF_SSID "wifi_pref"   // designated-preferred SSID, empty = none
+#define KEY_WIFI_STATIC_SSID "wifi_stssid" // the SSID the static IP belongs to, empty = unbound
 #define KEY_TX_TONE_HZ     "tx_tone_hz"
 #define KEY_TX_TONE_HOLD   "tx_tone_hold"
 #define KEY_FT8_SYNC_LINES "ft8_sync_ln"
@@ -134,6 +153,7 @@ static const char *TAG = "settings";
 #define KEY_PWR_CAL        "pwrcal"
 #define KEY_RADIO_UID      "radiouid"   /* UI; of the radio the table above belongs to */
 #define KEY_PWR_TARGET     "pwrtarget"
+#define KEY_PA_CEILING     "pacap"
 #define KEY_WSPR_TONE      "wsprtone"
 #define KEY_WSPR_DUMP      "wspr_dump"
 #define KEY_WSPR_HOPM      "wspr_hopm"
@@ -146,6 +166,9 @@ static const char *TAG = "settings";
 #define KEY_RELAY_PIN      "relay_pin"
 #define KEY_RELAY_LEVEL    "relay_lvl"
 #define KEY_RELAY_MS       "relay_ms"
+#define KEY_PORT_A_MODE    "port_a_mode"
+#define KEY_RX_SOURCE      "rx_source"
+#define KEY_LINEIN_GAIN    "linein_gain"
 #define KEY_RESMON_EN      "resmon_en"
 #define KEY_RESMON_DX      "resmon_dx"
 #define KEY_RESMON_DY      "resmon_dy"
@@ -182,7 +205,7 @@ static const char *TAG = "settings";
 #define DEF_WF_CONTRAST   (45.0f)
 #define DEF_WF_BLEND      (100)
 #define DEF_WF_WINDOW     (0)
-#define DEF_WF_SPEED      (1)
+#define DEF_WF_ROWS       (10)   /* rows/s - the rate the waterfall has always run at */
 #define DEF_CHARGE_LIM_EN  (false)
 #define DEF_CHARGE_LIM_PCT (80)
 #define DEF_RELAY_PIN      (53)
@@ -216,7 +239,7 @@ static const char *TAG = "settings";
  * taken every one of them while the comment still said 62. Bumped to 5 words
  * rather than land the next person on a full bitmap behind a wrong number.
  * Cost is 4 bytes. Recount before trusting this figure again. */
-#define DIRTY_WORDS      5                        /* 160 bits; highest used 127, 32 spare */
+#define DIRTY_WORDS      5                        /* 160 bits; highest used 138, 21 spare */
 #define DIRTY_BITS_MAX   (DIRTY_WORDS * 32)
 
 typedef struct { uint32_t w[DIRTY_WORDS]; } dirty_t;
@@ -392,6 +415,7 @@ static inline bool dirty_test_any(const dirty_t *d, const uint8_t *bits, size_t 
 #define DIRTY_SPOTMAP_EN    118   /* spot map + its three self-spot feeds */
 #define DIRTY_PWR_CAL        119  /* power calibration table (Calibrate Power) - NOT in config export, see the type's comment */
 #define DIRTY_PWR_TARGET     120  /* operator's own per-band Output power target - a preference, unlike DIRTY_PWR_CAL */
+#define DIRTY_PA_CEILING     139  /* operator's own PA-voltage ceiling - see pa_ceiling_x10 in settings.h */
 #define DIRTY_WF_SPEED       121
 #define DIRTY_WSPR_BURST     122  /* consecutive cycles per scheduled WSPR transmission */
 #define DIRTY_WSPR_TONE      123  /* pinned WSPR TX tone, 0 = random per burst */
@@ -399,10 +423,32 @@ static inline bool dirty_test_any(const dirty_t *d, const uint8_t *bits, size_t 
 #define DIRTY_RXA_PWIDTH     125  /* panoramic split: stereo width */
 #define DIRTY_RXA_PBLEND     126  /* panoramic split: cross-feed */
 #define DIRTY_RXA_POVLP      127  /* panoramic split: filter overlap */
+/* ⚠ NOT added to s_config_export_bits[] below - config_io_export()/import()
+ * would need a matching field, and that is a separate, wider change than
+ * this feature needs tonight. A restored config therefore does NOT carry the
+ * preferred network; it must be re-set on each unit. Worth doing properly
+ * later, not silently skipped - see the commit message. */
+#define DIRTY_WIFI_PREF       128  /* designated-preferred WiFi network */
+#define DIRTY_RXA_ATTACK      129  /* AGC attack time, ms */
+#define DIRTY_RXA_RELEASE     130  /* AGC release time, ms */
+#define DIRTY_RXA_AGCOFF      131  /* AGC bypass */
+#define DIRTY_HP_MUTE         132  /* speaker auto-mute on headphones */
+#define DIRTY_WIFI_STATIC_SSID 133 /* which SSID the static IP is for */
+#define DIRTY_DATE_SRC        134  /* date provenance byte (royord #18) */
+/* 135, not 134: ericmoritz' PORT.A branch and the date-provenance byte were
+ * written against the same tree and both took the next free bit. These are
+ * runtime bitmap indices only - nothing on flash carries them, the NVS KEY
+ * strings do - so renumbering here costs nothing. 24 spare. */
+#define DIRTY_PORT_A_MODE     135  /* PORT.A owner: relay | unit_gps (#15) */
+#define DIRTY_GNSS_MBUS       136  /* M-Bus GNSS receiver enable */
+#define DIRTY_RX_SOURCE       137  /* RX input source: qmx_usb | line_in */
+#define DIRTY_LINEIN_GAIN     138  /* line-in analogue gain, dB; 21 spare */
 
 // Bits that actually affect config_io_export()'s output (storage/config_io.c).
-// Bookkeeping bits like DIRTY_LAST_TIME (rewritten every FT8 slot by the
-// continuous time-sync correction, ~every 15s) and DIRTY_LAST_MODE are NOT in
+// Bookkeeping bits like DIRTY_LAST_TIME (rewritten by the continuous time-sync
+// correction, throttled to ~5 min in write_to_rtc_and_nvs() - this comment
+// claimed ~15 s while the Unit-GPS path was in fact writing it EVERY SECOND,
+// measured on the bench 2026-10-09) and DIRTY_LAST_MODE are NOT in
 // here on purpose: re-mirroring qmx-config.txt to the SD card produces an
 // identical file (those fields aren't part of the export), so doing it on
 // their account is pure waste — and worse, SD card I/O competes with the
@@ -434,6 +480,14 @@ static const uint8_t s_config_export_bits[] = {
      * the same reason the power calibration does - nobody can recreate it from
      * memory. config_io_export() prints all four. */
     DIRTY_RXA_GAIN, DIRTY_RXA_PWIDTH, DIRTY_RXA_PBLEND, DIRTY_RXA_POVLP,
+    DIRTY_RXA_ATTACK, DIRTY_RXA_RELEASE, DIRTY_RXA_AGCOFF, DIRTY_HP_MUTE,
+    DIRTY_WIFI_STATIC_SSID,
+    DIRTY_PORT_A_MODE,   /* config_io_export() prints port_a_mode; the import
+                          * must land in the same mode the file left behind */
+    /* The restored unit must come up on the SAME input it was backed up on.
+     * A config file that silently moved a board back to the QMX would look
+     * like the jack had stopped working. */
+    DIRTY_RX_SOURCE, DIRTY_LINEIN_GAIN,
 };
 
 // ---- Module state ------------------------------------------------------
@@ -443,6 +497,22 @@ static const uint8_t s_config_export_bits[] = {
 // it; see settings.h. Loaded in settings_init(), written on DIRTY_WIFI_KNOWN.
 static wifi_known_t s_known[WIFI_KNOWN_MAX];
 static int          s_known_n = 0;
+
+// Designated-preferred WiFi network (Randy N4OPI, 2026-09-23: multiple sites
+// with overlapping remembered SSIDs, and roam_to_known_if_present() in wifi.c
+// picks whichever is LOUDEST on a reboot, not whichever he actually wants -
+// "beyond my control as to which network it will connect to"). Empty string =
+// no preference, today's exact RSSI-based behaviour, unchanged. Deliberately
+// its own static + accessor, same reasoning as s_known above: wifi.c's roam
+// path runs on the system event task's <3 KB stack and must not pull in a
+// settings_load_all() copy of the ~1 KB qmx_settings_t just for one string.
+static char s_wifi_pref_ssid[33] = {0};
+/* The SSID the stored static IP was made for. Empty = not yet bound; it is
+ * bound on the first connection where the static config is actually used.
+ * Randy N4OPI, 2026-09-26: a static address had NO network context, so
+ * moving to another WLAN applied an address from the old one - the unit
+ * associates and then has no usable route, and the Tab5 just shows "Off". */
+static char s_wifi_static_ssid[33] = {0};
 
 static bool             s_ready          = false;
 static nvs_handle_t     s_nvs            = 0;
@@ -535,6 +605,8 @@ static void flush_task(void *arg)
         if (dirty_test(&dirty_local, DIRTY_BRIGHTNESS)) nvs_set_u8(s_nvs, KEY_BRIGHTNESS, snap.brightness_pct);
         if (dirty_test(&dirty_local, DIRTY_LAST_MODE))  nvs_set_u8(s_nvs, KEY_LAST_MODE,  snap.last_ui_mode);
         if (dirty_test(&dirty_local, DIRTY_LAST_TIME))  nvs_set_u32(s_nvs, KEY_LAST_TIME, snap.last_unix_time);
+        if (dirty_test(&dirty_local, DIRTY_DATE_SRC))   nvs_set_u8(s_nvs,  KEY_DATE_SRC,  snap.date_src);
+        if (dirty_test(&dirty_local, DIRTY_GNSS_MBUS))  nvs_set_u8(s_nvs,  KEY_GNSS_MBUS, snap.gnss_mbus_en);
         if (dirty_test(&dirty_local, DIRTY_CQ_MSG0))    nvs_set_str(s_nvs, KEY_CQ_MSG0, snap.cq_msg[0]);
         if (dirty_test(&dirty_local, DIRTY_CQ_MSG1))    nvs_set_str(s_nvs, KEY_CQ_MSG1, snap.cq_msg[1]);
         if (dirty_test(&dirty_local, DIRTY_CQ_MSG2))    nvs_set_str(s_nvs, KEY_CQ_MSG2, snap.cq_msg[2]);
@@ -549,6 +621,7 @@ static void flush_task(void *arg)
         if (dirty_test(&dirty_local, DIRTY_KBD_BIND))     nvs_set_blob(s_nvs, KEY_KBD_BIND, &snap.kbd_bindings, sizeof(snap.kbd_bindings));
         if (dirty_test(&dirty_local, DIRTY_PWR_CAL))      nvs_set_blob(s_nvs, KEY_PWR_CAL, &snap.pwr_cal, sizeof(snap.pwr_cal));
         if (dirty_test(&dirty_local, DIRTY_PWR_TARGET))   nvs_set_blob(s_nvs, KEY_PWR_TARGET, &snap.pwr_target, sizeof(snap.pwr_target));
+        if (dirty_test(&dirty_local, DIRTY_PA_CEILING))   nvs_set_u16(s_nvs, KEY_PA_CEILING, snap.pa_ceiling_x10);
         if (dirty_test(&dirty_local, DIRTY_WIFI_ENABLED)) nvs_set_u8(s_nvs, KEY_WIFI_ENABLED, snap.wifi_enabled ? 1 : 0);
         if (dirty_test(&dirty_local, DIRTY_QMX_GPS))      nvs_set_u8(s_nvs, KEY_QMX_GPS,      snap.qmx_gps      ? 1 : 0);
         if (dirty_test(&dirty_local, DIRTY_QMX_TPUSH))    nvs_set_u8(s_nvs, KEY_QMX_TPUSH,    snap.qmx_time_pushed ? 1 : 0);
@@ -576,7 +649,7 @@ static void flush_task(void *arg)
         if (dirty_test(&dirty_local, DIRTY_WF_CONTRAST)) nvs_set_float(KEY_WF_CONTRAST, snap.wf_contrast_db);
         if (dirty_test(&dirty_local, DIRTY_WF_BLEND))    nvs_set_u8(s_nvs, KEY_WF_BLEND,  snap.wf_floor_blend);
         if (dirty_test(&dirty_local, DIRTY_WF_WINDOW))   nvs_set_u8(s_nvs, KEY_WF_WINDOW, snap.wf_window);
-        if (dirty_test(&dirty_local, DIRTY_WF_SPEED))    nvs_set_u8(s_nvs, KEY_WF_SPEED,  snap.wf_speed_mult);
+        if (dirty_test(&dirty_local, DIRTY_WF_SPEED))    nvs_set_u8(s_nvs, KEY_WF_ROWS,   snap.wf_rows_per_s);
         if (dirty_test(&dirty_local, DIRTY_DISP_FLIP))   nvs_set_u8(s_nvs, KEY_DISP_FLIP, snap.display_flip ? 1 : 0);
         if (dirty_test(&dirty_local, DIRTY_QMX_VOL))     nvs_set_u8(s_nvs, KEY_QMX_VOL,   snap.qmx_vol_db);
         if (dirty_test(&dirty_local, DIRTY_CW_TX_OFFSET)) nvs_set_i16(s_nvs, KEY_CW_TX_OFF, snap.cw_tx_offset_hz);
@@ -585,6 +658,10 @@ static void flush_task(void *arg)
         if (dirty_test(&dirty_local, DIRTY_RXA_PWIDTH))   nvs_set_u8(s_nvs, KEY_RXA_PWIDTH, snap.rxaud_pan_width_x10);
         if (dirty_test(&dirty_local, DIRTY_RXA_PBLEND))   nvs_set_u8(s_nvs, KEY_RXA_PBLEND, snap.rxaud_pan_blend_x100);
         if (dirty_test(&dirty_local, DIRTY_RXA_POVLP))    nvs_set_u8(s_nvs, KEY_RXA_POVLP,  snap.rxaud_pan_ovlp_x100);
+        if (dirty_test(&dirty_local, DIRTY_RXA_ATTACK))   nvs_set_u8(s_nvs, KEY_RXA_ATTACK, snap.rxaud_agc_attack_ms);
+        if (dirty_test(&dirty_local, DIRTY_RXA_RELEASE))  nvs_set_u16(s_nvs, KEY_RXA_RELEASE, snap.rxaud_agc_release_ms);
+        if (dirty_test(&dirty_local, DIRTY_RXA_AGCOFF))   nvs_set_u8(s_nvs, KEY_RXA_AGCOFF, snap.rxaud_agc_off ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_HP_MUTE))      nvs_set_u8(s_nvs, KEY_HP_MUTE, snap.hp_mute_en ? 1 : 0);
         if (dirty_test(&dirty_local, DIRTY_ACTIVATION)) {
             nvs_set_u8(s_nvs, KEY_ACT_TYPE, snap.act_type);
             nvs_set_str(s_nvs, KEY_ACT_REF, snap.act_ref);
@@ -625,6 +702,20 @@ static void flush_task(void *arg)
         xSemaphoreGive(s_mutex);
         nvs_set_blob(s_nvs, KEY_WIFI_KNOWN, kn, (size_t)kn_n * sizeof(wifi_known_t));
     }
+    if (dirty_test(&dirty_local, DIRTY_WIFI_PREF)) {
+        char pref[33];
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        snprintf(pref, sizeof(pref), "%s", s_wifi_pref_ssid);
+        xSemaphoreGive(s_mutex);
+        nvs_set_str(s_nvs, KEY_WIFI_PREF_SSID, pref);
+    }
+    if (dirty_test(&dirty_local, DIRTY_WIFI_STATIC_SSID)) {
+        char own[33];
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        snprintf(own, sizeof(own), "%s", s_wifi_static_ssid);
+        xSemaphoreGive(s_mutex);
+        nvs_set_str(s_nvs, KEY_WIFI_STATIC_SSID, own);
+    }
         if (dirty_test(&dirty_local, DIRTY_TX_TONE_HZ))    nvs_set_u16(s_nvs, KEY_TX_TONE_HZ,   snap.tx_tone_hz);
         if (dirty_test(&dirty_local, DIRTY_TX_TONE_HOLD))  nvs_set_u8(s_nvs, KEY_TX_TONE_HOLD,  snap.tx_tone_hold ? 1 : 0);
         if (dirty_test(&dirty_local, DIRTY_FT8_SYNC_LINES)) nvs_set_u8(s_nvs, KEY_FT8_SYNC_LINES, snap.ft8_sync_lines ? 1 : 0);
@@ -657,6 +748,12 @@ static void flush_task(void *arg)
             nvs_set_u8 (s_nvs, KEY_RELAY_LEVEL, snap.gpio_relay_level ? 1 : 0);
             nvs_set_u16(s_nvs, KEY_RELAY_MS,    snap.gpio_relay_ms);
         }
+        if (dirty_test(&dirty_local, DIRTY_PORT_A_MODE))
+            nvs_set_u8(s_nvs, KEY_PORT_A_MODE, snap.port_a_mode);
+        if (dirty_test(&dirty_local, DIRTY_RX_SOURCE))
+            nvs_set_u8(s_nvs, KEY_RX_SOURCE, snap.rx_source);
+        if (dirty_test(&dirty_local, DIRTY_LINEIN_GAIN))
+            nvs_set_u8(s_nvs, KEY_LINEIN_GAIN, snap.line_in_gain_db);
         if (dirty_test(&dirty_local, DIRTY_RESMON_EN))  nvs_set_u8(s_nvs, KEY_RESMON_EN, snap.resmon_en ? 1 : 0);
         if (dirty_test(&dirty_local, DIRTY_RESMON_POS)) {
             nvs_set_i16(s_nvs, KEY_RESMON_DX, snap.resmon_dx);
@@ -791,6 +888,8 @@ static void load_from_nvs(qmx_settings_t *out)
     out->brightness_pct = DEF_BRIGHTNESS;
     out->last_ui_mode = DEF_LAST_MODE;
     out->last_unix_time = 0;
+    out->date_src       = 0;   /* nobody we trust - the date gets questioned */
+    out->gnss_mbus_en   = 0;   /* no M-Bus receiver unless the operator says so */
     out->cq_msg[0][0] = '\0';
     out->cq_msg[1][0] = '\0';
     out->cq_msg[2][0] = '\0';
@@ -824,7 +923,7 @@ static void load_from_nvs(qmx_settings_t *out)
     out->wf_contrast_db = DEF_WF_CONTRAST;
     out->wf_floor_blend = DEF_WF_BLEND;
     out->wf_window      = DEF_WF_WINDOW;
-    out->wf_speed_mult  = DEF_WF_SPEED;
+    out->wf_rows_per_s  = DEF_WF_ROWS;
     out->display_flip   = false;
     out->qmx_vol_db     = 20;   // fallback slider position only - never sent at boot
     out->ft8_early_decode = true; // on by default (WSJT-X-style fast pounce timing)
@@ -875,6 +974,10 @@ static void load_from_nvs(qmx_settings_t *out)
     out->rxaud_pan_width_x10  = 18;
     out->rxaud_pan_blend_x100 = 15;
     out->rxaud_pan_ovlp_x100  = 30;
+    out->rxaud_agc_attack_ms  = 3;
+    out->rxaud_agc_release_ms = 150;
+    out->rxaud_agc_off        = false;   /* tracking AGC, as before */
+    out->hp_mute_en           = true;    /* what everyone expects */
     out->act_type   = 0;          // not activating anything
     out->act_ref[0] = '\0';
     memset(&out->ft8_filters, 0, sizeof(out->ft8_filters));
@@ -907,6 +1010,12 @@ static void load_from_nvs(qmx_settings_t *out)
     out->gpio_relay_pin   = DEF_RELAY_PIN;
     out->gpio_relay_level = DEF_RELAY_LEVEL;
     out->gpio_relay_ms    = DEF_RELAY_MS;
+    /* Absent key == relay. This is the upgrade guarantee: a board that has
+     * never heard of the Unit GPS boots with both pins driven exactly as they
+     * were before the setting existed (task 2.4's READ BACK check). */
+    out->port_a_mode      = PORT_A_MODE_RELAY;
+    out->rx_source        = RX_SOURCE_QMX_USB;
+    out->line_in_gain_db  = 0;   /* see LINE_IN_GAIN_DB_MAX in settings.h */
     out->freq_sep_style   = 0;   /* #302: the punctuation the Tab5 has always
                                     shown - a stored preference is the only
                                     thing that changes it, so nobody sees a
@@ -944,6 +1053,10 @@ static void load_from_nvs(qmx_settings_t *out)
     nvs_get_u8(s_nvs, KEY_BRIGHTNESS, &out->brightness_pct);
     nvs_get_u8(s_nvs, KEY_LAST_MODE, &out->last_ui_mode);
     nvs_get_u32(s_nvs, KEY_LAST_TIME, &out->last_unix_time);
+    /* Absent on an upgrade from a build before this existed, which leaves it
+     * 0 and makes the first boot ask once. That is the safe direction. */
+    nvs_get_u8(s_nvs, KEY_DATE_SRC, &out->date_src);
+    nvs_get_u8(s_nvs, KEY_GNSS_MBUS, &out->gnss_mbus_en);
 
     // Strings: zero buffers first, then read length-bounded.
     out->wifi_ssid[0] = '\0';
@@ -975,6 +1088,10 @@ static void load_from_nvs(qmx_settings_t *out)
     nvs_get_u8(s_nvs, KEY_RXA_PWIDTH, &out->rxaud_pan_width_x10);
     nvs_get_u8(s_nvs, KEY_RXA_PBLEND, &out->rxaud_pan_blend_x100);
     nvs_get_u8(s_nvs, KEY_RXA_POVLP,  &out->rxaud_pan_ovlp_x100);
+    nvs_get_u8(s_nvs, KEY_RXA_ATTACK,  &out->rxaud_agc_attack_ms);
+    nvs_get_u16(s_nvs, KEY_RXA_RELEASE, &out->rxaud_agc_release_ms);
+    { uint8_t b; if (nvs_get_u8(s_nvs, KEY_RXA_AGCOFF, &b) == ESP_OK) out->rxaud_agc_off = (b != 0); }
+    { uint8_t b; if (nvs_get_u8(s_nvs, KEY_HP_MUTE,    &b) == ESP_OK) out->hp_mute_en     = (b != 0); }
     nvs_get_u8(s_nvs, KEY_ACT_TYPE, &out->act_type);
     out->act_ref[0] = '\0';
     sz = sizeof(out->act_ref);
@@ -1031,10 +1148,21 @@ static void load_from_nvs(qmx_settings_t *out)
     if (nvs_get_float(KEY_WF_CONTRAST, &fv)) out->wf_contrast_db = fv;
     nvs_get_u8(s_nvs, KEY_WF_BLEND,  &out->wf_floor_blend);
     nvs_get_u8(s_nvs, KEY_WF_WINDOW, &out->wf_window);
-    nvs_get_u8(s_nvs, KEY_WF_SPEED,  &out->wf_speed_mult);
+    /* Waterfall rate: rows/s now, a 1..4x multiplier before. Read the new key
+     * first; only if it has never been written does the legacy key decide,
+     * x10 to turn a multiplier into rows/s. One-way and unambiguous - once
+     * KEY_WF_ROWS exists the legacy value is ignored for good, so a stored 4
+     * can never be read as "4 rows/s" on one boot and "40" on the next. */
+    if (nvs_get_u8(s_nvs, KEY_WF_ROWS, &out->wf_rows_per_s) != ESP_OK) {
+        uint8_t legacy = 0;
+        if (nvs_get_u8(s_nvs, KEY_WF_SPEED, &legacy) == ESP_OK &&
+            legacy >= 1 && legacy <= 4) {
+            out->wf_rows_per_s = (uint8_t)(legacy * 10);
+        }
+    }
     if (out->wf_floor_blend > 100) out->wf_floor_blend = 100;
     if (out->wf_window > 2)        out->wf_window = 0;
-    if (out->wf_speed_mult < 1 || out->wf_speed_mult > 4) out->wf_speed_mult = DEF_WF_SPEED;
+    if (out->wf_rows_per_s < 1 || out->wf_rows_per_s > 40) out->wf_rows_per_s = DEF_WF_ROWS;
     if (nvs_get_u8(s_nvs, KEY_DISP_FLIP, &u8v) == ESP_OK) out->display_flip = (u8v != 0);
     if (nvs_get_u8(s_nvs, KEY_QMX_VOL, &u8v) == ESP_OK) out->qmx_vol_db = (u8v <= 199) ? u8v : 199;
     {
@@ -1105,6 +1233,11 @@ static void load_from_nvs(qmx_settings_t *out)
     sz = sizeof(out->pwr_target);
     nvs_get_blob(s_nvs, KEY_PWR_TARGET, &out->pwr_target, &sz);
 
+    /* Absent means no ceiling, which is the default and the behaviour every
+     * build since v1.16.0 has had - so an upgrade changes nothing until the
+     * operator sets one. */
+    nvs_get_u16(s_nvs, KEY_PA_CEILING, &out->pa_ceiling_x10);
+
     // Known-network list. Stored as a blob of exactly the used entries, so the
     // returned size gives the count back. A short/absent blob just means "none
     // remembered yet" - never an error worth reporting.
@@ -1120,6 +1253,20 @@ static void load_from_nvs(qmx_settings_t *out)
             for (int i = 0; i < n; i++)
                 if (s_known[i].ssid[0]) s_known[s_known_n++] = s_known[i];
         }
+    }
+
+    // Designated-preferred network - see s_wifi_pref_ssid's declaration.
+    {
+        s_wifi_pref_ssid[0] = '\0';
+        size_t psz = sizeof(s_wifi_pref_ssid);
+        nvs_get_str(s_nvs, KEY_WIFI_PREF_SSID, s_wifi_pref_ssid, &psz);
+    }
+
+    // Which SSID the stored static IP belongs to - see s_wifi_static_ssid.
+    {
+        s_wifi_static_ssid[0] = '\0';
+        size_t ssz = sizeof(s_wifi_static_ssid);
+        nvs_get_str(s_nvs, KEY_WIFI_STATIC_SSID, s_wifi_static_ssid, &ssz);
     }
 
     if (nvs_get_u8(s_nvs, KEY_FIELD_DAY_EN, &u8v) == ESP_OK) out->field_day_en = (u8v != 0);
@@ -1206,6 +1353,26 @@ static void load_from_nvs(qmx_settings_t *out)
         out->gpio_relay_pin   = (rp == 53 || rp == 54) ? rp : DEF_RELAY_PIN;
         out->gpio_relay_level = (rl != 0);
         if (out->gpio_relay_ms < 50 || out->gpio_relay_ms > 5000) out->gpio_relay_ms = DEF_RELAY_MS;
+    }
+    {
+        // 0 when the key was never written, so "no key" and "relay" are the
+        // same value on purpose - see port_a_mode_normalize().
+        uint8_t pm = 0;
+        nvs_get_u8(s_nvs, KEY_PORT_A_MODE, &pm);
+        out->port_a_mode = port_a_mode_normalize(pm);
+    }
+    {
+        /* 0 when the key was never written, which is the QMX - so an upgrade,
+         * a wiped NVS and a deliberate "use the radio" are one value. The
+         * normalize also catches a source a NEWER build offered before the
+         * operator downgraded: it resolves to the radio rather than leaving a
+         * board with no receiver at all. */
+        uint8_t rs = 0;
+        nvs_get_u8(s_nvs, KEY_RX_SOURCE, &rs);
+        out->rx_source = rx_source_normalize(rs);
+        uint8_t lg = 0;
+        nvs_get_u8(s_nvs, KEY_LINEIN_GAIN, &lg);
+        out->line_in_gain_db = line_in_gain_db_normalize(lg);
     }
     if (nvs_get_u8(s_nvs, KEY_RESMON_EN, &u8v) == ESP_OK) out->resmon_en = (u8v != 0);
     nvs_get_i16(s_nvs, KEY_RESMON_DX, &out->resmon_dx);
@@ -1469,6 +1636,19 @@ void settings_set_last_unix_time(uint32_t unix_sec)
     s_pending.last_unix_time = unix_sec;
     xSemaphoreGive(s_mutex);
     mark_dirty(DIRTY_LAST_TIME);
+}
+
+void settings_set_date_src(uint8_t src)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.date_src == src) {
+        xSemaphoreGive(s_mutex);
+        return;
+    }
+    s_pending.date_src = src;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_DATE_SRC);
 }
 
 void settings_set_my_callsign(const char *call)
@@ -2098,13 +2278,22 @@ void settings_set_wf_window(uint8_t idx)
     mark_dirty(DIRTY_WF_WINDOW);
 }
 
-void settings_set_wf_speed_mult(uint8_t mult)
+uint8_t settings_get_wf_rows_per_s(void)
+{
+    if (!s_ready) return DEF_WF_ROWS;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t v = s_pending.wf_rows_per_s;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+void settings_set_wf_rows_per_s(uint8_t rows)
 {
     if (!s_ready) return;
-    if (mult < 1 || mult > 4) mult = DEF_WF_SPEED;
+    if (rows < 1 || rows > 40) rows = DEF_WF_ROWS;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (s_pending.wf_speed_mult == mult) { xSemaphoreGive(s_mutex); return; }
-    s_pending.wf_speed_mult = mult;
+    if (s_pending.wf_rows_per_s == rows) { xSemaphoreGive(s_mutex); return; }
+    s_pending.wf_rows_per_s = rows;
     xSemaphoreGive(s_mutex);
     mark_dirty(DIRTY_WF_SPEED);
 }
@@ -2318,7 +2507,29 @@ uint8_t settings_get_swr_limit_x10(void)
     xSemaphoreGive(s_mutex);                          \
     return v
 
-void settings_set_rxaud_gain_d10(uint8_t v)      { RXA_SET_U8(rxaud_gain_d10,       DIRTY_RXA_GAIN,   5, 80); }
+/* Same shape as RXA_SET_U8/RXA_GET_U8 above, widened to uint16_t for the
+ * release time (needs up to 500, past uint8_t's 255). */
+#define RXA_SET_U16(field, dirty_bit, lo, hi)         \
+    if (!s_ready) return;                             \
+    if (v < (lo)) v = (lo);                           \
+    if (v > (hi)) v = (hi);                           \
+    xSemaphoreTake(s_mutex, portMAX_DELAY);           \
+    if (s_pending.field == v) { xSemaphoreGive(s_mutex); return; } \
+    s_pending.field = v;                              \
+    xSemaphoreGive(s_mutex);                          \
+    mark_dirty(dirty_bit)
+
+#define RXA_GET_U16(field, dflt)                      \
+    if (!s_ready) return (dflt);                      \
+    xSemaphoreTake(s_mutex, portMAX_DELAY);           \
+    uint16_t v = s_pending.field;                     \
+    xSemaphoreGive(s_mutex);                          \
+    return v
+
+/* 80 -> 150 (ceiling 800 -> 1500): operator's call 2026-09-23 - "better make
+ * gain adjust pretty high than too low", not sure Sam is on headphones and
+ * the Tab5's internal speaker needs more headroom than the old ceiling gave. */
+void settings_set_rxaud_gain_d10(uint8_t v)      { RXA_SET_U8(rxaud_gain_d10,       DIRTY_RXA_GAIN,   5, 150); }
 uint8_t settings_get_rxaud_gain_d10(void)        { RXA_GET_U8(rxaud_gain_d10,       20); }
 void settings_set_rxaud_pan_width_x10(uint8_t v) { RXA_SET_U8(rxaud_pan_width_x10,  DIRTY_RXA_PWIDTH, 0, 30); }
 uint8_t settings_get_rxaud_pan_width_x10(void)   { RXA_GET_U8(rxaud_pan_width_x10,  18); }
@@ -2326,6 +2537,52 @@ void settings_set_rxaud_pan_blend_x100(uint8_t v){ RXA_SET_U8(rxaud_pan_blend_x1
 uint8_t settings_get_rxaud_pan_blend_x100(void)  { RXA_GET_U8(rxaud_pan_blend_x100, 15); }
 void settings_set_rxaud_pan_ovlp_x100(uint8_t v) { RXA_SET_U8(rxaud_pan_ovlp_x100,  DIRTY_RXA_POVLP,  0, 100); }
 uint8_t settings_get_rxaud_pan_ovlp_x100(void)   { RXA_GET_U8(rxaud_pan_ovlp_x100,  30); }
+/* Attack/release exposed in ms (the units an operator can reason about);
+ * rx_audio.c converts to its per-sample coefficient - see rx_audio_set_agc_attack_ms(). */
+void settings_set_rxaud_agc_attack_ms(uint8_t v)   { RXA_SET_U8(rxaud_agc_attack_ms,   DIRTY_RXA_ATTACK,  1, 50); }
+uint8_t settings_get_rxaud_agc_attack_ms(void)     { RXA_GET_U8(rxaud_agc_attack_ms,   3); }
+void settings_set_rxaud_agc_release_ms(uint16_t v) { RXA_SET_U16(rxaud_agc_release_ms, DIRTY_RXA_RELEASE, 10, 500); }
+uint16_t settings_get_rxaud_agc_release_ms(void)   { RXA_GET_U16(rxaud_agc_release_ms, 150); }
+
+/* Not via the RXA_* macros: those clamp a numeric range, which a bool has
+ * none of. Same mutex + dirty-bit shape as settings_set_psk_rx_en(). */
+void settings_set_rxaud_agc_off(bool v)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.rxaud_agc_off == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.rxaud_agc_off = v;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_RXA_AGCOFF);
+}
+
+bool settings_get_rxaud_agc_off(void)
+{
+    if (!s_ready) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.rxaud_agc_off;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+void settings_set_hp_mute_en(bool v)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.hp_mute_en == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.hp_mute_en = v;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_HP_MUTE);
+}
+
+bool settings_get_hp_mute_en(void)
+{
+    if (!s_ready) return true;   /* default ON before settings are up */
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.hp_mute_en;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
 
 int16_t settings_get_cw_tx_offset_hz(void)
 {
@@ -2544,6 +2801,35 @@ uint32_t settings_get_last_unix_time(void)
     uint32_t v = s_pending.last_unix_time;
     xSemaphoreGive(s_mutex);
     return v;
+}
+
+uint8_t settings_get_date_src(void)
+{
+    if (!s_ready) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t v = s_pending.date_src;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+bool settings_get_gnss_mbus_en(void)
+{
+    if (!s_ready) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = (s_pending.gnss_mbus_en != 0);
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+void settings_set_gnss_mbus_en(bool en)
+{
+    if (!s_ready) return;
+    uint8_t v = en ? 1 : 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.gnss_mbus_en == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.gnss_mbus_en = v;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_GNSS_MBUS);
 }
 
 void settings_get_wifi_creds(char ssid[33], char pass[65], bool *enabled_out)
@@ -2812,6 +3098,50 @@ void settings_wifi_known_remember(const char *ssid, const char *pass)
     if (changed) mark_dirty(DIRTY_WIFI_KNOWN);
 }
 
+// Designated-preferred WiFi network (Randy N4OPI, 2026-09-23). Empty clears
+// it, which restores today's exact strongest-remembered-network behaviour in
+// roam_to_known_if_present() - this feature is opt-in and cannot regress
+// anyone who never sets it.
+void settings_get_wifi_preferred_ssid(char out[33])
+{
+    if (!out) return;
+    out[0] = '\0';
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    snprintf(out, 33, "%s", s_wifi_pref_ssid);
+    xSemaphoreGive(s_mutex);
+}
+
+void settings_set_wifi_preferred_ssid(const char *ssid)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool changed = strcmp(s_wifi_pref_ssid, ssid ? ssid : "") != 0;
+    if (changed) snprintf(s_wifi_pref_ssid, sizeof(s_wifi_pref_ssid), "%s", ssid ? ssid : "");
+    xSemaphoreGive(s_mutex);
+    if (changed) mark_dirty(DIRTY_WIFI_PREF);
+}
+
+void settings_get_wifi_static_ssid(char out[33])
+{
+    if (!out) return;
+    out[0] = '\0';
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    snprintf(out, 33, "%s", s_wifi_static_ssid);
+    xSemaphoreGive(s_mutex);
+}
+
+void settings_set_wifi_static_ssid(const char *ssid)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool changed = strcmp(s_wifi_static_ssid, ssid ? ssid : "") != 0;
+    if (changed) snprintf(s_wifi_static_ssid, sizeof(s_wifi_static_ssid), "%s", ssid ? ssid : "");
+    xSemaphoreGive(s_mutex);
+    if (changed) mark_dirty(DIRTY_WIFI_STATIC_SSID);
+}
+
 void settings_wifi_known_set_all(const wifi_known_t *list, int n)
 {
     if (!s_ready) return;
@@ -3024,6 +3354,25 @@ void settings_set_wspr_net_en(bool v)
     s_pending.wspr_net_en = v;
     xSemaphoreGive(s_mutex);
     mark_dirty(DIRTY_WSPR_NET);
+}
+
+void settings_set_pa_ceiling_x10(uint16_t v_x10)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.pa_ceiling_x10 == v_x10) { xSemaphoreGive(s_mutex); return; }
+    s_pending.pa_ceiling_x10 = v_x10;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_PA_CEILING);
+}
+
+uint16_t settings_get_pa_ceiling_x10(void)
+{
+    if (!s_ready) return 0;   /* no ceiling - the documented default */
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint16_t v = s_pending.pa_ceiling_x10;
+    xSemaphoreGive(s_mutex);
+    return v;
 }
 
 void settings_set_wspr_tx_dbm(int8_t v)
@@ -3266,6 +3615,151 @@ void settings_get_gpio_relay(uint8_t *pin, bool *level, uint16_t *ms)
     xSemaphoreGive(s_mutex);
 }
 
+/* ---- RX input source ---------------------------------------------------
+ *
+ * ⛔ NEITHER SETTER TOUCHES HARDWARE FOR THE SOURCE ITSELF. app_main() reads
+ * it once, before USB host start, and the choice is latched for the session.
+ * settings_set_rx_source() returns true when a restart is needed to make the
+ * stored choice real, and every caller must say so on the surface it owns -
+ * see the comment on rx_source_t.
+ *
+ * The GAIN is different: it is one I2C register write on a running codec, so
+ * line_in.c applies it live and there is nothing to restart. */
+uint8_t settings_get_rx_source(void)
+{
+    /* The QMX before settings_init(), for the same reason port_a_mode answers
+     * relay: the boot branch reads this, and the radio is the only source
+     * that matches a board nobody has configured. */
+    if (!s_ready) return RX_SOURCE_QMX_USB;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t src = s_pending.rx_source;
+    xSemaphoreGive(s_mutex);
+    return rx_source_normalize(src);
+}
+
+bool settings_set_rx_source(uint8_t src)
+{
+    if (!s_ready) return false;
+    uint8_t want = rx_source_normalize(src);
+    if (want != src) {
+        /* Asked for a source this build does not implement. Say which, rather
+         * than silently storing the radio and leaving the operator to wonder
+         * why the selector sprang back. */
+        ESP_LOGW(TAG, "rx_source %s is declared but not implemented - staying on %s",
+                 rx_source_str(src), rx_source_str(want));
+    }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool changed = (s_pending.rx_source != want);
+    s_pending.rx_source = want;
+    xSemaphoreGive(s_mutex);
+    if (!changed) return false;        // already there: no restart needed
+    mark_dirty(DIRTY_RX_SOURCE);
+    ESP_LOGW(TAG, "rx_source -> %s (stored; RESTART REQUIRED to apply)",
+             rx_source_str(want));
+    return true;
+}
+
+uint8_t settings_get_line_in_gain_db(void)
+{
+    if (!s_ready) return 0;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t db = s_pending.line_in_gain_db;
+    xSemaphoreGive(s_mutex);
+    return line_in_gain_db_normalize(db);
+}
+
+void settings_set_line_in_gain_db(uint8_t db)
+{
+    if (!s_ready) return;
+    db = line_in_gain_db_normalize(db);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.line_in_gain_db == db) { xSemaphoreGive(s_mutex); return; }
+    s_pending.line_in_gain_db = db;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_LINEIN_GAIN);
+}
+
+uint8_t settings_get_port_a_mode(void)
+{
+    // RELAY is the answer before settings_init(): the boot branch and the
+    // gpio_relay refusals both read this, and "relay" is the only mode that
+    // matches hardware nobody has configured yet.
+    if (!s_ready) return PORT_A_MODE_RELAY;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t mode = s_pending.port_a_mode;
+    xSemaphoreGive(s_mutex);
+    return port_a_mode_normalize(mode);
+}
+
+/* Move the RAM copy of the mode on its own, so the sequencer can order that
+ * step precisely against the backend switch while NVS stays last. */
+static void set_mode_ram(uint8_t mode)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_pending.port_a_mode = mode;
+    xSemaphoreGive(s_mutex);
+}
+
+bool settings_set_port_a_mode(uint8_t mode)
+{
+    if (!s_ready) return false;
+    mode = port_a_mode_normalize(mode);
+
+    uint8_t cur = settings_get_port_a_mode();
+    if (mode == cur) return true;   // already there - nothing to hand over
+
+    /* 3.1: refuse rather than hand the port over mid-pulse. The pulse's
+     * release callback would fire after the switch and drive a pin the other
+     * backend now owns, and a power cycle is a multi-second sequence that
+     * cannot be interrupted safely. The refusal is logged because the operator
+     * sees only "it did not change". */
+    if (gpio_relay_busy() || gpio_relay_power_cycle_status() == GPIO_PC_RUNNING) {
+        ESP_LOGW(TAG, "port mode refused: a relay pulse or power cycle is running "
+                      "(stays %s)", port_a_mode_str(cur));
+        return false;
+    }
+
+    if (mode == PORT_A_MODE_UNIT_GPS) {
+        /* 3.2: release FIRST, then bring the UART up. Configuring UART1 onto
+         * pins an output driver is still holding would put the GPS's TX into a
+         * driven pad for the duration. */
+        if (!gpio_relay_release()) {
+            ESP_LOGE(TAG, "port mode: could not release GPIO53/54 - staying %s",
+                     port_a_mode_str(cur));
+            return false;
+        }
+        if (!unit_gps_start()) {
+            /* Roll back: no UART means no mode change at all, and the pins go
+             * back to exactly what they were - the relay's stored polarity.
+             * RAM still says relay here, so gpio_relay_init() is allowed to
+             * drive. */
+            gpio_relay_init();
+            ESP_LOGE(TAG, "port mode: Unit GPS UART failed to start - rolled back to %s",
+                     port_a_mode_str(cur));
+            return false;
+        }
+        set_mode_ram(mode);
+        ESP_LOGI(TAG, "port mode: relay -> unit_gps (pins released, UART1 up)");
+    } else {
+        /* 3.3: stop the UART, then re-drive. gpio_relay_init() refuses while
+         * the RAM mode says unit_gps - which is the guard that stops an
+         * accidental call driving pins the UART owns - so the mode is moved
+         * first and only then the pins. The init's own READ BACK log is the
+         * evidence that both pads are driven again. */
+        unit_gps_stop();
+        set_mode_ram(PORT_A_MODE_RELAY);
+        gpio_relay_init();
+        ESP_LOGI(TAG, "port mode: unit_gps -> relay (UART stopped, pins driven)");
+    }
+
+    /* NVS LAST, after the metal already matches: a reset in between leaves a
+     * board that boots into the mode the pins are actually in, which is the
+     * only consistent answer. */
+    mark_dirty(DIRTY_PORT_A_MODE);
+    settings_flush();
+    return true;
+}
+
 void settings_set_resmon_en(bool v)
 {
     if (!s_ready) return;
@@ -3354,4 +3848,30 @@ void settings_set_lotw_uploaded_n(uint32_t n)
     s_pending.lotw_uploaded_n = n;
     xSemaphoreGive(s_mutex);
     mark_dirty(DIRTY_LOTW_UPLOADED);
+}
+
+/* ── The grid the GPS last wrote (provenance for gps_autogrid.c) ────────────
+ * Written straight through rather than staged: it changes at most once per
+ * Maidenhead square the station moves into, so the debounce machinery and a
+ * dirty bit would buy nothing. It is also not part of qmx_settings_t on
+ * purpose - no caller but status.c has any business reading it. */
+void settings_get_gps_grid_auto(char *out, size_t cap)
+{
+    if (!out || cap == 0) return;
+    out[0] = ' ';
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    size_t sz = cap;
+    if (nvs_get_str(s_nvs, KEY_GPS_GRID_A, out, &sz) != ESP_OK) out[0] = ' ';
+    xSemaphoreGive(s_mutex);
+}
+
+void settings_set_gps_grid_auto(const char *grid)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (grid && grid[0]) nvs_set_str(s_nvs, KEY_GPS_GRID_A, grid);
+    else                 nvs_erase_key(s_nvs, KEY_GPS_GRID_A);
+    nvs_commit(s_nvs);
+    xSemaphoreGive(s_mutex);
 }

@@ -99,10 +99,13 @@ Insert a microSD card (a plain **FAT32 32 GB** card is ideal) into the Tab5's sl
 - **Diagnostic log** — rolling copy
 - **README.txt** — describes every file on the card
 
-The **SD** dot in the bottom status bar shows what is happening (absent = no card, which is not an error):
+The **SD** dot in the bottom status bar shows what is happening:
 
-- **Green** — mirroring continuously. This is the case with **WiFi off**, i.e. normal POTA/SOTA operating.
-- **Yellow** — your start-up backup is written and mirroring has stopped. This is the case with **WiFi on**: the card and the WiFi co-processor share a bus and can't both use it reliably, so the Tab5 takes the full backup within a few seconds of switching on and then leaves the card alone. QSOs made later in that session are written at the next start-up.
+- **Green** — writes are reaching the card (something landed in the last 90 seconds).
+- **Yellow** — a card is mounted, but nothing has been written lately. On a quiet session that can simply mean there was nothing to write; if it stays yellow while the Tab5 is busy, writes are failing — see [Troubleshooting](reference/troubleshooting.md).
+- **Grey, struck through** — no card in the slot. Not an error.
+
+With **WiFi off** (normal POTA/SOTA operating) everything is mirrored continuously. With **WiFi on** the card and the WiFi co-processor share a bus and can't both use it reliably, so the Tab5 takes the full backup within a few seconds of switching on and then only keeps the diagnostic log and CW transcript going every 30 seconds. QSOs made later in that session are written at the next start-up.
 
 > **After inserting the SD card your Tab5 needs a restart.** The card is claimed during a short window early in boot, so one pushed in while the Tab5 is running isn't used until you restart it.
 
@@ -114,7 +117,7 @@ The entire app runs on **edge swipes and taps on the top bar**:
 
 | Action | Does |
 |---|---|
-| Swipe → from **left edge** | Cycle Panadapter -> FT8/FT4 -> WSPR |
+| Swipe → from **left edge** | Cycle Panadapter -> FT8/FT4/JS8 -> WSPR |
 | Swipe ← from **right edge** | Open settings drawer |
 | Swipe ↑ from **bottom edge** | Open memory channel picker |
 | Tap any **top bar item** | Open that item's selector (Freq, Mode, BW, etc.) |
@@ -133,14 +136,24 @@ You're now receiving. The **spectrum** shows signal strength across the band, an
 - **Tap Band** to switch between your configured bands
 - **Tap Mode** to switch USB/LSB/CW/DiGi
 
-## Step 8: FT8 Mode (Optional)
+## Step 8: FT8, FT4 and JS8 (Optional)
 
-Swipe → from the left edge to switch to **FT8 view**. You'll see:
+Swipe → from the left edge to switch to the **decode view**. You'll see:
 
-- **Live decode list** — all FT8 stations heard on frequency
+- **Live decode list** — every station heard on frequency
 - **Waterfall** — same real-time spectrum waterfall
 - **Call CQ** button — transmit a CQ (requires QMX to be on the air)
 - **Reply** rows — tap a station to reply to their CQ
+
+**Three modes share this page.** Tap the **Preset** button at the top of the left
+column to pick **FT8**, **FT4** or **JS8**; the Tab5 retunes to that mode's calling
+frequency on the band you are on.
+
+**JS8** *(beta)* is the keyboard mode: it carries free text instead of FT8's fixed
+exchange, so you hold a short conversation. In JS8 the page gains a **Conversation**
+tab beside **Stations**, and a **Free text** button under Call CQ opens a box to type
+a message — it tells you how many seconds the message will hold the frequency before
+anything is transmitted. See [JS8](guide/js8.md).
 
 
 ## Step 9: WiFi & Web UI (Optional)
@@ -253,4 +266,4 @@ off and on again afterwards — the screen will tell you if so.
 
 ---
 
-**Next steps:** Read the full [User Guide](guide/panadapter.md) or dive into [FT8 Transmit](guide/ft8-tx.md).
+**Next steps:** Read the full [User Guide](guide/panadapter.md), or dive into [FT8 Transmit](guide/ft8-tx.md) or [JS8](guide/js8.md).

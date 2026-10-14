@@ -48,6 +48,21 @@ void rx_audio_preopen(void);
 void rx_audio_set_enabled(bool en);
 bool rx_audio_is_enabled(void);
 
+/* ⛔ TRUE WHEN THE SWITCH IS ON AND IS DOING NOTHING.
+ *
+ * The ES8388/I2S codec is opened once at boot, and only when the saved enable
+ * flag was already set - it has to claim its DMA RAM before the USB host takes
+ * that pool, so it cannot be opened later in the session. Turning RX audio on
+ * afterwards therefore sets the flag, logs "restart required", and produces no
+ * sound at all until the next boot.
+ *
+ * Samuel W7STF, 2026-10-02: booted with audio off, used the radio for 15
+ * minutes, turned audio on and heard nothing - "I had to reboot the Tab5 and
+ * QMX/+ for audio to work. This is not the way it's supposed to be switched
+ * on/off, is it?" The behaviour was right and the UI was silent about it,
+ * which is the part that was wrong. Ask this after enabling and say so. */
+bool rx_audio_restart_pending(void);
+
 // Output volume, 0..100 (persisted to NVS).
 void rx_audio_set_volume(uint8_t vol_0_100);
 uint8_t rx_audio_get_volume(void);
@@ -89,6 +104,16 @@ void rx_audio_set_agc_attack(float v);
 void rx_audio_set_agc_release(float v);
 void rx_audio_set_agc_gain_max(float v);
 void rx_audio_get_tuning(rx_audio_tuning_t *out);
+
+// Operator-facing units (ms) for agc_attack/agc_release above - converts via
+// tau ~= 1/(alpha*fs_dec) and calls through to the coefficient setters.
+void rx_audio_set_agc_attack_ms(uint8_t ms);    // 1..50   (default 3)
+void rx_audio_set_agc_release_ms(uint16_t ms);  // 10..500 (default 150)
+/* AGC bypass. With it set, the envelope is still tracked (the squelch needs
+ * it) but the gain is pinned at the ceiling set by rx_audio_set_agc_gain_max()
+ * - so the AGC Ceiling control becomes a manual gain. See the branch in the
+ * sample loop for why a "very slow AGC" is not the same thing. */
+void rx_audio_set_agc_off(bool off);
 
 // ---- Panoramic CW (2026-09-20) ---------------------------------------------
 // Splits the CW filter's own selected width in half AT THE TUNED PITCH and

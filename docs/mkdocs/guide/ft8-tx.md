@@ -121,6 +121,25 @@ Choose a preset (or edit/save a new one), then tap **Transmit**. The QMX starts 
 
 **CQ tone selection** — the panadapter automatically picks a quiet frequency (6.25 Hz tone spacing, 200–2800 Hz audio range, no other stations nearby). If your chosen tone gets busy during a QSO, the panadapter **auto-relocates to the nearest clear frequency** to avoid stepping on other stations.
 
+## What the TX status line is telling you
+
+The left pane carries a persistent status line under the slot countdown. The
+colour is the quickest read; the text says which station and which tone.
+
+| Colour | Line | Meaning |
+|--------|------|---------|
+| **Red** | `TRANSMITTING: <message>` | A burst is going out, with your audio tone on its own line. Tap to abort. |
+| **Amber** | `TX armed: <message>` then `nnnn Hz -> EVEN/ODD, ~Ns` | Waiting for the slot. Tap to cancel. |
+| **Red-orange** | `FREQ BUSY` | Your tone is occupied (+/-50 Hz guard), and the warning names the frequency. During a CQ run this self-heals - the next cycle hops to the nearest clear tone. Mid-exchange, move it yourself with the TX tone control. |
+| **Amber** | `working <call> - waiting` + `TAP TO CANCEL` | The station you are calling is mid-exchange with somebody else. Nothing transmits until they sign off or call CQ again. |
+| **Green** | QSO complete | |
+| **Orange** | QSO timed out | Tap to clear. |
+| **Dim white** | capturing / decoding / symbol count | The engine's own status, passed through. Nothing is armed. |
+
+!!! note "Amber means armed, not transmitting"
+    An armed burst has not keyed the radio yet. Cancelling an amber line costs
+    nothing; cancelling a red one aborts a transmission in progress.
+
 **CQ auto-stop** — by default the panadapter keeps calling until someone answers. If you'd rather call a few times and then pause (a common courtesy on a quiet band), long-press **Call CQ** and tap the **CQ stop** button at the top-right of the preset editor: it cycles through never / 1 / 2 / 3 / 4 / 5 / 10 calls and applies immediately, no Save needed. While calling, the TX status shows the progress ("call 2 of 4"); after the last unanswered call the panadapter listens through one more receive slot (an answer to your final call still starts the QSO normally), then stops and goes idle. Applies to every CQ run, including the automatic resume after a completed or timed-out QSO — each fresh CQ sequence starts the count over.
 
 **Listening slot** - while you are transmitting you are deaf to your own time window, so
@@ -324,7 +343,7 @@ Tap the status label to **abort** the current QSO (only works if ARMED or ACTIVE
 
 **Resume after timeout** — if a QSO times out because the partner faded, and they come back within ~5 minutes calling you, the exchange **resumes where it left off** automatically (or tap their row to resume manually) instead of restarting from scratch.
 
-**If they never heard your final** (v1.3.4) — a partner who does not decode your closing `73`/`RR73` keeps sending you their report, waiting for it. The Tab5 now notices: if the station just worked comes back with a report rather than `RR73`/`73`/`RRR`, the final is sent again, up to three times within four minutes, *before* anything else can start a new contact. The QSO is not logged a second time. Taking over by hand no longer produces a duplicate entry either — the same callsign on the same band inside ten minutes is recognised as the same contact.
+**If they never heard your final** (v1.3.4, extended in v1.16.8) — a partner who does not decode your closing `73`/`RR73` keeps sending you their report, waiting for it. The Tab5 notices: if a station just worked comes back with a report rather than `RR73`/`73`/`RRR`, the final is sent again, up to six times within five minutes, *before* anything else can start a new contact. This now tracks **up to four partners at once** rather than only the most recent one — finishing a QSO and immediately working the next caller in a pileup no longer drops the first station's re-sends. The QSO is not logged a second time. Taking over by hand no longer produces a duplicate entry either — the same callsign on the same band inside ten minutes is recognised as the same contact.
 
 ### 8. Power & SWR Readout
 
@@ -370,6 +389,11 @@ Your transmit tone is chosen for you by default — the nearest clear 50 Hz slot
 
 **Both time windows, always** (asked for by Roy KI0ER). The strip is **two rows — EVEN above, ODD below**, marked `E` and `O` in the same blue/orange the slot countdown uses. Two stations only collide if they transmit in the *same* window, and only you know which window you are about to pounce into — so both pictures are on screen **before** you choose, not after a transmission has fixed your window. Your white marker sits on your own window's row once one is locked (both rows until then), and your partner's pink sits in *their* window. The picker's full-size strip is split the same way, and its verdict says where your pick stands: *"Clear in EVEN — busy in ODD"*.
 
+The picker **repaints every second while it is open**, so the occupancy you are choosing
+against is the live picture rather than a snapshot taken when you tapped the button.
+If it has just told you something in words, that message stays on screen for a few
+seconds rather than being overwritten by the next repaint.
+
 In the picker:
 
 | Control | What it does |
@@ -404,6 +428,15 @@ On a crowded band several stations answer the same CQ and the caller works one o
 **You are not committed to the wait** (Roy KI0ER's report). The status line carries a **TAP TO CANCEL** line while the hold is on; tapping it drops the pounce so you are free to work somebody else. The abandoned exchange stays resumable for a few minutes, in case the station frees up and you want back in.
 
 This also protects the grey-list. Giving up on a station used to count against it, so a popular station could end up permanently skipped by the robot and Auto-work-pileup for no reason other than being busy. A wait is not a failed attempt. The wait is capped at about six minutes so a station that vanishes mid-exchange still times out normally.
+
+!!! warning "Fixed in v1.16.4 — the six-minute cap did not work"
+
+    Before v1.16.4 that cap never actually took effect: the counter reset
+    itself instead of stopping, so the Tab5 could wait **more than half an
+    hour** for a station working somebody else. Worse, each held slot cancelled
+    the call it had just queued, so it never got back to calling them either —
+    which is why it could look like the radio had simply given up and gone
+    quiet *(Gyula HA3HZ)*. Both are the same fault, and both are fixed.
 
 To tune to a different frequency while CQ is running:
 

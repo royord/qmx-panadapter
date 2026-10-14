@@ -5,6 +5,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/idf_additions.h"   // xTaskCreatePinnedToCoreWithCaps - rx_hp stack in PSRAM
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -128,6 +129,11 @@ static rxaud_mode_t mode_from_cat_str(const char *m)
 #define FIR_LEN        255       // stage-2 narrow lowpass taps (odd, linear phase) - shared by both modes
 #define FIR_DECIM_LEN  63        // stage-1 decimator taps (fixed, coarse - same as dsp.c's ZOOMFIR)
 #define RX_DECIM_D     8         // internal rate = DSP_SAMPLE_RATE_HZ / RX_DECIM_D
+// Headroom for the continuous clock-drift resampler (see rx_audio_preopen's
+// s_out allocation and the upsample loop). Sized for the resample clamp's
+// worst case, not the ~2.5 extra samples the measured 0.24% drift actually
+// needs - "generous, not incremental" after the bug this undersizing caused.
+#define RX_OUT_HEADROOM 64
 #define CW_DEF_OFFSET  700       // fallback CW offset if CAT hasn't reported one
 // Mode-default passband widths, used only when ui_get_passband_width_hz()
 // reads 0 (CAT hasn't reported one yet). Mirrors compute_passband_edges_hz()'s
@@ -195,6 +201,8 @@ static volatile float s_agc_target   = DEF_AGC_TARGET;
 static volatile float s_agc_attack   = DEF_AGC_ATTACK;
 static volatile float s_agc_release  = DEF_AGC_RELEASE;
 static volatile float s_agc_gain_max = DEF_AGC_GAIN_MAX;
+/* AGC bypass (Samuel W7STF, 2026-09-25). See rx_audio_set_agc_off(). */
+static volatile bool  s_agc_off      = false;
 
 // How many output samples hit s_out_clamp since the last read - an objective
 // answer to "how much is it actually clicking", instead of judging by ear.
@@ -292,6 +300,34 @@ static bool     s_cap_autodump  = false;   /* dump to serial when full */
 static int64_t  s_cap_first_us  = 0;       /* first audio frame, for the delay */
 static volatile bool s_cap_dumping = false;  /* a dump task is running */
 static void rxcap_auto_tick(void);   /* defined by the recorder block below */
+
+/* ---- Silence the internal speaker when headphones are plugged in ---------
+ *
+ * Roy KI0ER, 2026-09-24: "sound comes out of both headphones and speakers
+ * when the headphone jack is utilized."
+ *
+ * ⛔ THE CODEC CANNOT DO THIS, and the measurement that proves it is worth
+ * keeping. Reading the ES8388's per-output volumes on the bench gave
+ *     OUT1 vol L=0x1e R=0x1e     OUT2 vol L=0x00 R=0x00
+ * esp_codec_dev_set_out_vol() writes OUT1, and the operator's volume control
+ * demonstrably moves the SPEAKER, so the speaker is on OUT1; the headphones
+ * play at that same volume, so they are on OUT1 too. Both share LOUT1/ROUT1
+ * and no DACPOWER value can separate them - writing 0x30 reads back as 0x30
+ * and is audibly a no-op, which is exactly what happened.
+ *
+ * The speaker's POWER AMPLIFIER is the separable element, and its enable is
+ * PI4IOE1 P1 - recorded upstream only in the comment
+ * `.pa_pin = -1,  // PI4IOE1 P1 控制` inside bsp_audio_codec_speaker_init().
+ * ⚠ BSP_POWER_AMP_IO in the header is NOT it: that is GPIO_NUM_NC with
+ * "(GPIO_NUM_53)" beside it, and GPIO 53 is BSP_EXT_I2C_SDA - driving it
+ * breaks the external I2C bus.
+ *
+ * Two other traps found the hard way:
+ *   - esp_codec_dev_write_reg() ALWAYS fails for the ES8388; the driver never
+ *     assigns base.set_reg. Use ctrl_if->write_reg if a register is ever
+ *     genuinely needed.
+ *   - bsp_headphone_detect() itself works perfectly (PI4IO expander 1, bit 7). */
+static void rx_audio_headphone_task(void *arg);
 static volatile uint32_t s_cap_gap_n  = 0;
 
 static volatile uint32_t s_gap_prev_us   = 0;   /* uptime of the previous gap */
@@ -305,6 +341,10 @@ static volatile uint32_t s_gap_iv_n      = 0;
 // BOTH dsp_rxaudio_read()'s own wait and the blocking I2S write. Timing both
 // separately settles which one actually owns the missing time.
 static volatile uint32_t s_read_us_max = 0, s_write_us_max = 0;
+/* Output channel energy, reset each 10 s diag window - see the accumulator
+ * in the write loop for why this exists. */
+static uint64_t s_out_sq_l = 0, s_out_sq_r = 0;
+static uint32_t s_out_sq_n = 0;
 /* Per-10-s-window counters - see the diag line. Reset every window on purpose:
    a running maximum cannot distinguish one stall from a thousand. */
 static volatile uint32_t s_write_late_win = 0;   /* writes over 25 ms */
@@ -472,6 +512,17 @@ static float s_agc_env = 1.0f;
 #define LIM_THRESH   26000.0f
 #define LIM_RELEASE  (0.00008f * (float)RX_DECIM_D)
 static float s_lim_gain = 1.0f;
+/* Fractional-resample state for the clock-drift corrector. s_up_inc is the
+   phase advance per OUTPUT sample; 1/RX_DECIM_D is exactly no correction, and
+   the accounting below nudges it by a few parts per million to track the
+   radio. Clamped hard: this multiplies the playback rate, so a runaway value
+   would change the pitch. */
+static float s_up_phase = 0.0f;
+static float s_up_inc   = 1.0f / (float)RX_DECIM_D;
+static volatile uint32_t s_rate_railed = 0;   /* times the rate loop hit its clamp */
+static float    s_up_target    = 0.0f;   /* smoothed increment from the measured source rate */
+static uint32_t s_in_pairs_win = 0;      /* input pairs seen in the current measuring window */
+static int64_t  s_in_win_us    = 0;      /* when that window started */
 static float s_noise   = 1.0f;     // slow noise-floor estimate (for squelch)
 // Linear-interpolation upsample state, one per ear - the value each
 // channel's ramp ended on, carried forward so the next frame's ramp starts
@@ -923,6 +974,9 @@ static void rx_audio_task(void *arg)
         if (!active_prev) {
             s_agc_env = 1.0f;
             s_lim_gain = 1.0f;
+            s_up_phase = 0.0f;
+            s_up_inc   = 1.0f / (float)RX_DECIM_D;
+            s_up_target = 0.0f; s_in_pairs_win = 0; s_in_win_us = 0;
             s_noise   = 1.0f;
             s_last_up_v_l = 0.0f;
             s_last_up_v_r = 0.0f;
@@ -966,6 +1020,7 @@ static void rx_audio_task(void *arg)
         s_loop_count++;
         int64_t read_start_us = esp_timer_get_time();
         int pairs = (int)dsp_rxaudio_read(s_rxbuf, DSP_FFT_SIZE, 60);
+        const int in_pairs = pairs;   /* INPUT count - `pairs` becomes the OUTPUT count below */
         uint32_t read_us = (uint32_t)(esp_timer_get_time() - read_start_us);
         if (read_us > s_read_us_max) s_read_us_max = read_us;
         s_read_us_sum += read_us;
@@ -1165,6 +1220,7 @@ static void rx_audio_task(void *arg)
         float agc_release  = s_agc_release;
         float agc_target   = s_agc_target;
         float agc_gain_max = s_agc_gain_max;
+        bool  agc_off      = s_agc_off;
         float out_clamp    = s_out_clamp;
         bool  panoramic_now = (mode == RXAUD_MODE_CW) && s_binaural_en;
 
@@ -1184,6 +1240,12 @@ static void rx_audio_task(void *arg)
         // own pan_width (a WIDE filter should not get LESS spread than what
         // was tuned), never above 4x it (an extremely narrow filter, e.g.
         // 50 Hz, would otherwise demand an absurd multiplier).
+        /* Output write cursor. The upsampler emits RX_DECIM_D samples per
+           decimated sample normally, and one more or one fewer on the frame
+           where the clock-drift accounting asks for it - so the output length
+           is counted, not computed. */
+        int outn = 0;
+
         float eff_pan_width = s_pan_width;
         if (panoramic_now && s_half_bw_hz > 0) {
             const float PAN_WIDTH_REF_HALF_BW_HZ = 250.0f;   // half of the 500 Hz test filter
@@ -1235,8 +1297,23 @@ static void rx_audio_task(void *arg)
             s_noise += (s_agc_env - s_noise) * AGC_NOISE_TC;
             if (s_noise < 1.0f) s_noise = 1.0f;
 
-            float gain = agc_target / (s_agc_env + 1.0f);
-            if (gain > agc_gain_max) gain = agc_gain_max;
+            /* ⛔ AGC OFF IS NOT "A VERY SLOW AGC". The gain law below is
+             * target/(envelope+1) - it is driven by the envelope at every
+             * setting, so lengthening attack/release only makes it ride the
+             * signal SLOWLY, never stop riding it. An operator who asks for
+             * AGC off wants a fixed gain, so pin it at the ceiling and let
+             * the AGC Ceiling slider be the manual gain control.
+             *
+             * The envelope above is still computed on purpose: the squelch
+             * below uses s_agc_env/s_noise, and switching the AGC off must
+             * not also silently switch the squelch off. */
+            float gain;
+            if (agc_off) {
+                gain = agc_gain_max;
+            } else {
+                gain = agc_target / (s_agc_env + 1.0f);
+                if (gain > agc_gain_max) gain = agc_gain_max;
+            }
 
             float snr = s_agc_env / s_noise;
             float sq  = (snr - SQ_LO) / (SQ_HI - SQ_LO);
@@ -1334,11 +1411,112 @@ static void rx_audio_task(void *arg)
             // the documented fallback in the FIR_LEN comment above rather
             // than a new idea. s_last_up_v_l/r carry each ramp's end value
             // across frame boundaries so there is no click at i=0 either.
-            int base = i * RX_DECIM_D;
-            for (int k = 0; k < RX_DECIM_D; k++) {
-                float frac = (float)(k + 1) / (float)RX_DECIM_D;
-                float yl = s_last_up_v_l + (v_l - s_last_up_v_l) * frac;
-                float yr = s_last_up_v_r + (v_r - s_last_up_v_r) * frac;
+            /* ⭐ THE CLOCK DRIFT IS ABSORBED HERE, INSIDE THE INTERPOLATION.
+             *
+             * The first cut spliced a duplicated sample pair onto the end of the
+             * frame instead. Measured on a 700 Hz test tone, host-side:
+             *
+             *   clean reference                      113.2 dB SNDR
+             *   duplicate one sample per frame        31.3 dB
+             *   absorb it in the interpolation        43.8 dB
+             *
+             * Repeating a sample is a step discontinuity whose SIZE IS THE
+             * SIGNAL AMPLITUDE, ~47 times a second - which the operator heard
+             * immediately and described exactly: "a ripple or noise that lingers
+             * with the tone level" (2026-09-22). It was my own fix making the
+             * audio worse than the drift it corrected.
+             *
+             * ⛔ AND A PER-FRAME STEP IS NOT GOOD ENOUGH EITHER. Stretching one
+             * input sample's worth of output by a single step got rid of the
+             * spliced sample, but it still put ONE timing event in every frame -
+             * and a frame is 46.9 Hz. Measured on the bench afterwards: sidebands
+             * at +/-46.9 Hz around the tone at -27 to -32 dBc, and the operator
+             * heard what was left as "slightly better... but chirps from time to
+             * time". A once-per-frame correction has a once-per-frame spectrum,
+             * however gently it is applied.
+             *
+             * ⭐ So the drift is now spread over EVERY sample by a phase
+             * accumulator - proper fractional resampling. The interpolation runs
+             * at a rate fractionally different from 1/RX_DECIM_D, and there is no
+             * per-frame event to have a spectrum at all. Measured host-side on a
+             * 700 Hz tone, same net correction in each case:
+             *
+             *   no correction at all (v1.16.1)  SNDR 32.9 dB   46.9 Hz  -160 dBc
+             *   per-frame single step           SNDR 29.0 dB   46.9 Hz   -37 dBc
+             *   continuous fractional resample  SNDR 33.0 dB   46.9 Hz   -74 dBc
+             *
+             * i.e. it restores the UNCORRECTED purity exactly while still
+             * absorbing the clock difference. (The 33 dB floor is this linear
+             * upsampler itself and is present in every version - not a
+             * regression, and the thing to improve if anyone wants more.)
+             *
+             * s_up_phase carries the fractional position across frames, so there
+             * is no discontinuity at a frame boundary either. */
+            /* ⛔⛔ THE ACTUAL RUNAWAY BUG (found 2026-09-23, on re-reading the
+             * whole block rather than re-simulating the rate math again - the
+             * operator was right that simulation was not finding this).
+             *
+             * The buffer only had "+1" pair of headroom, sized for the OLD
+             * spliced corrector which added at most one sample. THIS
+             * resampler can need MANY more: stretching a full DSP_FFT_SIZE
+             * (1024) input frame by even the measured 0.24% needs ~2.5 EXTRA
+             * output samples, and dsp_rxaudio_read asks for a full frame
+             * essentially every call - so the `outn < DSP_FFT_SIZE` cap was
+             * being hit on ordinary frames, not just a pathological one, and
+             * NOTHING ABOUT THAT DEPENDS ON THERE BEING A SIGNAL - which is
+             * why the operator heard it grow on a completely silent band.
+             *
+             * And the old code decremented s_up_phase UNCONDITIONALLY after
+             * the while loop:
+             *
+             *     while (s_up_phase < 1.0f && outn < CAP) { ... }
+             *     s_up_phase -= 1.0f;
+             *
+             * When the loop exits because the CAP stopped it (phase still
+             * <1.0, not because phase reached 1.0), subtracting 1.0 anyway
+             * drives s_up_phase NEGATIVE. Next input sample, the while
+             * condition (phase < 1.0) is now true for many more iterations
+             * than it should be, each one computing `frac = s_up_phase` -
+             * strongly negative - which the linear interpolation
+             * (last + delta*frac) EXTRAPOLATES far outside the two real
+             * samples instead of interpolating between them. If the cap is
+             * hit again before phase claws back to normal (likely, since the
+             * buffer is still the same size), phase goes more negative still.
+             * That is a compounding, self-worsening runaway with no signal
+             * amplitude anywhere in its cause - exactly "starts faint, then
+             * increases, and increases" on a silent band, and exactly why the
+             * two earlier "fixes" to the RATE MATH (attempts #3 and #4 in the
+             * commit history) could never have touched it: this bug is in
+             * the BUFFER ACCOUNTING around the resampler, not in the rate
+             * controller feeding it.
+             *
+             * Fixed two ways, either of which alone would have stopped the
+             * compounding, but both belong here:
+             *   1. RX_OUT_HEADROOM (64 pairs) - sized for the resample
+             *      clamp's worst case (~21 samples at +/-2%), not the ~2.5
+             *      actually needed today, so ordinary operation never
+             *      touches the cap at all.
+             *   2. The phase decrement is now conditional on the loop having
+             *      exited NORMALLY (phase actually reached >=1.0). If the cap
+             *      stops it instead, phase is left exactly as it was and the
+             *      remaining decimated samples for this call are silently
+             *      skipped (a few microseconds of audio, not a corruption) -
+             *      the next call resumes cleanly from a valid phase.
+             *
+             * This is also why "measure, don't simulate the part you already
+             * modelled" only gets you so far: the rate-drift simulations were
+             * accurate FOR THE RATE MATH. They could not have found a buffer
+             * size bug because the model never allocated a buffer. */
+            {
+                float dl = v_l - s_last_up_v_l;
+                float dr = v_r - s_last_up_v_r;
+                bool up_phase_completed = false;
+                while (s_up_phase < 1.0f && outn < DSP_FFT_SIZE + RX_OUT_HEADROOM) {
+                float frac = s_up_phase;
+                s_up_phase += s_up_inc;
+                if (s_up_phase >= 1.0f) up_phase_completed = true;
+                float yl = s_last_up_v_l + dl * frac;
+                float yr = s_last_up_v_r + dr * frac;
                 // Post-upsample smoothing (see SMOOTH_FC_HZ comment above) -
                 // knocks down the interpolation image further, effectively
                 // free next to the FIR stages. A Butterworth has no passband
@@ -1359,17 +1537,34 @@ static void rx_audio_task(void *arg)
                 if (ysl < -out_clamp) ysl = -out_clamp;
                 if (ysr >  out_clamp) ysr =  out_clamp;
                 if (ysr < -out_clamp) ysr = -out_clamp;
-                s_out[2 * (base + k)]     = (int16_t)ysl;   // L
-                s_out[2 * (base + k) + 1] = (int16_t)ysr;   // R
+                s_out[2 * outn]     = (int16_t)ysl;   // L
+                s_out[2 * outn + 1] = (int16_t)ysr;   // R
+                outn++;
+                }
+                /* Only carry the fraction when the loop finished NORMALLY -
+                   see the note above the loop. If the cap stopped it instead,
+                   s_up_phase is already < 1.0 and must be left untouched, or
+                   it goes negative and the next sample extrapolates instead
+                   of interpolating. */
+                if (up_phase_completed) s_up_phase -= 1.0f;
             }
             s_last_up_v_l = v_l;
             s_last_up_v_r = v_r;
         }
-        // Any tail beyond n_out*RX_DECIM_D (the un-consumed remainder from
-        // the floor-divide above) gets silence rather than stale/garbage data.
-        for (int i = n_out * RX_DECIM_D; i < pairs; i++) {
+        // Any tail beyond what the upsampler actually wrote gets silence
+        // rather than stale/garbage data. outn, not n_out*RX_DECIM_D: the
+        // continuous resampler makes the written length vary by the whole
+        // RX_OUT_HEADROOM range now (see the upsample loop), not by one - a
+        // no-op here when outn >= pairs, which stretching makes the common
+        // case.
+        for (int i = outn; i < pairs; i++) {
             s_out[2 * i] = 0; s_out[2 * i + 1] = 0;
         }
+        if (outn > 0) pairs = outn;   /* play exactly what was produced, which
+                                          may now be MORE than the input count -
+                                          rxcap_push/esp_codec_dev_write both
+                                          take pairs as a parameter, not a
+                                          fixed size, so this is safe. */
 
         // DSP-only time (NCO x2 + FIR x2 + AGC) - excludes the intentionally
         // real-time-paced I2S write below on purpose, so this answers "is the
@@ -1419,19 +1614,104 @@ static void rx_audio_task(void *arg)
             int64_t elapsed  = now_rm - s_rate_t0_us;
             int64_t expected = elapsed * DSP_SAMPLE_RATE_HZ / 1000000;
             int64_t written  = s_rate_written + pairs;
-            if (expected - written >= 1 && pairs < DSP_FFT_SIZE + 1) {
-                /* Behind the clock: repeat the last pair once. */
-                s_out[2 * pairs]     = s_out[2 * (pairs - 1)];
-                s_out[2 * pairs + 1] = s_out[2 * (pairs - 1) + 1];
-                pairs++;
-                s_rate_ins++;
-            } else if (written - expected >= 1 && pairs > 1) {
-                /* Ahead of the clock: drop the last pair. */
-                pairs--;
-                s_rate_drop++;
+            /* Nudge the RESAMPLE RATE, not the sample count. err is already an
+               integral of the rate mismatch, so a proportional step here is
+               integral control on the rate - it settles on the radio's true
+               rate and then stops moving, which is what removes the per-frame
+               event entirely. The gain is deliberately tiny: the whole
+               correction needed is 0.24%, and a loop that hunts would be
+               audible as exactly the chirp being removed. */
+            /* ⛔ THE SIGN HERE IS THE WHOLE LOOP, AND I HAD IT BACKWARDS ONCE.
+             *
+             * s_up_inc is the phase advance per OUTPUT sample, so the number of
+             * outputs produced per input is ~1/s_up_inc. Being BEHIND the clock
+             * (err > 0) means we owe more output, which needs a SMALLER
+             * increment. Adding err instead of subtracting it is positive
+             * feedback: behind -> fewer samples -> further behind, until the
+             * clamp. The operator heard it as crackling that grew steadily
+             * louder until he switched the radio off (2026-09-22). A rate loop
+             * with the sign inverted has no safe gain - the clamp is the only
+             * thing that stops it, and by then it is changing the pitch.
+             *
+             * Integral control on the rate: err is already the accumulated
+             * sample deficit, so stepping the rate by it drives err to zero and
+             * then holds, which is what leaves no periodic event behind. */
+            /* ⛔⛔ NO FEEDBACK LOOP HERE. THE RATE IS COMPUTED, NOT SERVOED.
+             *
+             * Two attempts at a loop both failed on the bench, and the second
+             * one is why the operator had to switch his radio off:
+             *
+             *  1. `s_up_inc += err` - the SIGN was inverted. s_up_inc is the
+             *     phase advance per OUTPUT sample, so outputs per input is
+             *     ~1/s_up_inc: being behind needs a SMALLER increment, not a
+             *     larger one. Simulated afterwards, err diverged to 32,298
+             *     pairs and hit the clamp 5,642 times. Heard as crackling that
+             *     grew steadily louder.
+             *  2. `s_up_inc -= err` with the sign fixed converges, but a pure
+             *     integrator against a transport delay RINGS - simulated, it
+             *     hunted around the answer instead of settling.
+             *
+             * ⭐ There is nothing to servo. The required rate is known exactly:
+             * the radio delivers in_pairs per frame, each input sample yields
+             * 1/s_up_inc outputs, and the codec needs DSP_SAMPLE_RATE_HZ of
+             * them per second. So
+             *
+             *     s_up_inc = source_pairs_per_second / (RX_DECIM_D * FS)
+             *
+             * measured over a smoothed window. Simulated: settles on -0.2396%
+             * for a 47,885 pairs/s radio - the exact figure needed - with a
+             * residual error of 2.4 pairs and the clamp never touched, and it
+             * follows a mid-session rate change without ringing.
+             *
+             * The tiny err term is a trim, not the controller: it nulls the
+             * slow residue from rounding, and it CANNOT run away because
+             * s_up_inc is recomputed from the measurement every frame rather
+             * than accumulated. */
+            const float inc_nom = 1.0f / (float)RX_DECIM_D;
+            int64_t err = expected - written;            /* + = we are behind */
+            if (err >  2000) err =  2000;
+            if (err < -2000) err = -2000;
+
+            s_in_pairs_win += (uint32_t)in_pairs;
+            int64_t win_us = now_rm - s_in_win_us;
+            if (s_in_win_us == 0) { s_in_win_us = now_rm; s_in_pairs_win = 0; }
+            else if (win_us >= 1000000) {                /* 1 s of measurement */
+                float src_rate = (float)s_in_pairs_win * 1000000.0f / (float)win_us;
+                float target   = src_rate / ((float)RX_DECIM_D * (float)DSP_SAMPLE_RATE_HZ);
+                s_up_target = (s_up_target <= 0.0f) ? target
+                                                    : s_up_target + (target - s_up_target) * 0.25f;
+                s_in_win_us = now_rm; s_in_pairs_win = 0;
             }
+            if (s_up_target > 0.0f) s_up_inc = s_up_target - (float)err * 2.0e-10f;
+
+            /* ±2% is far more than any real unit needs (0.24% here) and is the
+               only thing between a wrong measurement and a pitch change, so it
+               says so when it is reached instead of sitting at the rail. */
+            if (s_up_inc > inc_nom * 1.02f || s_up_inc < inc_nom * 0.98f) {
+                s_up_inc = (s_up_inc > inc_nom) ? inc_nom * 1.02f : inc_nom * 0.98f;
+                if ((s_rate_railed++ % 200) == 0)
+                    ESP_LOGW(TAG, "resample rate hit the rail (err=%lld) - audio "
+                                  "may be off pitch", (long long)err);
+            }
+            if (err > 0) s_rate_ins++; else if (err < 0) s_rate_drop++;
             s_rate_written += pairs;
         }
+
+        /* ⛔ OUTPUT CHANNEL LEVELS - the one thing nothing else measures.
+         *
+         * audio.c's "peak L= R=" is the USB INPUT from the QMX, and rxcap is
+         * MONO by construction (s_cap), so when the operator reported "only
+         * the right ear" there was no instrument anywhere that could say
+         * whether the firmware was actually feeding both channels. Arguing
+         * about headphone plugs instead of measuring is exactly the wrong
+         * move. Sum of squares per channel, reported with the 10 s diag line
+         * below; two multiply-accumulates per sample. */
+        for (int i = 0; i < pairs; i++) {
+            int32_t l = s_out[2 * i], r = s_out[2 * i + 1];
+            s_out_sq_l += (uint64_t)(l * l);
+            s_out_sq_r += (uint64_t)(r * r);
+        }
+        s_out_sq_n += (uint32_t)pairs;
 
         rxcap_push(s_out, pairs);   /* record exactly what is played */
         rxcap_auto_tick();          /* self-arm / self-dump, no host needed */
@@ -1489,6 +1769,20 @@ static void rx_audio_task(void *arg)
                          (unsigned long)(gn ? s_gap_iv_min_ms : 0),
                          (unsigned long)(gn ? s_gap_iv_sum_ms / gn : 0),
                          (unsigned long)s_gap_iv_max_ms, (unsigned long)gn);
+                /* What actually reached the codec, per channel. Balanced
+                 * numbers mean any one-sided audio is downstream of us - jack,
+                 * cable or headphones - and lopsided numbers mean it is ours.
+                 * Nothing else in the system can tell those two apart. */
+                if (s_out_sq_n) {
+                    uint32_t rl = (uint32_t)sqrt((double)s_out_sq_l / s_out_sq_n);
+                    uint32_t rr = (uint32_t)sqrt((double)s_out_sq_r / s_out_sq_n);
+                    ESP_LOGI(TAG, "diag: OUT level L=%lu R=%lu rms (n=%lu)%s",
+                             (unsigned long)rl, (unsigned long)rr,
+                             (unsigned long)s_out_sq_n,
+                             (rl > 4 * (rr + 1) || rr > 4 * (rl + 1))
+                                 ? "  <-- CHANNELS LOPSIDED" : "");
+                }
+                s_out_sq_l = s_out_sq_r = 0; s_out_sq_n = 0;
                 s_write_late_win = 0;
                 s_frames_win     = 0;
                 s_pairs_win      = 0;
@@ -1514,6 +1808,9 @@ void rx_audio_apply_settings(void)
     rx_audio_set_pan_width   ((float)settings_get_rxaud_pan_width_x10()  / 10.0f);
     rx_audio_set_pan_blend   ((float)settings_get_rxaud_pan_blend_x100() / 100.0f);
     rx_audio_set_pan_overlap ((float)settings_get_rxaud_pan_ovlp_x100()  / 100.0f);
+    rx_audio_set_agc_attack_ms (settings_get_rxaud_agc_attack_ms());
+    rx_audio_set_agc_release_ms(settings_get_rxaud_agc_release_ms());
+    rx_audio_set_agc_off       (settings_get_rxaud_agc_off());
 }
 
 void rx_audio_init(void)
@@ -1543,9 +1840,17 @@ void rx_audio_init(void)
     s_filt_im   = heap_caps_malloc(DSP_FFT_SIZE * sizeof(float),      MALLOC_CAP_SPIRAM);
     s_narrow_re = heap_caps_malloc(DSP_FFT_SIZE * sizeof(float),      MALLOC_CAP_SPIRAM);
     s_narrow_im = heap_caps_malloc(DSP_FFT_SIZE * sizeof(float),      MALLOC_CAP_SPIRAM);
-    // +1 pair of headroom: the clock-drift corrector below may append one
-    // duplicated sample pair to a full frame. See the rate-match block.
-    s_out       = heap_caps_malloc((DSP_FFT_SIZE + 1) * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    // RX_OUT_HEADROOM pairs of headroom - NOT the "+1" the old spliced
+    // corrector needed. The continuous resampler can produce MORE than
+    // DSP_FFT_SIZE output samples from a full DSP_FFT_SIZE-pair input frame
+    // whenever it is stretching (source slower than the codec), and a full
+    // frame is common (dsp_rxaudio_read asks for up to DSP_FFT_SIZE every
+    // time). At the resample clamp's worst case (+/-2%, see s_up_inc below)
+    // a 1024-pair frame needs up to ~21 EXTRA samples - the "+1" allocated
+    // for the old scheme silently truncated that, which is the actual cause
+    // of the runway/growing-crackle bug (2026-09-23): see the note by
+    // RX_OUT_HEADROOM's use in the upsample loop for the mechanism.
+    s_out       = heap_caps_malloc((DSP_FFT_SIZE + RX_OUT_HEADROOM) * 2 * sizeof(int16_t), MALLOC_CAP_SPIRAM);
     s_dec_coeff    = heap_caps_malloc(FIR_DECIM_LEN * sizeof(float),  MALLOC_CAP_SPIRAM);
     s_dec_delay_re = heap_caps_malloc(FIR_DECIM_LEN * sizeof(float),  MALLOC_CAP_SPIRAM);
     s_dec_delay_im = heap_caps_malloc(FIR_DECIM_LEN * sizeof(float),  MALLOC_CAP_SPIRAM);
@@ -1611,6 +1916,48 @@ void rx_audio_init(void)
     // measured recovering to 42 KB by ~17.5 s on this same boot sequence.
     BaseType_t created = xTaskCreatePinnedToCore(rx_audio_task, "rx_audio", 4096, NULL,
                              RX_AUDIO_TASK_PRIORITY, &s_task, 1);
+
+    /* The headphone-jack follower, on its OWN task - see the block comment at
+     * rx_audio_headphone_task() for the measurement that moved it off the
+     * audio thread. Priority 1: below rx_audio (3) and everything else that
+     * matters, because a jack is not urgent and this one blocks on I2C.
+     * Core 0, so it cannot even compete with rx_audio's core. 3072 B covers
+     * the two BSP calls and their I2C driver frames. Not fatal if it fails -
+     * the speaker amp simply keeps whatever state the BSP left it in. */
+    /* ⛔ STACK IN PSRAM, and the reason is a crash on the v1.16.5 bench.
+     *
+     * This task was added in 24c04fa with a default (INTERNAL) 3072-byte stack.
+     * Internal RAM on this board runs at a median of 13-21 KB free with
+     * `min=0KB` on essentially every build since v1.16.0, and 400 s into an
+     * idle panadapter session `sd_archive` aborted in newlib's
+     * lock_init_generic() - the documented "any task's first lock-needing call
+     * while internal heap is near zero" failure, already seen with diag_persist
+     * and spots, and the reason apply_newlib_lock_init_retry.ps1 exists. It
+     * retried and still could not get a lock.
+     *
+     * The shortage predates this task and the medians do not show v1.16.5 out
+     * of family (17 KB vs 18-19 KB on v1.16.4) - but 3 KB taken from a pool
+     * whose minimum is zero is not nothing, and it was mine to give back.
+     *
+     * ✅ Safe here, and checked rather than assumed: rx_hp is NOT on the
+     * psram-stack exclusion list (audio_task, fft_task, render_task, cat's
+     * link/poll tasks, ws_push_task - all excluded for measured latency). It
+     * wakes at 4 Hz, does two I2C transactions and sleeps. It has no latency
+     * requirement and touches no DMA buffer. It also never exits, so there is
+     * no vTaskDeleteWithCaps site to get wrong. */
+/* ⚠ Stack raised 2026-10-10. Measured headroom was 1212 B of 3072 (60% used)
+ * via /api/cmd {"action":"stacks"}. ⛔ That watermark only reports paths
+ * ALREADY TAKEN, and a jack insert/removal path that may not
+ * have been exercised in that session is exactly what it misses.
+ * This stack is in PSRAM, where 12.6 MB was free, so the margin costs
+ * nothing from the internal or DMA pools - see the same lesson paid for
+ * twice on the two web stacks in webserver.h. */
+    BaseType_t hp = xTaskCreatePinnedToCoreWithCaps(rx_audio_headphone_task, "rx_hp",
+                                                    6144, NULL, 1, NULL, 0,
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (hp != pdPASS)
+        ESP_LOGW(TAG, "headphone follower task not created - speaker/jack "
+                      "switching is inactive this session");
     for (int attempt = 1; created != pdPASS && attempt <= 5; attempt++) {
         ESP_LOGW(TAG, "rx_audio task create failed (%d/5) - retrying in 2 s", attempt);
         vTaskDelay(pdMS_TO_TICKS(2000));
@@ -1674,70 +2021,36 @@ static void preopen_task(void *arg)
     vTaskDelete(NULL);
 }
 
-// ---- Headphone routing -----------------------------------------------------
-// The Tab5 jack has a mechanical insert-detect input (PI4IOE1 P7,
-// bsp_headphone_detect) and the internal speaker amplifier enable is on the
-// same expander (PI4IOE1 P1, bsp_set_speaker_enable). The M5Stack BSP ships
-// both but nothing in main/ used them: the amp stayed ON from boot forever, so
-// the I/Q test tone (and every other audio path) played through the built-in
-// speaker even with headphones seated in the jack. This tiny poller follows the
-// hardware's intent - speaker amp OFF while a plug is in (the jack is fed
-// directly by the ES8388, so audio continues in the headphones), back ON when
-// the jack empties - for ALL audio, not just the siggen tone.
-//
-// Detect-pin polarity: MEASURED on the bench 2026-10-08 (operator's plug/unplug
-// A/B). The jack's detect line reads HIGH while a plug is seated
-// (HP_JACK_ACTIVE_LOW = 0). The first build assumed the usual pull-up +
-// switch-to-GND convention (low = seated); the bench showed the exact inversion
-// - plugged drove the amp ON, unplugged held it OFF. The raw bit is still
-// logged on the first pass so any future board change is visible in one boot.
-#define HP_POLL_MS        200
-#define HP_JACK_ACTIVE_LOW 0
-
-static bool hp_jack_seated(void)
-{
-    bool det = bsp_headphone_detect();   // true = P7 held high
-    return HP_JACK_ACTIVE_LOW ? !det : det;
-}
-
-static void hp_route_task(void *arg)
-{
-    bool first = true;
-    bool prev  = false;
-    for (;;) {
-        bool seated = hp_jack_seated();
-        if (first || seated != prev) {
-            prev = seated;
-            bsp_set_speaker_enable(!seated);   // internal speaker amp
-            if (first) {
-                first = false;
-                ESP_LOGI(TAG, "hp route: jack %s at boot (det=%d), speaker amp %s, stack hiwater %u B",
-                         seated ? "seated" : "empty", (int)bsp_headphone_detect(),
-                         seated ? "off" : "on",
-                         (unsigned)(uxTaskGetStackHighWaterMark(NULL) * sizeof(StackType_t)));
-            } else {
-                ESP_LOGI(TAG, "hp route: jack %s, speaker amp %s",
-                         seated ? "seated" : "empty", seated ? "off" : "on");
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(HP_POLL_MS));
-    }
-}
-
 void rx_audio_preopen(void)
 {
-    // Headphone routing only drives the PI4IOE1 amp/detect lines - it does not
-    // need the codec open below, so start it first and let it survive any
-    // preopen failure. Idempotent: this is a boot-time call in main.c.
-    static bool hp_started = false;
-    if (!hp_started) {
-        if (xTaskCreatePinnedToCore(hp_route_task, "hp_route", 3072, NULL,
-                                    tskIDLE_PRIORITY + 2, NULL, 1) != pdPASS) {
-            ESP_LOGW(TAG, "hp route task create failed - speaker amp stays in boot state");
-        } else {
-            hp_started = true;
-        }
-    }
+    // ⛔ NO headphone-routing poller starts here any more.
+    //
+    // This branch (kx3) grew its own "hp_route" task for the same job main
+    // already had in rx_audio_headphone_task() below: read the jack detect on
+    // PI4IOE1 P7, drive the speaker amp on P1. Two pollers fighting over one
+    // amplifier is not a merge conflict to be resolved - only ONE may survive,
+    // and main's is the one kept, for four reasons kx3's did not have:
+    //   - 4 Hz with a 3-reading debounce (kx3: 5 Hz, single-sample), so one
+    //     bad I2C read cannot mute the speaker - the exact defect that gave
+    //     Steve N9SZ "no audio from the Tab5" on v1.16.4.
+    //   - An operator off-switch (settings_get_hp_mute_en) that forces the amp
+    //     ON and gets out of the way; two people lost audio to this feature and
+    //     it is not allowed to be the only thing between a user and their sound.
+    //   - PSRAM-backed stack via xTaskCreatePinnedToCoreWithCaps, where the
+    //     margin is free (kx3 took 3072 B of INTERNAL RAM, the pool whose
+    //     measured minimum is zero).
+    //   - Measured rationale for all of it (see the task's comment block).
+    // kx3's contribution that is KEPT is its measured polarity: the detect line
+    // reads HIGH while a plug is seated (kx3's HP_JACK_ACTIVE_LOW 0), verified
+    // on the bench 2026-10-08 by plug/unplug A/B after the first build guessed
+    // the pull-up convention and came out exactly inverted. main's task already
+    // reads `plugged = bsp_headphone_detect()` (raw high = plugged), so the two
+    // agree and no inversion is needed here.
+    //
+    // main's task is created in rx_audio_init(), which runs unconditionally at
+    // boot - so routing no longer depends on rx_audio_preopen() succeeding, and
+    // it no longer starts before the codec open (which it never needed; it only
+    // drives the two PI4IOE1 lines).
 
     TaskHandle_t self = xTaskGetCurrentTaskHandle();
     if (xTaskCreatePinnedToCore(preopen_task, "rxaud_pre", RXAUD_PREOPEN_STACK,
@@ -1886,6 +2199,9 @@ void rx_audio_set_enabled(bool en)
 
 bool rx_audio_is_enabled(void) { return s_enabled; }
 
+/* On, but the codec was never opened for this session - see rx_audio.h. */
+bool rx_audio_restart_pending(void) { return s_enabled && !s_codec_ready; }
+
 // ---- I/Q test-tone generator (sig_gen.c) ------------------------------------
 // The OFF path has no preconditions anywhere - the whole point of this feature
 // was a HARD off switch, and a switch that can decline to switch off is not
@@ -1931,6 +2247,27 @@ void rx_audio_set_agc_target(float v)   { if (v > 0.0f) s_agc_target   = v; }
 void rx_audio_set_agc_attack(float v)   { if (v > 0.0f && v <= 1.0f) s_agc_attack  = v; }
 void rx_audio_set_agc_release(float v)  { if (v > 0.0f && v <= 1.0f) s_agc_release = v; }
 void rx_audio_set_agc_gain_max(float v) { if (v > 0.0f) s_agc_gain_max = v; }
+void rx_audio_set_agc_off(bool off)     { s_agc_off = off; }
+
+/* Operator-facing units (ms) for the two coefficients above - same tau ~=
+ * 1/(alpha*fs_dec) relationship DEF_AGC_ATTACK/DEF_AGC_RELEASE derive from,
+ * fs_dec = DSP_SAMPLE_RATE_HZ/RX_DECIM_D (6 kHz today). Exposed as ms in the
+ * Resource Management modal because that is the unit an operator can reason
+ * about tuning against CW keying/SSB syllables; the bare coefficient is not. */
+void rx_audio_set_agc_attack_ms(uint8_t ms)
+{
+    if (ms == 0) return;
+    float fs_dec = (float)DSP_SAMPLE_RATE_HZ / (float)RX_DECIM_D;
+    float alpha = 1000.0f / ((float)ms * fs_dec);
+    rx_audio_set_agc_attack(alpha > 1.0f ? 1.0f : alpha);
+}
+void rx_audio_set_agc_release_ms(uint16_t ms)
+{
+    if (ms == 0) return;
+    float fs_dec = (float)DSP_SAMPLE_RATE_HZ / (float)RX_DECIM_D;
+    float alpha = 1000.0f / ((float)ms * fs_dec);
+    rx_audio_set_agc_release(alpha > 1.0f ? 1.0f : alpha);
+}
 
 void rx_audio_get_tuning(rx_audio_tuning_t *out)
 {
@@ -2100,6 +2437,112 @@ static void rxcap_dump_task(void *arg)
 /* Called once per audio frame. Arms the one-shot capture RXCAP_AUTO_DELAY_MS
  * after audio first flows, and dumps it when it fills - both without any
  * host involvement, which is the whole point (see the note above). */
+/* Poll the jack and gate the speaker amp. Called from the audio write loop
+ * because that is the one place guaranteed to run whenever there is sound to
+ * route - no extra task, no extra timer.
+ *
+ * Rate-limited to 1 Hz: both the detect and the amp control are I2C
+ * transactions to the PI4IO expander on a bus shared with the touch
+ * controller and the battery monitor, and this loop runs every ~21 ms. A jack
+ * is not moved faster than that. Writes only on a CHANGE, so a settled jack
+ * costs one I2C read per second and nothing else. */
+/* Poll period and how many agreeing reads it takes to believe a change.
+ * 4 Hz x 3 = a real jack movement is acted on in ~0.75 s, FASTER than the 1 Hz
+ * single-shot this replaces, while a lone bad read changes nothing. */
+#define HP_POLL_US      250000
+#define HP_DEBOUNCE_N   3
+
+/* ⛔⛔ THIS MUST NOT RUN ON THE AUDIO THREAD, AND IT USED TO.
+ *
+ * It was called once per frame from rx_audio_task's write loop, rate-limited
+ * internally. That looked free. It is not: bsp_headphone_detect() is an I2C
+ * transaction to the PI4IO expander on a bus shared with the touch controller
+ * and the battery monitor, and the frame-tail window that contains it measures
+ * up to ~82 ms.
+ *
+ * At the original 1 Hz that cost ~82 ms/s and was survivable. When I added the
+ * debounce I raised the poll to 4 Hz to reject a single bad read - roughly
+ * 320 ms of blocking per second, inside a real-time loop with a ~21 ms budget.
+ *
+ * Measured on bench dev, 2026-09-25, same board, same BLE state, decoder idle:
+ *
+ *     6f0d341 (1 Hz, on the audio thread)  OUT 47944-48074  frame max  35 ms
+ *     22bfb27 (4 Hz, on the audio thread)  OUT 37800-40555  frame max 603 ms
+ *
+ * ~20% of the output rate, the input ring overflowing, and the drift corrector
+ * pinned at its rail ("resample rate hit the rail"). The operator heard it
+ * immediately. I had "verified" the debounce by ear and by log without once
+ * measuring what it cost the loop it lived in.
+ *
+ * ⭐ The lesson is not "poll slower". A blocking bus transaction has no business
+ * on the audio thread at ANY rate - 1 Hz was already spending 82 ms of a
+ * real-time budget. It now runs on its own low-priority task, where it can
+ * debounce as fast as it likes and block whoever it wants. */
+static void rx_audio_headphone_task(void *arg)
+{
+    (void)arg;
+    int s_last  = -1;   /* acted-on state; -1 forces the first decision */
+    int s_cand  = -1;   /* what the last few reads have been saying */
+    int s_cand_n = 0;   /* how many in a row have said it */
+
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(HP_POLL_US / 1000));
+
+        /* ⭐ THE OPERATOR CAN TURN THIS OFF. Two people lost audio to this
+         * feature after v1.16.4 and I could not reproduce either on the bench,
+         * so it does not get to be the only thing between a user and their
+         * sound. Off = leave the amplifier alone and force it ON once, so
+         * disabling the setting is itself the recovery. Re-read every pass, so
+         * the switch takes effect without a restart. */
+        if (!settings_get_hp_mute_en()) {
+            if (s_last != -2) { s_last = -2; s_cand = -1; s_cand_n = 0;
+                                bsp_set_speaker_amp_enable(true);
+                                ESP_LOGI(TAG, "headphone auto-mute is OFF - speaker forced on"); }
+            continue;
+        }
+        if (s_last == -2) s_last = -1;   /* re-enabled: decide afresh */
+
+    int plugged = bsp_headphone_detect() ? 1 : 0;
+
+    /* ⛔ ONE BAD READ USED TO BE ENOUGH TO SWITCH THE SPEAKER.
+     *
+     * Measured on bench dev, 2026-09-25, with headphones plugged in the whole
+     * time and nothing touching the jack:
+     *     5463.8 s  headphones out - internal speaker on
+     *     5464.8 s  headphones IN  - internal speaker OFF
+     * One poll read the wrong value and the next corrected it. The detect is a
+     * single I2C read of the PI4IO expander's input register on a bus shared
+     * with the touch controller and the battery monitor, and it is not
+     * filtered anywhere - so that glitch went straight to the amplifier.
+     *
+     * In that direction it is a one-second burst from the speaker while
+     * someone is on headphones. In the other direction - a spurious "IN" on an
+     * EMPTY jack - it mutes the speaker of someone who is not wearing
+     * headphones at all. Steve N9SZ reported exactly "no audio from the Tab5"
+     * on v1.16.4, the release that started calling this every second.
+     *
+     * ⚠ THIS IS NOT A PROVEN EXPLANATION OF HIS FAULT. A single glitch
+     * self-corrects on the next poll, so it gives a ~1 s dropout, not
+     * permanent silence; his would need a reading that is persistently wrong.
+     * This fix removes a real defect that the bench measured. It does not
+     * close his report, and the fix must not be announced as though it does.
+     *
+     * Deliberately NOT a running average or a hysteresis timer: the operator
+     * moves a jack at human speed and the only thing worth rejecting is a
+     * sample that disagrees with its neighbours. */
+    if (plugged != s_cand)             { s_cand = plugged; s_cand_n = 1; }
+    else if (s_cand_n < HP_DEBOUNCE_N) { s_cand_n++; }
+
+    if (s_cand_n < HP_DEBOUNCE_N) continue;   /* not convinced yet */
+    if (plugged == s_last) continue;          /* convinced, nothing changed */
+    s_last = plugged;
+
+    bsp_set_speaker_amp_enable(!plugged);
+    ESP_LOGI(TAG, "headphones %s - internal speaker %s",
+             plugged ? "IN" : "out", plugged ? "OFF" : "on");
+    }
+}
+
 static void rxcap_auto_tick(void)
 {
 #if RXCAP_AUTO_SECONDS > 0

@@ -5,6 +5,12 @@
 #include "ui.h"
 #include "settings.h"
 #include "audio/rx_audio.h"
+#include "audio/line_in.h"      // line_in_running/_set_gain_db/_peak_dbfs
+#include "esp_attr.h"           // RTC_NOINIT_ATTR - the reopen one-shot
+#include "esp_system.h"         // esp_restart
+#include "display/display.h"   // go dark before the restart
+#include "util/psram_task.h"    // the restart delay must leave the LVGL task
+#include "storage/settings.h"   // rx_source_t and the line-in gain rules
 #include "lvgl.h"
 #include "esp_log.h"
 #include <string.h>
@@ -13,6 +19,7 @@ static const char *TAG = "resmgmt_modal";
 
 static lv_obj_t *s_modal = NULL;
 static lv_obj_t *s_panel = NULL;
+static lv_obj_t *s_scroll = NULL;   // scrolling content strip - see modal_build()
 
 // Row 0 is RX audio - never gated, always the one doing the gating. Rows
 // 1..N are the background feeds it CAN hold off - but only the ones with a
@@ -53,8 +60,15 @@ static lv_obj_t *s_gate_note = NULL;
 
 /* Panel width, and the separator that has to match it. Was a bare 760 in two
  * places; the separator silently kept the old width when the panel grew. */
-#define PANEL_W      1000
+/* 1000 -> 1100 (2026-09-23): the scroll strip's scrollbar runs down the right
+ * edge and was touching the row check boxes, which align to that same edge.
+ * The extra width plus SCROLL_PAD_R below gives the bar its own lane. The
+ * screen is 1280, so a 1100-wide panel still centres with 90 px either side. */
+#define PANEL_W      1100
 #define PANEL_PAD    24
+/* Right inset inside the scrolling strip, reserved for the scrollbar so no
+ * right-aligned child (the check boxes) ever sits under it. */
+#define SCROLL_PAD_R 20
 
 /* Gain sits on the RX Audio line and follows that checkbox; the three pan
  * sliders sit under Binaural CW and follow THAT one, because they shape the
@@ -69,6 +83,59 @@ static lv_obj_t *s_lbl_width_val = NULL;
 static lv_obj_t *s_lbl_blend_val = NULL;
 static lv_obj_t *s_lbl_ovlp_val  = NULL;
 static lv_obj_t *s_pan_hdr       = NULL;   // "Panoramic split" caption
+
+// AGC attack/release, ms - sit on their own line directly under Gain,
+// gated the same way (live whenever RX audio is on).
+static lv_obj_t *s_sld_attack     = NULL;
+static lv_obj_t *s_sld_release    = NULL;
+static lv_obj_t *s_lbl_attack_val = NULL;
+static lv_obj_t *s_lbl_release_val = NULL;
+
+/* RX output volume, 0..100. Moved here 2026-09-23 (operator): it was only in
+ * the settings drawer, one screen away from the AGC controls it interacts
+ * with, and "it is confusing to have it two places" - the level you hear is
+ * decided by the ceiling AND this together, so they belong on one page. */
+static lv_obj_t *s_sld_vol     = NULL;
+static lv_obj_t *s_lbl_vol_val = NULL;
+
+/* ---- AGC presets (Samuel W7STF, 2026-09-25) ------------------------------
+ *
+ * "it would be nice if we had a FAST, MED, SLOW, OFF 'AGC' preset buttons.
+ * Perhaps CUSTOM could be the one attached to the sliders? SLOW and MED would
+ * be good for SSB. For CW maybe FAST. For faint signals, or per other personal
+ * preferences: OFF."
+ *
+ * CUSTOM is deliberately NOT a button: it is the state you are already in when
+ * the sliders do not match any preset, so making it clickable would raise the
+ * question of what it applies. It is shown as a caption instead, which is what
+ * he asked for - the sliders are the custom setting.
+ *
+ * ⚠ OFF is not a slider pair. See the branch in rx_audio.c's sample loop: the
+ * gain law is envelope-driven at every setting, so the slowest AGC still rides
+ * the signal. OFF needs the separate bypass flag, which is why it is a
+ * settings key and not two numbers here. */
+typedef struct {
+    const char *cap;
+    uint8_t     attack_ms;   /* ignored when off */
+    uint16_t    release_ms;  /* ignored when off */
+    bool        off;
+} agc_preset_t;
+
+static const agc_preset_t AGC_PRESETS[] = {
+    /* FAST: CW, where a fast-rising signal must not be let through loud.  */
+    { "Fast",  1,  30, false },
+    /* MED: the shipped default since these controls existed.              */
+    { "Med",   3, 150, false },
+    /* SLOW: SSB, where a fast release pumps on speech pauses.             */
+    { "Slow",  5, 400, false },
+    /* OFF: fixed gain at the ceiling - for faint signals, his words.      */
+    { "Off",   0,   0, true  },
+};
+#define AGC_PRESET_N ((int)(sizeof(AGC_PRESETS) / sizeof(AGC_PRESETS[0])))
+
+static lv_obj_t *s_cb_hp_mute = NULL;   /* speaker auto-mute on headphone insert */
+static lv_obj_t *s_btn_preset[AGC_PRESET_N];
+static lv_obj_t *s_lbl_preset_state = NULL;
 
 // Plain checkbox, themed square indicator, generous touch target - same
 // idiom as ft8_filter_modal.c's make_checkbox(), copied rather than shared
@@ -176,11 +243,31 @@ static void refresh_gating(void)
             lv_obj_set_style_opa((s), _o, LV_PART_KNOB);                        \
         } while (0)
 
-    /* Gain is live whenever audio is - it sets the level in every supported
-     * mode, not just CW. */
+    /* Gain (AGC ceiling) and the AGC timing pair are live whenever audio is -
+     * they shape the level/response in every supported mode, not just CW. */
     SLD_SET_ENABLED(s_sld_gain, audio_on);
     if (s_lbl_gain_val)
         lv_obj_set_style_text_opa(s_lbl_gain_val, audio_on ? LV_OPA_COVER : LV_OPA_50, 0);
+    SLD_SET_ENABLED(s_sld_vol, audio_on);
+    SLD_SET_ENABLED(s_sld_attack, audio_on);
+    SLD_SET_ENABLED(s_sld_release, audio_on);
+    if (s_lbl_vol_val)
+        lv_obj_set_style_text_opa(s_lbl_vol_val, audio_on ? LV_OPA_COVER : LV_OPA_50, 0);
+    if (s_lbl_attack_val)
+        lv_obj_set_style_text_opa(s_lbl_attack_val, audio_on ? LV_OPA_COVER : LV_OPA_50, 0);
+    if (s_lbl_release_val)
+        lv_obj_set_style_text_opa(s_lbl_release_val, audio_on ? LV_OPA_COVER : LV_OPA_50, 0);
+    /* The preset buttons follow RX Audio for the same reason the sliders do -
+     * they set the same three values. Plain opacity + DISABLED: unlike the
+     * sliders these have no INDICATOR/KNOB parts to chase. */
+    for (int i = 0; i < AGC_PRESET_N; i++) {
+        if (!s_btn_preset[i]) continue;
+        if (audio_on) lv_obj_clear_state(s_btn_preset[i], LV_STATE_DISABLED);
+        else          lv_obj_add_state(s_btn_preset[i], LV_STATE_DISABLED);
+        lv_obj_set_style_opa(s_btn_preset[i], audio_on ? LV_OPA_COVER : LV_OPA_40, LV_PART_MAIN);
+    }
+    if (s_lbl_preset_state)
+        lv_obj_set_style_text_opa(s_lbl_preset_state, audio_on ? LV_OPA_COVER : LV_OPA_50, 0);
 
     /* The pan sliders need audio AND binaural: they shape a split that is not
      * being produced otherwise, so leaving them live would offer three controls
@@ -200,6 +287,20 @@ static void audio_cb(lv_event_t *e)
     bool on = lv_obj_has_state((lv_obj_t *)lv_event_get_target(e), LV_STATE_CHECKED);
     rx_audio_set_enabled(on);
     ESP_LOGI(TAG, "RX audio %s from resource panel", on ? "enabled" : "disabled");
+    /* ⛔ SAY IT WHEN THE SWITCH CANNOT DO ANYTHING YET. The codec is opened at
+     * boot or not at all (rx_audio.h), so switching audio on mid-session is
+     * silently inert - Samuel W7STF spent fifteen minutes and a reboot finding
+     * that out. The firmware knew the whole time and only told the log. */
+    /* ⛔ A DIALOG, NOT A TOAST. The operator has to DO something about this -
+     * restart the Tab5 - and a toast leaves after 12 s whether it was read or
+     * not. Samuel W7STF lost fifteen minutes to exactly that. */
+    if (on && rx_audio_restart_pending())
+        ui_notice("Restart needed",
+                  "RX audio is switched on, but it will not play until the Tab5 "
+                  "is restarted. The audio hardware can only be started at boot, "
+                  "before USB and WiFi claim the memory it needs.\n\n"
+                  "Your QMX will need a power cycle after that restart, as it "
+                  "does after any Tab5 restart.");
     refresh_gating();
 }
 
@@ -263,6 +364,121 @@ static void gain_cb(lv_event_t *e)
     if (s_lbl_gain_val) lv_label_set_text_fmt(s_lbl_gain_val, "%d", v * 10);
 }
 
+/* rx_audio_set_volume() persists to settings itself, so unlike the sliders
+ * below there is no separate settings_set_* call here - adding one would just
+ * write the same key twice. */
+/* ⛔ AN ESCAPE HATCH, NOT A PREFERENCE. Two operators lost all audio to the
+ * headphone auto-mute after v1.16.4 and neither could be reproduced here, so
+ * there has to be a way to switch it off from the device itself - a user with
+ * no sound cannot be asked to edit a config file. Applies immediately. */
+static void hp_mute_cb(lv_event_t *e)
+{
+    bool on = lv_obj_has_state((lv_obj_t *)lv_event_get_target(e), LV_STATE_CHECKED);
+    settings_set_hp_mute_en(on);
+    ESP_LOGI(TAG, "headphone auto-mute: %s", on ? "ON" : "OFF (speaker always on)");
+}
+
+static void rx_vol_cb(lv_event_t *e)
+{
+    int v = lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));
+    rx_audio_set_volume((uint8_t)v);
+    if (s_lbl_vol_val) lv_label_set_text_fmt(s_lbl_vol_val, "%d", v);
+}
+
+/* Which preset, if any, the current settings correspond to. -1 = Custom.
+ *
+ * Derived from the SETTINGS every time rather than remembered in a variable:
+ * the sliders, the web API and a restored config can all move these values
+ * without going through a preset button, and a remembered index would then be
+ * a lie. Same rule as the CW strip re-deriving its own visibility every tick. */
+static int agc_preset_current(void)
+{
+    if (settings_get_rxaud_agc_off()) {
+        for (int i = 0; i < AGC_PRESET_N; i++) if (AGC_PRESETS[i].off) return i;
+        return -1;
+    }
+    uint8_t  a = settings_get_rxaud_agc_attack_ms();
+    uint16_t r = settings_get_rxaud_agc_release_ms();
+    for (int i = 0; i < AGC_PRESET_N; i++) {
+        if (AGC_PRESETS[i].off) continue;
+        if (AGC_PRESETS[i].attack_ms == a && AGC_PRESETS[i].release_ms == r) return i;
+    }
+    return -1;
+}
+
+/* Paint the button row and the caption to match the settings. Called after a
+ * preset press AND after any attack/release slider move, so dragging a slider
+ * drops the highlight and the caption reads "Custom" immediately. */
+static void agc_preset_refresh(void)
+{
+    int cur = agc_preset_current();
+    for (int i = 0; i < AGC_PRESET_N; i++) {
+        if (!s_btn_preset[i]) continue;
+        if (i == cur) lv_obj_add_state(s_btn_preset[i], LV_STATE_CHECKED);
+        else          lv_obj_clear_state(s_btn_preset[i], LV_STATE_CHECKED);
+    }
+    if (s_lbl_preset_state) {
+        if (cur < 0)
+            lv_label_set_text(s_lbl_preset_state, "Custom");
+        else if (AGC_PRESETS[cur].off)
+            lv_label_set_text(s_lbl_preset_state, "Off - AGC Ceiling is a manual gain");
+        else
+            lv_label_set_text(s_lbl_preset_state, "");
+    }
+}
+
+/* Apply a preset: settings, the live audio path, and the two sliders that show
+ * it. The sliders are moved with LV_ANIM_OFF and their labels written directly
+ * - lv_slider_set_value() does NOT raise LV_EVENT_VALUE_CHANGED, so their own
+ * callbacks do not run and each value would otherwise be written once here and
+ * displayed from stale text. */
+static void agc_preset_apply(int i)
+{
+    if (i < 0 || i >= AGC_PRESET_N) return;
+    const agc_preset_t *p = &AGC_PRESETS[i];
+
+    settings_set_rxaud_agc_off(p->off);
+    rx_audio_set_agc_off(p->off);
+
+    if (!p->off) {
+        settings_set_rxaud_agc_attack_ms(p->attack_ms);
+        rx_audio_set_agc_attack_ms(p->attack_ms);
+        settings_set_rxaud_agc_release_ms(p->release_ms);
+        rx_audio_set_agc_release_ms(p->release_ms);
+
+        if (s_sld_attack)  lv_slider_set_value(s_sld_attack,  p->attack_ms,  LV_ANIM_OFF);
+        if (s_lbl_attack_val)  lv_label_set_text_fmt(s_lbl_attack_val,  "%d ms", (int)p->attack_ms);
+        if (s_sld_release) lv_slider_set_value(s_sld_release, p->release_ms, LV_ANIM_OFF);
+        if (s_lbl_release_val) lv_label_set_text_fmt(s_lbl_release_val, "%d ms", (int)p->release_ms);
+    }
+    ESP_LOGI(TAG, "AGC preset '%s' (attack %u ms, release %u ms, off=%d)",
+             p->cap, (unsigned)p->attack_ms, (unsigned)p->release_ms, (int)p->off);
+    agc_preset_refresh();
+}
+
+static void agc_preset_cb(lv_event_t *e)
+{
+    agc_preset_apply((int)(intptr_t)lv_event_get_user_data(e));
+}
+
+static void agc_attack_cb(lv_event_t *e)
+{
+    int v = lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));
+    settings_set_rxaud_agc_attack_ms((uint8_t)v);
+    rx_audio_set_agc_attack_ms((uint8_t)v);
+    if (s_lbl_attack_val) lv_label_set_text_fmt(s_lbl_attack_val, "%d ms", v);
+    agc_preset_refresh();   /* the operator has just made it Custom */
+}
+
+static void agc_release_cb(lv_event_t *e)
+{
+    int v = lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));
+    settings_set_rxaud_agc_release_ms((uint16_t)v);
+    rx_audio_set_agc_release_ms((uint16_t)v);
+    if (s_lbl_release_val) lv_label_set_text_fmt(s_lbl_release_val, "%d ms", v);
+    agc_preset_refresh();   /* the operator has just made it Custom */
+}
+
 static void pan_width_cb(lv_event_t *e)
 {
     int v = lv_slider_get_value((lv_obj_t *)lv_event_get_target(e));
@@ -317,10 +533,394 @@ static const row_def_t ROW_DEFS[ROW_COUNT] = {
     { ROW_PSKTX,   "PSK Reporter - report my decodes",    psktx_cb },
 };
 
-static void close_btn_cb(lv_event_t *e)
+/* ===================== AUDIO INPUT SOURCE =============================
+ *
+ * Placed at the TOP of this window, above everything else, because it decides
+ * whether the rest of the window applies at all: on the 3.5 mm jack there is
+ * no RX audio output and no CAT, so half the controls below are moot.
+ *
+ * (-) THE SELECTOR DOES NOT SWITCH ANYTHING LIVE. The source is latched at
+ * boot - the USB host and the I2S channel layout are both one-shot in
+ * app_main(), and tearing the USB host down mid-session is the operation that
+ * wedges the QMX (#74). So the dropdown records a choice and the note under
+ * it says a restart is needed. A control that looked like it had switched the
+ * input and had not would be worse than no control.
+ *
+ * (!) TWO ENTRIES ARE SHOWN BUT CANNOT BE CHOSEN. Generic IQ and the internal
+ * microphones are declared in rx_source_t and have no code behind them. They
+ * are listed rather than hidden so the window says what the hardware can and
+ * cannot do; picking one snaps back and says why. Hiding them would make the
+ * same question get asked again.
+ */
+static lv_obj_t *s_dd_source     = NULL;
+static lv_obj_t *s_lbl_src_note  = NULL;
+static lv_obj_t *s_sld_lin_gain  = NULL;
+static lv_obj_t *s_lbl_lin_gain  = NULL;
+static lv_obj_t *s_bar_lin_level = NULL;
+static lv_obj_t *s_lbl_lin_level = NULL;
+static lv_timer_t *s_level_timer = NULL;
+
+/* Dropdown order IS rx_source_t's numbering, so no mapping table can drift
+ * out of step with the enum. */
+static const char *SRC_OPTIONS =
+    "QMX / QMX+  (USB)\n"
+    "Generic IQ  (not yet)\n"
+    "Line in  -  3.5 mm jack\n"
+    "Internal mics  (not yet)";
+
+static void src_note_set(const char *txt, uint32_t colour)
+{
+    if (!s_lbl_src_note) return;
+    lv_label_set_text(s_lbl_src_note, txt);
+    lv_obj_set_style_text_color(s_lbl_src_note, lv_color_hex(colour), 0);
+}
+
+/* The OPEN option list is a separate object with its own style, so setting a
+ * font on the dropdown alone leaves the list at the LVGL default - which is
+ * what made this unreadable. Same treatment the drawer's dropdowns get
+ * (ui.c's drawer_dropdown_cmap_open_cb): montserrat_28, and the height cap
+ * lifted so four options show at once instead of scrolling. */
+static void source_list_open_cb(lv_event_t *e)
+{
+    lv_obj_t *list = lv_dropdown_get_list(lv_event_get_target(e));
+    if (!list) return;
+    lv_obj_set_style_text_font(list, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_max_height(list, LV_COORD_MAX, 0);
+    lv_obj_set_height(list, LV_SIZE_CONTENT);
+}
+
+/* ⛔ THE DROPDOWN STORES NOTHING. It holds a PENDING choice that Save
+ * commits and Cancel throws away.
+ *
+ * That is the whole reason this window gained Save/Cancel in place of Close:
+ * changing the source has to be followed by a restart, so an immediate store
+ * left the board in a state where the window said one thing and the hardware
+ * was doing another until the operator happened to reboot. Save now does the
+ * restart itself.
+ *
+ * ⚠ SAVE AND CANCEL GOVERN THE SOURCE ONLY. Every other control in this
+ * window - the feed check boxes, the volume and AGC sliders, the line-in
+ * gain - is live and already stored the moment it is touched, exactly as
+ * before. Making all of them transactional would be a much larger change to
+ * controls whose whole point is that you hear the effect while you drag
+ * them. The note by the buttons says so, rather than leaving it to be
+ * discovered by pressing Cancel and finding the volume did not go back. */
+static uint8_t s_src_pending;
+
+static void source_cb(lv_event_t *e)
+{
+    lv_obj_t *dd = lv_event_get_target(e);
+    uint8_t want = (uint8_t)lv_dropdown_get_selected(dd);
+
+    if (!rx_source_implemented(want)) {
+        /* Put the control back rather than letting Save commit a source that
+         * would boot into nothing. */
+        lv_dropdown_set_selected(dd, s_src_pending);
+        src_note_set(LV_SYMBOL_WARNING " That source is not implemented yet - "
+                     "it is listed so you can see the hardware supports it.",
+                     0xFFA040);
+        return;
+    }
+
+    s_src_pending = want;
+    if (want != settings_get_rx_source()) {
+        src_note_set(LV_SYMBOL_WARNING " Press Save to change the input. The "
+                     "Tab5 restarts, because the source is chosen at boot.",
+                     0xFFA040);
+    } else {
+        src_note_set("Chosen once at boot. The jack and the radio cannot both "
+                     "be live - the USB host and the audio input need the "
+                     "same memory.", UI_COLOR_TEXT_SECONDARY);
+    }
+}
+
+static void lin_gain_cb(lv_event_t *e)
+{
+    int v = lv_slider_get_value(lv_event_get_target(e));
+    uint8_t db = line_in_gain_db_normalize((uint8_t)v);
+    settings_set_line_in_gain_db(db);
+    /* Live, unlike the source: one I2C register write on a running codec.
+     * No-op when the jack is not the running source. */
+    if (line_in_running()) line_in_set_gain_db(db);
+    if (s_lbl_lin_gain) lv_label_set_text_fmt(s_lbl_lin_gain, "%u dB", (unsigned)db);
+}
+
+/* The level meter. THIS is how the gain actually gets set - the right value
+ * depends entirely on what the operator has plugged in, and no default can
+ * know that. Peak over the last ~100 ms, straight from line_in.c.
+ *
+ * Only runs while the window is open: a 10 Hz timer walking LVGL objects
+ * behind a hidden modal is exactly the kind of idle cost this panel exists
+ * to control. */
+static void level_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (!s_bar_lin_level || !line_in_running()) return;
+    if (!s_modal || lv_obj_has_flag(s_modal, LV_OBJ_FLAG_HIDDEN)) return;
+
+    float db = line_in_peak_dbfs();
+    int shown = (int)(db < -60.0f ? -60.0f : db);
+    lv_bar_set_value(s_bar_lin_level, shown, LV_ANIM_OFF);
+
+    /* ⭐ CLIP BEATS THE NUMBER. Past full scale the samples stop growing, so
+     * the peak reading parks at 0 dBFS and looks like a strong clean signal
+     * while the waveform is being flattened. Say CLIP instead of the figure,
+     * because the figure is the thing that misleads. */
+    const bool clipping = line_in_clip_count() > 0;
+    if (clipping) lv_label_set_text(s_lbl_lin_level, "CLIP - turn it down");
+    else          lv_label_set_text_fmt(s_lbl_lin_level, "%d dBFS", shown);
+
+    /* Red while clipping or within 3 dB of it, amber with little headroom
+     * left, green otherwise - the same three-band rule the mic test build
+     * used, because that is the one Tony has already read off a screen. */
+    uint32_t col = (clipping || db > -3.0f) ? 0xE05050
+                 : (db > -12.0f            ? 0xE0C040 : 0x40C040);
+    lv_obj_set_style_bg_color(s_bar_lin_level, lv_color_hex(col), LV_PART_INDICATOR);
+    lv_obj_set_style_text_color(s_lbl_lin_level,
+        lv_color_hex(clipping ? 0xE05050 : UI_COLOR_TEXT), 0);
+}
+
+/* Builds the source block at the top of the scrolling strip and advances y. */
+static void build_source_block(int *py)
+{
+    const int ROW_H = 46;
+    const int SLD_X = 210, SLD_W = 700, SLD_VAL_X = 930;
+    int y = *py;
+
+    lv_obj_t *cap = lv_label_create(s_scroll);
+    lv_label_set_text(cap, "Audio source");
+    lv_obj_set_style_text_color(cap, lv_color_hex(UI_COLOR_TEXT), 0);
+    lv_obj_set_style_text_font(cap, &lv_font_montserrat_24, 0);
+    lv_obj_align(cap, LV_ALIGN_TOP_LEFT, 0, y + 12);
+
+    s_dd_source = lv_dropdown_create(s_scroll);
+    lv_dropdown_set_options_static(s_dd_source, SRC_OPTIONS);
+    /* 50 px tall and montserrat_28 - the same shape every dropdown in the
+     * drawer uses (ui.c's PORT.A and sleep pickers). The first version set
+     * no font at all and inherited LVGL's default, which the operator could
+     * not read on a 1280x720 panel at arm's length. */
+    lv_obj_set_size(s_dd_source, SLD_W, 50);
+    lv_obj_align(s_dd_source, LV_ALIGN_TOP_LEFT, SLD_X, y);
+    lv_obj_set_style_text_font(s_dd_source, &lv_font_montserrat_28, 0);
+    s_src_pending = settings_get_rx_source();
+    lv_dropdown_set_selected(s_dd_source, s_src_pending);
+    lv_obj_add_event_cb(s_dd_source, source_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_dd_source, source_list_open_cb, LV_EVENT_CLICKED, NULL);
+    y += 50 + 10;
+
+    s_lbl_src_note = lv_label_create(s_scroll);
+    lv_obj_set_style_text_font(s_lbl_src_note, &lv_font_montserrat_20, 0);
+    lv_label_set_long_mode(s_lbl_src_note, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_lbl_src_note, SLD_X + SLD_W);
+    lv_obj_align(s_lbl_src_note, LV_ALIGN_TOP_LEFT, 0, y);
+    src_note_set("Chosen once at boot. The jack and the radio cannot both be "
+                 "live - the USB host and the audio input need the same memory.",
+                 UI_COLOR_TEXT_SECONDARY);
+    y += ROW_H;
+
+    /* ⭐ WHICH CONTACTS. Tony A (tony1tf), GitHub #17, with the plug in his
+     * hand: "a 4way 3.5mm plug with Mic on the nearest ring". The ring
+     * nearest the body is ring 2, so signal is ring 2 and screen is the
+     * sleeve. M5Stack publish no Tab5 schematic and their own Module Audio
+     * page states the CTIA/OMTP convention in a way that contradicts the
+     * usual definition, so the standard's NAME is deliberately not printed -
+     * the physical contact is what somebody wiring a lead needs.
+     *
+     * The 3-pole warning follows from the same fact and is the failure
+     * people will actually hit: an ordinary TRS plug puts its sleeve across
+     * the socket's ring 2 and sleeve, so the input is shorted to ground and
+     * the meter simply never moves. Without this line that reads as a dead
+     * feature. */
+    lv_obj_t *wire = lv_label_create(s_scroll);
+    lv_obj_set_style_text_font(wire, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(wire, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
+    lv_label_set_long_mode(wire, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(wire, SLD_X + SLD_W);
+    lv_obj_align(wire, LV_ALIGN_TOP_LEFT, 0, y);
+    lv_label_set_text(wire,
+        "Jack wiring: 4-pole (TRRS) plug only. Signal on the ring nearest the "
+        "plug body, screen on the sleeve. A 3-pole plug shorts the input to "
+        "ground and reads nothing.");
+    y += ROW_H + 10;
+
+    /* Gain and meter only exist for the jack. Built always (so the layout
+     * does not jump when the source changes) but disabled unless the jack is
+     * the RUNNING source - the stored setting is not what the codec is
+     * using until the restart has happened. */
+    const bool jack_live = line_in_running();
+    const uint8_t g0 = settings_get_line_in_gain_db();
+
+    lv_obj_t *gcap = lv_label_create(s_scroll);
+    lv_label_set_text(gcap, "Line-in gain");
+    lv_obj_set_style_text_color(gcap, lv_color_hex(UI_COLOR_TEXT), 0);
+    lv_obj_set_style_text_font(gcap, &lv_font_montserrat_24, 0);
+    lv_obj_align(gcap, LV_ALIGN_TOP_LEFT, 0, y);
+
+    s_sld_lin_gain = lv_slider_create(s_scroll);
+    lv_obj_set_size(s_sld_lin_gain, SLD_W, 14);
+    lv_obj_align(s_sld_lin_gain, LV_ALIGN_TOP_LEFT, SLD_X, y + 10);
+    lv_slider_set_range(s_sld_lin_gain, 0, LINE_IN_GAIN_DB_MAX);
+    lv_slider_set_value(s_sld_lin_gain, g0, LV_ANIM_OFF);
+    lv_obj_add_event_cb(s_sld_lin_gain, lin_gain_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    s_lbl_lin_gain = lv_label_create(s_scroll);
+    lv_label_set_text_fmt(s_lbl_lin_gain, "%u dB", (unsigned)g0);
+    lv_obj_set_style_text_color(s_lbl_lin_gain, lv_color_hex(UI_COLOR_TEXT), 0);
+    lv_obj_set_style_text_font(s_lbl_lin_gain, &lv_font_montserrat_20, 0);
+    lv_obj_align(s_lbl_lin_gain, LV_ALIGN_TOP_LEFT, SLD_VAL_X, y + 4);
+    y += ROW_H;
+
+    lv_obj_t *lcap = lv_label_create(s_scroll);
+    lv_label_set_text(lcap, "Input level");
+    lv_obj_set_style_text_color(lcap, lv_color_hex(UI_COLOR_TEXT), 0);
+    lv_obj_set_style_text_font(lcap, &lv_font_montserrat_24, 0);
+    lv_obj_align(lcap, LV_ALIGN_TOP_LEFT, 0, y);
+
+    s_bar_lin_level = lv_bar_create(s_scroll);
+    lv_obj_set_size(s_bar_lin_level, SLD_W, 14);
+    lv_obj_align(s_bar_lin_level, LV_ALIGN_TOP_LEFT, SLD_X, y + 10);
+    lv_bar_set_range(s_bar_lin_level, -60, 0);
+    lv_bar_set_value(s_bar_lin_level, -60, LV_ANIM_OFF);
+
+    s_lbl_lin_level = lv_label_create(s_scroll);
+    lv_label_set_text(s_lbl_lin_level, jack_live ? "--" : "jack not active");
+    lv_obj_set_style_text_color(s_lbl_lin_level, lv_color_hex(UI_COLOR_TEXT), 0);
+    lv_obj_set_style_text_font(s_lbl_lin_level, &lv_font_montserrat_20, 0);
+    lv_obj_align(s_lbl_lin_level, LV_ALIGN_TOP_LEFT, SLD_VAL_X, y + 4);
+    y += ROW_H;
+
+    /* The meter is not decoration - it is the control. No default gain can
+     * know what the operator has plugged in, so say what to aim for rather
+     * than leaving a bar graph to be interpreted. */
+    lv_obj_t *hint = lv_label_create(s_scroll);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(hint, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(hint, SLD_X + SLD_W);
+    lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 0, y);
+    lv_label_set_text(hint,
+        "Live peak, updated 10x a second. Raise the gain until speech or "
+        "noise peaks sit around -12 dB (amber), and back off if it says CLIP.");
+    y += ROW_H;
+
+    if (!jack_live) {
+        lv_obj_add_state(s_sld_lin_gain, LV_STATE_DISABLED);
+        lv_obj_set_style_text_color(gcap, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
+        lv_obj_set_style_text_color(lcap, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
+    } else if (!s_level_timer) {
+        /* 100 ms matches line_in.c's publish interval - polling faster would
+         * redraw the same number. */
+        s_level_timer = lv_timer_create(level_timer_cb, 100, NULL);
+    }
+
+    /* A separator so the source block reads as its own thing rather than as
+     * the first two feed rows. */
+    lv_obj_t *sep = lv_obj_create(s_scroll);
+    lv_obj_set_size(sep, PANEL_W - 2 * PANEL_PAD - 2 * 2 - SCROLL_PAD_R, 2);
+    lv_obj_align(sep, LV_ALIGN_TOP_LEFT, 0, y);
+    lv_obj_set_style_bg_color(sep, lv_color_hex(UI_COLOR_BORDER), 0);
+    lv_obj_set_style_border_width(sep, 0, 0);
+    lv_obj_clear_flag(sep, LV_OBJ_FLAG_SCROLLABLE);
+    y += 20;
+
+    *py = y;
+}
+
+/* ⛔ ONE-SHOT: REOPEN THIS WINDOW AFTER THE RESTART.
+ *
+ * Changing to the jack means a restart, and the first thing the operator
+ * needs afterwards is the level meter - which lives in this window. Making
+ * them find it again, on a board that has just rebooted and lost its radio,
+ * is the kind of small friction that makes a feature feel broken.
+ *
+ * RTC_NOINIT rather than NVS, the same pattern as factory_reset.c and
+ * mic_probe.c: RTC RAM survives esp_restart() but NOT a power cycle, which
+ * is exactly the lifetime wanted. An NVS flag would reopen this window days
+ * later after an unrelated power-on, and would cost a flash write.
+ *
+ * ⛔ The magic word is what makes a request real - a cold boot leaves
+ * garbage here - and it is CONSUMED BEFORE the window opens, so a crash in
+ * the open path cannot turn this into a reboot loop. */
+RTC_NOINIT_ATTR static uint32_t s_reopen_magic;
+#define REOPEN_MAGIC 0x7210A5D1u
+
+bool resource_mgmt_modal_reopen_pending(void)
+{
+    if (s_reopen_magic != REOPEN_MAGIC) return false;
+    s_reopen_magic = 0;            /* consume FIRST - see above */
+    return true;
+}
+
+/* Restart, having already stored everything. Mirrors ota_modal.c: go dark
+ * first, or the panel stays lit from this run and shows an empty screen for
+ * the 2-3 s before display_init() turns it off. */
+static void save_restart_task(void *arg)
+{
+    (void)arg;
+    /* Just long enough for LVGL to paint the window closing, so the
+     * last frame is not a half-dismissed dialog. Was 1200 ms when a
+     * toast had to be read; there is no toast now. */
+    vTaskDelay(pdMS_TO_TICKS(250));
+    display_set_brightness(0);
+    vTaskDelay(pdMS_TO_TICKS(80));
+    esp_restart();
+}
+
+static void cancel_btn_cb(lv_event_t *e)
 {
     (void)e;
+    /* Put the dropdown back to what the board is actually set to. Nothing
+     * else is reverted, because nothing else was pending - see source_cb. */
+    s_src_pending = settings_get_rx_source();
+    if (s_dd_source) lv_dropdown_set_selected(s_dd_source, s_src_pending);
+    src_note_set("Chosen once at boot. The jack and the radio cannot both be "
+                 "live - the USB host and the audio input need the same "
+                 "memory.", UI_COLOR_TEXT_SECONDARY);
     if (s_modal) lv_obj_add_flag(s_modal, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void save_btn_cb(lv_event_t *e)
+{
+    (void)e;
+
+    /* No source change: Save is just Close. Rebooting on every Save would
+     * make the window unusable for the volume and AGC controls that share
+     * it. */
+    if (s_src_pending == settings_get_rx_source()) {
+        if (s_modal) lv_obj_add_flag(s_modal, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    const bool to_real = rx_source_is_real(s_src_pending);
+    settings_set_rx_source(s_src_pending);
+    /* ⛔ FLUSH BEFORE RESTARTING. The dirty-bit writer is debounced, so a
+     * restart a few hundred ms later would come back on the OLD source and
+     * read as "Save did nothing". */
+    settings_flush();
+
+    /* Only when moving TO a source whose level has to be set - his call,
+     * 2026-10-10: going back to the QMX just restarts. There is nothing to
+     * set up on the radio, so reopening this window there would be one more
+     * thing to dismiss. */
+    if (to_real) s_reopen_magic = REOPEN_MAGIC;
+
+    ESP_LOGW(TAG, "SAVE: rx_source -> %s, restarting now (reopen=%d)",
+             rx_source_str(s_src_pending), (int)to_real);
+
+    /* ⛔ NO TOAST HERE, DELIBERATELY (his call, 2026-10-10 - the first
+     * version had one). The operator pressed Save on a dialog that says it
+     * restarts, so the reboot is already announced by the button they just
+     * used; a toast that appears for one second and then vanishes into a
+     * reboot is unreadable and says nothing new. The usual "announce a
+     * reboot so it is not mistaken for a crash" rule is satisfied by the
+     * press itself. The log line above is the durable record. */
+
+    if (s_modal) lv_obj_add_flag(s_modal, LV_OBJ_FLAG_HIDDEN);
+
+    /* Off the LVGL task: this sleeps, and sleeping on the LVGL task freezes
+     * the toast it was posted to show. */
+    psram_task_create(save_restart_task, "src_restart", 3072, NULL, 3,
+                      tskNO_AFFINITY);
 }
 
 static void modal_build(void)
@@ -340,20 +940,18 @@ static void modal_build(void)
     lv_obj_add_flag(s_modal, LV_OBJ_FLAG_HIDDEN);
 
     s_panel = lv_obj_create(s_modal);
-    // 700: 8 rows + the row-0 separator now end at content-y=548 (was 496
-    // for 7 rows before Binaural CW was added, 2026-09-20 - +52 for the new
-    // row); +164 margin (which the 660 figure already proved is enough for
-    // the Close button + padding) would be 712, but the screen itself is
-    // only 720 tall and centering that leaves just 4 px top/bottom - too
-    // tight to trust without a screenshot. Capped at 700 instead (still 152
-    // px of margin below the content, more than the button needs) pending
-    // an on-hardware screenshot check, same discipline as the ORIGINAL
-    // sizing bug here (a panel sized "just enough" put the Close button on
-    // top of the rows - measured wrong from arithmetic before, verify with
-    // a screenshot, don't just trust the numbers again).
+    // 700: the screen itself is only 720 tall and centering anything taller
+    // leaves too little top/bottom margin to trust without a screenshot.
+    // Content (8 rows + pan trio + AGC attack/release, 2026-09-23) no longer
+    // fits inside a fixed 700 without doing fragile per-row pixel arithmetic
+    // every time a row is added - see the growth history this comment used
+    // to track (492->548->today). Fixed that CLASS of bug instead of the
+    // instance: the row content below now lives in s_scroll, a genuinely
+    // scrollable strip between the header and the Close button, so a future
+    // addition here cannot silently collide with the button or the screen
+    // edge - it just scrolls. Close stays pinned outside the scroll area.
     /* 760 -> 1000 wide: the three pan sliders sit side by side under Binaural
-     * and need room to be draggable rather than fiddly. Height unchanged - the
-     * slider strip replaces the space the reordered rows freed. */
+     * and need room to be draggable rather than fiddly. */
     lv_obj_set_size(s_panel, PANEL_W, 700);
     lv_obj_align(s_panel, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(s_panel, lv_color_hex(0x1c2128), 0);
@@ -365,7 +963,13 @@ static void modal_build(void)
     lv_obj_clear_flag(s_panel, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(s_panel);
-    lv_label_set_text(title, "Resource Management");
+    /* "Audio Settings", not "Resource Management" - operator, 2026-09-24:
+     * "it is not really about resources as it is about real audio settings".
+     * Correct: five of its rows are RX audio, the panoramic trio is audio,
+     * and the feed switches are only here because they compete with audio
+     * for internal heap. The old name described the mechanism; this one
+     * describes what the operator came to do. */
+    lv_label_set_text(title, "Audio Settings");
     lv_obj_set_style_text_color(title, lv_color_hex(0xffffff), 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_32, 0);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -384,25 +988,39 @@ static void modal_build(void)
     lv_obj_align(s_gate_note, LV_ALIGN_TOP_LEFT, 0, 72);
     lv_obj_add_flag(s_gate_note, LV_OBJ_FLAG_HIDDEN);
 
-    int y = 116;
-    /* 52 -> 46. The pan-slider strip added ~92 px and the Close button is
-     * bottom-aligned, so at 52 the last row (PSK Reporter - report my decodes)
-     * ran under it: content area is 700 - 2*24 pad - 2*2 border = 648, the row
-     * ended at ~609, and the button starts at 648 - 64 = 584. At 46 the row
-     * ends ~567 and there is 17 px of daylight. The rows do not become harder
-     * to hit - the checkbox carries ext_click_area 28 either way. */
+    // Header (title/subtitle/gate note above) ends around y=92; Close sits in
+    // the last 64 px of the panel's content box (648 = 700 - 2*24 pad -
+    // 2*2 border) plus a 16 px gap above it. Everything in between scrolls.
+    s_scroll = lv_obj_create(s_panel);
+    lv_obj_set_pos(s_scroll, 0, 100);
+    /* 64 button + 16 gap, plus 28 for the Save/Cancel note line above
+     * them - without it the note draws over the last scrolled row. */
+    lv_obj_set_size(s_scroll, LV_PCT(100), 648 - 100 - 64 - 16 - 28);
+    lv_obj_set_style_bg_opa(s_scroll, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_scroll, 0, 0);
+    lv_obj_set_style_pad_all(s_scroll, 0, 0);
+    // Keep right-aligned children (the check boxes) out from under the
+    // scrollbar - see SCROLL_PAD_R.
+    lv_obj_set_style_pad_right(s_scroll, SCROLL_PAD_R, 0);
+    lv_obj_set_scroll_dir(s_scroll, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_scroll, LV_SCROLLBAR_MODE_AUTO);
+
+    int y = 16;   // relative to s_scroll now, not s_panel
     const int ROW_H = 46;
+
+    /* First, because it decides whether anything below it applies. */
+    build_source_block(&y);
     for (int i = 0; i < ROW_COUNT; i++) {
         const row_def_t *d = &ROW_DEFS[i];
 
-        lv_obj_t *lbl = lv_label_create(s_panel);
+        lv_obj_t *lbl = lv_label_create(s_scroll);
         lv_label_set_text(lbl, d->label);
         lv_obj_set_style_text_color(lbl, lv_color_hex(UI_COLOR_TEXT), 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_24, 0);
         lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, y);
         lv_obj_add_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
 
-        lv_obj_t *cb = make_checkbox(s_panel);
+        lv_obj_t *cb = make_checkbox(s_scroll);
         lv_obj_align(cb, LV_ALIGN_TOP_RIGHT, 0, y - 6);
         lv_obj_add_event_cb(cb, d->cb, LV_EVENT_VALUE_CHANGED, NULL);
         lv_obj_add_event_cb(lbl, label_toggles_cb, LV_EVENT_CLICKED, cb);
@@ -416,49 +1034,146 @@ static void modal_build(void)
             s_rows[d->row].lbl = lbl;
         }
 
-        // Gain rides on the RX Audio line: it is the level for ALL supported
-        // modes, not a property of the stereo split, so it belongs with the
-        // switch that turns audio on rather than with the pan controls.
-        if (d->row == ROW_AUDIO) {
-            /* x positions: "RX Audio (speaker/headphone)" at font 24 runs to
-             * about x=367, so Gain started at 370 and touched it. Pushed right
-             * to 430, which leaves the row label clear air and still ends well
-             * before the checkbox (~900). 430 label, 490..760 slider, 780 value. */
-            s_sld_gain = lv_slider_create(s_panel);
-            lv_obj_set_size(s_sld_gain, 270, 14);
-            lv_obj_align(s_sld_gain, LV_ALIGN_TOP_LEFT, 490, y + 10);
-            lv_slider_set_range(s_sld_gain, 5, 80);          // 50..800, settings.c clamps the same
-            lv_slider_set_value(s_sld_gain, settings_get_rxaud_gain_d10(), LV_ANIM_OFF);
-            lv_obj_add_event_cb(s_sld_gain, gain_cb, LV_EVENT_VALUE_CHANGED, NULL);
-
-            lv_obj_t *gl = lv_label_create(s_panel);
-            lv_label_set_text(gl, "Gain");
-            lv_obj_set_style_text_color(gl, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
-            lv_obj_set_style_text_font(gl, &lv_font_montserrat_20, 0);
-            lv_obj_align(gl, LV_ALIGN_TOP_LEFT, 430, y + 4);
-
-            s_lbl_gain_val = lv_label_create(s_panel);
-            lv_label_set_text_fmt(s_lbl_gain_val, "%d", settings_get_rxaud_gain_d10() * 10);
-            lv_obj_set_style_text_color(s_lbl_gain_val, lv_color_hex(UI_COLOR_TEXT), 0);
-            lv_obj_set_style_text_font(s_lbl_gain_val, &lv_font_montserrat_20, 0);
-            lv_obj_align(s_lbl_gain_val, LV_ALIGN_TOP_LEFT, 780, y + 4);
-        }
-
         if (d->row == ROW_AUDIO) {
             y += ROW_H;
+
+            /* RX Volume, then AGC Ceiling, Attack, Release - each its OWN full row, same
+             * label/slider/value shape as every other row (0 label, 490
+             * slider, 780 value). Ceiling used to ride on the RX Audio row's
+             * own line at x=430, sharing it with that row's checkbox label -
+             * fine at the old "Gain" (4 chars) but "AGC Ceiling" (11 chars)
+             * ran into the slider (operator screenshot, 2026-09-23: the
+             * label text sat under the slider knob). Given its own row
+             * instead of tuning more x-offset arithmetic by eye. */
+            {
+                struct {
+                    const char   *cap;
+                    lv_obj_t    **sld;
+                    lv_obj_t    **val;
+                    int           min, max, cur;
+                    lv_event_cb_t cb;
+                    const char   *fmt;
+                } agcs[4] = {
+                    { "RX Volume",   &s_sld_vol,     &s_lbl_vol_val,     0, 100,  rx_audio_get_volume(),                rx_vol_cb,      "%d" },
+                    { "AGC Ceiling", &s_sld_gain,    &s_lbl_gain_val,    5, 150,  settings_get_rxaud_gain_d10(),        gain_cb,        "%d" },
+                    { "AGC Attack",  &s_sld_attack,  &s_lbl_attack_val,  1, 50,   settings_get_rxaud_agc_attack_ms(),  agc_attack_cb,  "%d ms" },
+                    { "AGC Release", &s_sld_release, &s_lbl_release_val, 10, 500, settings_get_rxaud_agc_release_ms(), agc_release_cb, "%d ms" },
+                };
+                /* ⭐ THESE ROWS HAVE NO CHECK BOX, so unlike the feed rows they
+                 * can use nearly the whole width - and they SHOULD. At 270 px
+                 * the operator could not set them accurately: "they are too
+                 * short now - there is plenty of space on each side ... it is
+                 * very difficult to adjust precisely when so short". A ceiling
+                 * of 50..1500 across 270 px is about 5 units per pixel; across
+                 * 700 px it is under 2. Content width is 1028 (panel 1100 less
+                 * 2x24 pad, 2x2 border and SCROLL_PAD_R), so 210 + 700 + value
+                 * at 930 leaves the value text clear to the right edge. */
+                const int SLD_X = 210, SLD_W = 700, SLD_VAL_X = 930;
+                for (int p = 0; p < 4; p++) {
+                    lv_obj_t *cap = lv_label_create(s_scroll);
+                    lv_label_set_text(cap, agcs[p].cap);
+                    lv_obj_set_style_text_color(cap, lv_color_hex(UI_COLOR_TEXT), 0);
+                    lv_obj_set_style_text_font(cap, &lv_font_montserrat_24, 0);
+                    lv_obj_align(cap, LV_ALIGN_TOP_LEFT, 0, y);
+
+                    lv_obj_t *sld = lv_slider_create(s_scroll);
+                    lv_obj_set_size(sld, SLD_W, 14);
+                    lv_obj_align(sld, LV_ALIGN_TOP_LEFT, SLD_X, y + 10);
+                    lv_slider_set_range(sld, agcs[p].min, agcs[p].max);
+                    lv_slider_set_value(sld, agcs[p].cur, LV_ANIM_OFF);
+                    lv_obj_add_event_cb(sld, agcs[p].cb, LV_EVENT_VALUE_CHANGED, NULL);
+                    *agcs[p].sld = sld;
+
+                    lv_obj_t *val = lv_label_create(s_scroll);
+                    lv_label_set_text_fmt(val, agcs[p].fmt, agcs[p].cur);
+                    lv_obj_set_style_text_color(val, lv_color_hex(UI_COLOR_TEXT), 0);
+                    lv_obj_set_style_text_font(val, &lv_font_montserrat_20, 0);
+                    lv_obj_align(val, LV_ALIGN_TOP_LEFT, SLD_VAL_X, y + 4);
+                    *agcs[p].val = val;
+
+                    y += ROW_H;
+                }
+
+                /* Preset row, directly under the sliders it drives - see
+                 * AGC_PRESETS. Same 210 px left margin as the sliders so the
+                 * caption column lines up with theirs. */
+                {
+                    lv_obj_t *cap = lv_label_create(s_scroll);
+                    lv_label_set_text(cap, "AGC Preset");
+                    lv_obj_set_style_text_color(cap, lv_color_hex(UI_COLOR_TEXT), 0);
+                    lv_obj_set_style_text_font(cap, &lv_font_montserrat_24, 0);
+                    lv_obj_align(cap, LV_ALIGN_TOP_LEFT, 0, y + 8);
+
+                    const int BTN_W = 140, BTN_H = 50, BTN_GAP = 16;
+                    for (int i = 0; i < AGC_PRESET_N; i++) {
+                        lv_obj_t *b = lv_button_create(s_scroll);
+                        lv_obj_set_size(b, BTN_W, BTN_H);
+                        lv_obj_align(b, LV_ALIGN_TOP_LEFT, 210 + i * (BTN_W + BTN_GAP), y);
+                        lv_obj_set_style_radius(b, 8, 0);
+                        /* Unchecked = the panel's key colour, checked = the
+                         * same PRIMARY the check boxes use when ticked, so
+                         * "this one is active" reads the same way everywhere
+                         * in this window. */
+                        lv_obj_set_style_bg_color(b, lv_color_hex(UI_COLOR_KEY_BG), 0);
+                        lv_obj_set_style_border_color(b, lv_color_hex(UI_COLOR_BORDER), 0);
+                        lv_obj_set_style_border_width(b, 1, 0);
+                        lv_obj_set_style_bg_color(b, lv_color_hex(UI_COLOR_PRIMARY), LV_STATE_CHECKED);
+                        lv_obj_set_style_border_color(b, lv_color_hex(UI_COLOR_PRIMARY_BORDER), LV_STATE_CHECKED);
+                        lv_obj_add_event_cb(b, agc_preset_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+                        lv_obj_t *l = lv_label_create(b);
+                        lv_label_set_text(l, AGC_PRESETS[i].cap);
+                        lv_obj_set_style_text_color(l, lv_color_hex(0xffffff), 0);
+                        lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
+                        lv_obj_center(l);
+                        s_btn_preset[i] = b;
+                    }
+
+                    s_lbl_preset_state = lv_label_create(s_scroll);
+                    lv_obj_align(s_lbl_preset_state, LV_ALIGN_TOP_LEFT,
+                                 210 + AGC_PRESET_N * (BTN_W + BTN_GAP), y + 14);
+                    lv_obj_set_style_text_color(s_lbl_preset_state,
+                                                lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
+                    lv_obj_set_style_text_font(s_lbl_preset_state, &lv_font_montserrat_20, 0);
+                    lv_label_set_text(s_lbl_preset_state, "");
+                    agc_preset_refresh();
+
+                    y += BTN_H + 12;
+                }
+
+                /* The auto-mute escape hatch - see hp_mute_cb(). Directly
+                 * under the audio controls it affects. */
+                {
+                    lv_obj_t *cb = make_checkbox(s_scroll);
+                    lv_obj_align(cb, LV_ALIGN_TOP_LEFT, 0, y);
+                    if (settings_get_hp_mute_en()) lv_obj_add_state(cb, LV_STATE_CHECKED);
+                    lv_obj_add_event_cb(cb, hp_mute_cb, LV_EVENT_VALUE_CHANGED, NULL);
+                    s_cb_hp_mute = cb;
+                    lv_obj_t *l = lv_label_create(s_scroll);
+                    lv_label_set_text(l, "Mute speaker when headphones are plugged in");
+                    lv_obj_set_style_text_color(l, lv_color_hex(UI_COLOR_TEXT), 0);
+                    lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
+                    lv_obj_align(l, LV_ALIGN_TOP_LEFT, 60, y + 4);
+                    y += ROW_H;
+                }
+            }
         } else if (d->row == ROW_BINAURAL) {
             // The three pan controls, side by side directly under the switch
             // that makes them do anything.
             y += ROW_H - 8;
 
-            s_pan_hdr = lv_label_create(s_panel);
+            s_pan_hdr = lv_label_create(s_scroll);
             lv_label_set_text(s_pan_hdr, "Panoramic split - adjust while listening");
             lv_obj_set_style_text_color(s_pan_hdr, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
             lv_obj_set_style_text_font(s_pan_hdr, &lv_font_montserrat_20, 0);
             lv_obj_align(s_pan_hdr, LV_ALIGN_TOP_LEFT, 16, y);
             y += 30;
 
-            const int SW = 292, SGAP = 20;
+            /* 292 -> 320: the panel went 1000 -> 1100 wide, and the trio was
+             * still laid out for the old width, leaving ~96 px dead on the
+             * right. Same reason the four audio sliders above grew - a wider
+             * slider is a more precise one. 16 + 2*340 + 320 = 1016, inside
+             * the 1028 content width. */
+            const int SW = 320, SGAP = 20;
             struct {
                 const char   *cap;
                 lv_obj_t    **sld;
@@ -474,19 +1189,19 @@ static void modal_build(void)
             for (int p = 0; p < 3; p++) {
                 const int x = 16 + p * (SW + SGAP);
 
-                lv_obj_t *cap = lv_label_create(s_panel);
+                lv_obj_t *cap = lv_label_create(s_scroll);
                 lv_label_set_text(cap, pans[p].cap);
                 lv_obj_set_style_text_color(cap, lv_color_hex(UI_COLOR_TEXT), 0);
                 lv_obj_set_style_text_font(cap, &lv_font_montserrat_20, 0);
                 lv_obj_align(cap, LV_ALIGN_TOP_LEFT, x, y);
 
-                lv_obj_t *val = lv_label_create(s_panel);
+                lv_obj_t *val = lv_label_create(s_scroll);
                 lv_obj_set_style_text_color(val, lv_color_hex(UI_COLOR_TEXT), 0);
                 lv_obj_set_style_text_font(val, &lv_font_montserrat_20, 0);
                 lv_obj_align(val, LV_ALIGN_TOP_LEFT, x + SW - 60, y);
                 *pans[p].val = val;
 
-                lv_obj_t *s = lv_slider_create(s_panel);
+                lv_obj_t *s = lv_slider_create(s_scroll);
                 lv_obj_set_size(s, SW, 14);
                 lv_obj_align(s, LV_ALIGN_TOP_LEFT, x, y + 30);
                 lv_slider_set_range(s, pans[p].min, pans[p].max);
@@ -511,8 +1226,11 @@ static void modal_build(void)
              * which is the division the panel is actually about. Sitting
              * directly beneath RX Audio it cut the audio group in half and
              * implied Binaural belonged with the network feeds. */
-            lv_obj_t *sep = lv_obj_create(s_panel);
-            lv_obj_set_size(sep, PANEL_W - 2 * PANEL_PAD, 2);
+            lv_obj_t *sep = lv_obj_create(s_scroll);
+            /* LV_PCT, not PANEL_W - 2*PANEL_PAD: the strip now also reserves
+             * SCROLL_PAD_R on the right, so a width computed from the panel
+             * overflows the content box and would arm a horizontal scroll. */
+            lv_obj_set_size(sep, LV_PCT(100), 2);
             lv_obj_set_style_bg_color(sep, lv_color_hex(UI_COLOR_BORDER), 0);
             lv_obj_set_style_border_width(sep, 0, 0);
             lv_obj_align(sep, LV_ALIGN_TOP_LEFT, 0, y);
@@ -522,14 +1240,38 @@ static void modal_build(void)
         }
     }
 
+    /* Save and Cancel in place of the old single Close (his call,
+     * 2026-10-10). Green left, red right. They govern the AUDIO SOURCE; the
+     * line under them says so, because every other control here is live and
+     * pressing Cancel will not put the volume back. */
+    lv_obj_t *btn_note = lv_label_create(s_panel);
+    lv_obj_set_style_text_font(btn_note, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(btn_note, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
+    lv_label_set_text(btn_note,
+        "Save / Cancel apply to the audio source. Everything else here takes "
+        "effect as you change it.");
+    lv_obj_align(btn_note, LV_ALIGN_BOTTOM_MID, 0, -72);
+
+    lv_obj_t *save_btn = lv_btn_create(s_panel);
+    lv_obj_set_size(save_btn, 200, 64);
+    lv_obj_align(save_btn, LV_ALIGN_BOTTOM_MID, -110, 0);
+    lv_obj_set_style_bg_color(save_btn, lv_color_hex(0x2E8B40), 0);
+    lv_obj_set_style_radius(save_btn, 8, 0);
+    lv_obj_add_event_cb(save_btn, save_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *save_lbl = lv_label_create(save_btn);
+    lv_label_set_text(save_lbl, "Save");
+    lv_obj_set_style_text_color(save_lbl, lv_color_hex(0xffffff), 0);
+    lv_obj_set_style_text_font(save_lbl, &lv_font_montserrat_24, 0);
+    lv_obj_center(save_lbl);
+
     lv_obj_t *close_btn = lv_btn_create(s_panel);
     lv_obj_set_size(close_btn, 200, 64);
-    lv_obj_align(close_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(close_btn, lv_color_hex(UI_COLOR_PRIMARY), 0);
+    lv_obj_align(close_btn, LV_ALIGN_BOTTOM_MID, 110, 0);
+    lv_obj_set_style_bg_color(close_btn, lv_color_hex(0xA03030), 0);
     lv_obj_set_style_radius(close_btn, 8, 0);
-    lv_obj_add_event_cb(close_btn, close_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(close_btn, cancel_btn_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *close_lbl = lv_label_create(close_btn);
-    lv_label_set_text(close_lbl, "Close");
+    lv_label_set_text(close_lbl, "Cancel");
     lv_obj_set_style_text_color(close_lbl, lv_color_hex(0xffffff), 0);
     lv_obj_set_style_text_font(close_lbl, &lv_font_montserrat_24, 0);
     lv_obj_center(close_lbl);
@@ -577,6 +1319,21 @@ static void rows_refresh_from_settings(void)
         lv_slider_set_value(s_sld_gain, g, LV_ANIM_OFF);
         if (s_lbl_gain_val) lv_label_set_text_fmt(s_lbl_gain_val, "%d", g * 10);
     }
+    if (s_sld_vol) {
+        const uint8_t v = rx_audio_get_volume();
+        lv_slider_set_value(s_sld_vol, v, LV_ANIM_OFF);
+        if (s_lbl_vol_val) lv_label_set_text_fmt(s_lbl_vol_val, "%d", v);
+    }
+    if (s_sld_attack) {
+        const uint8_t a = settings_get_rxaud_agc_attack_ms();
+        lv_slider_set_value(s_sld_attack, a, LV_ANIM_OFF);
+        if (s_lbl_attack_val) lv_label_set_text_fmt(s_lbl_attack_val, "%d ms", a);
+    }
+    if (s_sld_release) {
+        const uint16_t r = settings_get_rxaud_agc_release_ms();
+        lv_slider_set_value(s_sld_release, r, LV_ANIM_OFF);
+        if (s_lbl_release_val) lv_label_set_text_fmt(s_lbl_release_val, "%d ms", r);
+    }
     if (s_sld_width) {
         const uint8_t w = settings_get_rxaud_pan_width_x10();
         lv_slider_set_value(s_sld_width, w, LV_ANIM_OFF);
@@ -600,6 +1357,14 @@ void resource_mgmt_modal_open(void)
 {
     modal_build();
     rows_refresh_from_settings();
+    /* The web form can set these behind our back while the window is shut,
+     * so re-derive the highlight on every open rather than trusting the last
+     * press - see agc_preset_current(). */
+    agc_preset_refresh();
+    if (s_cb_hp_mute) {
+        if (settings_get_hp_mute_en()) lv_obj_add_state(s_cb_hp_mute, LV_STATE_CHECKED);
+        else                           lv_obj_clear_state(s_cb_hp_mute, LV_STATE_CHECKED);
+    }
     lv_obj_clear_flag(s_modal, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_modal);
     ESP_LOGI(TAG, "opened");

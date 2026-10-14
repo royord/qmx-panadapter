@@ -191,6 +191,8 @@ which also covers setting the seconds — the part that matters with no WiFi and
 
 **QMX GPS** — Detected **automatically**, no setting to toggle. If your QMX (typically a QMX+) is GPS-disciplined, the Tab5 recognises it at connect by comparing the QMX's own second-tick against SNTP, and then phase-locks to the GPS second boundary (~10 ms) as an offline time source. On a non-GPS QMX nothing happens. The bottom-bar clock shows **UTC(GPS)** when a GPS-disciplined QMX is the active source. A clock the Tab5 has itself pushed into the radio is never accepted as evidence of GPS — see [Time Sync](../guide/time-sync.md#4-qmx-gps-time-sync-auto-detected).
 
+**Unit GPS (PORT.A)** — not set here. Choose it under **Device -> [Port mode](#port-mode-porta)**, since the first question is what is plugged into the connector. When it is on, it beats the QMX's GPS and SNTP while it has a fresh lock, and it is the only offline source that also gives the date. See [Unit GPS Time Source](time-sync.md#unit-gps-time-source-porta).
+
 ## Display
 
 **Flip 180°** — Invert the display for upside-down mounting or cable routing.
@@ -221,6 +223,27 @@ to restart.
 - **Normal** — absolute dBm scale
 - **Flat** — relative to per-bin noise floor (signals pop above baseline)
 
+## Port mode (PORT.A)
+
+**Advanced -> Device.** One connector, two possible owners, so there is one setting with two values:
+
+- **Relay (default)** — the remote power-cycle relay drives GPIO53/54, exactly as it always has. A board that has never seen this setting is on **Relay**, so nothing changes when you update.
+- **Unit GPS v1.1** — the M5Stack Unit GPS owns those pins as a UART instead, and disciplines the clock from the satellite: time **and the full date**, with no internet. See [Unit GPS Time Source](time-sync.md#unit-gps-time-source-porta).
+
+Switching is live — the pins are handed straight over, and a toast confirms which side has PORT.A. It is refused while a relay pulse or power cycle is running (finish it first), and refused if the GPS UART cannot be brought up (the mode then stays as it was, rather than changing to something that is not working).
+
+!!! warning "Never leave the Unit GPS plugged in while Port mode is Relay"
+
+    Relay mode **drives both pins**. The Unit GPS transmits on one of them.
+    They are mutually exclusive by hardware: either plug the GPS in and select
+    *Unit GPS v1.1*, or unplug it and stay on *Relay*. The warning is shown
+    right under the control, and the bottom-bar GPS indicator is hidden entirely
+    while Relay owns the port.
+
+**Tip: switch the mode first, then plug the GPS in.** The reverse order works but puts the GPS's transmitter against a driven pin for the moment between the two.
+
+The same control is in the web UI's **Miscellaneous** menu, above the remote relay row — the relay row greys out and says why whenever Unit GPS owns PORT.A. See [Web UI](web-ui.md).
+
 ## Battery Care
 
 **Charge Limit** — Optionally stop charging once the battery reaches a set percentage (default **80%**), to reduce long-term wear on the pack. Enable it and choose the target in the settings drawer; charging restarts automatically if the level later falls well below the target (5% hysteresis). Leave it off to always charge to 100%.
@@ -240,9 +263,13 @@ to restart.
 - **Hann** — smoother peaks
 - **Nuttall** — sharpest edges
 
-**Waterfall scroll speed** — 1× to 4× (default 1×). How many rows the waterfall
-advances per render, independent of the spectrum and S-meter update rate, which
-stay unchanged either way.
+**Waterfall rate** — in **rows per second**, default 10. The steps are 1 to 10,
+then 20, 30 and 40. Before v1.16.12 this was a 1× to 4× multiplier over a fixed
+10 rows/s, which could only go *faster*; slower is what was actually wanted,
+both to put more history on one screen and to cut the waterfall's share of the
+drawing work. The spectrum and S-meter update rate is unchanged either way.
+
+The same control is in the browser, and the two lists match.
 
 **Spur suppression — withdrawn in v1.8.9.** The control is no longer in the
 drawer.
@@ -288,7 +315,7 @@ Choose **Off** to tune exactly where you tap (asked for by Samuel W7STF). The
 grid exists because SSB stations sit on whole kilohertz and the ones that stray
 are usually at the half, so landing on a round number is normally what you want —
 but it is a preference, and now it is one you can set. CW keeps its own 10 Hz
-grid, AM and FM their 1 kHz, and tap-to-RIT overrides all of them, because an
+grid, AM its 1 kHz, and tap-to-RIT overrides all of them, because an
 offset onto one caller's tone needs resolution rather than tidiness.
 
 **Distance in Miles** — show distances in miles instead of kilometres, in the FT8
@@ -473,6 +500,17 @@ only place RBN skimmers more precisely.
 
 **Fast pounce (early decode)** — On by default. Decodes surface ~1.8 s *before* the slot boundary (WSJT-X style), so a fresh CQ can be answered in the very next slot and mid-QSO replies land on the beat. Trade-off: the capture window closes early, so a station transmitting late in the slot can occasionally be missed. ⚠️ *Not yet A/B-verified on a live band — if your decodes-per-slot drop with it on, turn it off and please report your numbers.*
 
+!!! tip "v1.16.4 made this actually deliver"
+
+    Starting the decode early only helps if the *decision* to transmit is taken
+    early too, and until v1.16.4 only one of the Tab5's two processors was
+    allowed to take it. Which one happened to find the station calling you was
+    chance — so the same situation answered immediately about half the time and
+    a full cycle (30 s) late the rest, which is exactly how it looked from the
+    operator's chair *(Gyula HA3HZ: "sometimes it works well, other times the
+    transmission is delayed")*. Both halves may now decide. Verified on the air
+    over three contacts, every message going out in the immediate slot.
+
 **Distance in miles** — Show the decode list's distance column in miles instead of kilometres.
 
 **Report to PSK Reporter** — **On by default.** Uploads the stations you decode to [PSK Reporter](https://pskreporter.info), the same as WSJT-X, so you appear on the map as a monitoring station and other operators can see where they were heard.
@@ -588,14 +626,26 @@ A plain 32 GB FAT32 card is ideal. There is no benefit to a fast or expensive on
 
 The microSD card and the WiFi co-processor share a bus on this hardware and cannot both use it reliably. Rather than fail at an unpredictable moment, the Tab5 picks the behaviour that works:
 
-| | What happens | SD dot |
-|---|---|---|
-| **WiFi off** (POTA/SOTA) | Continuous mirroring the whole time the card is in | **Green** |
-| **WiFi on** | One complete backup within a few seconds of switching on, then file mirroring stops — but the diagnostic log and the CW transcript keep going, every 30 seconds | **Yellow** |
+| | What happens |
+|---|---|
+| **WiFi off** (POTA/SOTA) | Continuous mirroring the whole time the card is in |
+| **WiFi on** | One complete backup within a few seconds of switching on, then file mirroring stops — but the diagnostic log and the CW transcript keep going, every 30 seconds |
 
 Either way your QSO log, config, and LoTW certificate and key are backed up. With WiFi on, QSOs made later in that session reach the card at the **next start-up** — so if you have been operating with WiFi up and want them on the card now, restart the Tab5.
 
-If no card is inserted the dot is absent, which is not an error.
+### What the SD dot means (changed in v1.16.3)
+
+The dot reports whether writes are actually **landing**, not merely whether a card mounted:
+
+| Dot | Meaning |
+|---|---|
+| **Green** | A write succeeded in the last 90 seconds |
+| **Yellow** | A card is mounted, but nothing has been written lately |
+| **Grey, struck through** | No card in the slot — not an error |
+
+Before v1.16.3 the dot went yellow about ten seconds into any WiFi session and stayed yellow for the rest of it, whatever the card was doing — so it read the same on a perfectly healthy unit and on one where every write was failing. It now distinguishes those.
+
+A short spell of yellow is not a fault: on a quiet session there may be nothing to write. Yellow that persists while the Tab5 is clearly busy means writes are failing — see [Troubleshooting](../reference/troubleshooting.md).
 
 **While a browser is watching the spectrum, those 30-second writes wait.** The
 card and the WiFi co-processor share a bus, and writing the card holds the
@@ -607,6 +657,23 @@ sooner.
 > **⚠️ The card holds credentials.** A full backup that can *restore* a station necessarily includes secrets: `qmx-config.txt` stores your WiFi password and QRZ/eQSL logins in clear text, and `lotw_key.b64` is your LoTW **private key**. Keep the card as physically secure as a house key. (The on-card `README.txt` repeats this warning.)
 
 > The diagnostic log is always-on regardless of whether an SD card is present. If no card is inserted, the log still persists to internal flash (see [Diagnostic Logging](#diagnostic-logging) above) and survives a power-off.
+
+### Taking the card out, and restarting the Tab5
+
+Two buttons in the settings drawer:
+
+- **Eject microSD** finishes whatever is being written, closes the card and
+  tells you when it is safe to pull it out. The confirmation stays on screen
+  until you close it, so you can look at the card slot without missing it.
+  Pulling the card without ejecting risks losing the last thing written to it.
+- **Restart the Tab5** reboots cleanly from the screen instead of the power
+  button. The card is released first.
+
+The card is now also released automatically before a firmware update. Before
+v1.16.11 a reset caught the card mid-transaction, and because the Tab5 cannot
+power the card down on its own the card stayed confused until the whole unit was
+powered off - which is why a card could take several attempts to mount after an
+update, or not come back at all.
 
 ### Restoring the log from the card
 

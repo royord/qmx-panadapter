@@ -5,7 +5,7 @@ The panadapter includes **on-device FT8 and FT4 decoders** with real-time spectr
 
 ### 1. FT8 & FT4 View
 
-Swipe → from the left edge to reach the FT8/FT4 view (the edge cycles Panadapter -> FT8/FT4 -> WSPR). The same decode list and waterfall work for both modes — switch modes via the **Preset** dropdown in the left pane (top).
+Swipe → from the left edge to reach the FT8/FT4 view (the edge cycles Panadapter -> FT8/FT4/JS8 -> WSPR). The same decode list and waterfall serve all three modes — FT8, FT4 and **JS8** — switched with the **Preset** dropdown in the left pane (top). JS8 adds a Conversation tab and free-text sending; see [JS8](js8.md).
 
 **FT4 notes:**
 - Decodes refresh roughly twice as fast as FT8 because slots are 7.5 seconds
@@ -69,6 +69,11 @@ Tap the **Options** button to open the Options modal:
 - **Exclude if contains** — hide any call matching these substrings
 - **Exclude worked before** — skip calls you've already logged QSOs with
 - **Show only CQ callers** — hide replies, show only CQ messages
+- **Show CQs in my run** — off by default. While you are running your own CQ, other
+  stations' plain CQ calls are hidden so that replies addressed to you are not buried
+  under unrelated traffic. Turn this on to keep seeing them, so you can spot a station
+  worth breaking off for during your listening slot. It changes the list only; it does
+  not change who the robot or Auto-work-pileup will answer
 - **Skip TX1** — when you pounce a station, open with your signal report straight away instead of the grid exchange, for a quicker QSO (falls back to the normal grid exchange if the station has dropped out of the decode list)
 - **Allow grey-listing** — off by default. A station that times out two of your pounces in a row is set aside: the robot and Auto-work-pileup skip it, its decode row turns **violet**, and tapping it offers to clear it from the grey-list instead of opening the TX dialog. Handy on a busy band where one station simply never comes back. The list is held in memory only and forgotten at power-off
 - **Auto-reply priority** — Strongest SNR, Weakest SNR, Most distant grid

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdint.h>
 
 /**
  * @brief Initialize CAT subsystem.
@@ -87,6 +88,12 @@ esp_err_t cat_set_passband_hz(uint32_t hz);
  * Cleared on QMX USB disconnect.
  */
 bool cat_is_ready(void);
+
+/* True once cat_init() has opened the CDC host, i.e. once the Tab5 is actually
+ * capable of seeing a QMX. Before this, cat_is_ready() being false says nothing
+ * about the radio - it only means we have not started looking. The "turn on
+ * your QMX" prompt is gated on it (Dennis WN4FLA, Gyula HA3HZ 2026-10-01). */
+bool cat_host_is_up(void);
 /**
  * @brief Get the CW offset (Hz) read from QMX at connect time.
  *
@@ -200,7 +207,62 @@ bool cat_get_iq_mode_confirmed(void);
 // answer, which is why it exists: the alternative - inferring GPS from the
 // clock agreeing with ours - can be satisfied by a clock WE set. False on
 // firmware that does not report the item, so it only ever ADDS certainty.
+/* GPS DATE straight from the receiver. It also returns a time and a bracketed
+ * second boundary, but that boundary measures ~1 s LATE (the receiver reports
+ * the previous second) - so callers take the date and the GPS verdict from
+ * here and leave the clock PHASE to cat_gps_tick_sync(). The measurement is in
+ * apply_qmx_gp() in time_sync.c.
+ * ESP_ERR_NOT_SUPPORTED on firmware older than 1.04_004. */
+esp_err_t cat_gps_gp_sync(int *out_y, int *out_mo, int *out_d,
+                          int *out_h, int *out_mi, int *out_s, int64_t *out_flip_us);
+
+/* GP; characterisation burst - the instrument behind /api/cmd {"action":
+ * "gp_probe"}. Reads only: no clock is set and nothing is written. Holds the
+ * CAT poll for the whole `secs` (clamped to 1..10).
+ *
+ * It exists because two things about GP are measured, not assumed: whether its
+ * time field advances at 1 Hz at all (one bench attempt saw 60 distinct
+ * replies hold the same second for 1.3 s), and how late its second boundary
+ * is against SNTP (one bench apply landed 399 ms behind). See
+ * cat_gps_gp_probe() in cat.c. */
+#define CAT_GP_PROBE_MAX    192
+#define CAT_GP_PROBE_FLIPS  12
+typedef struct {
+    int     n;                              /* distinct GP readings captured  */
+    int     polls;                          /* GP; sent                       */
+    int     nflip;                          /* second changes seen            */
+    int16_t t_ms[CAT_GP_PROBE_MAX];         /* arrival, ms from burst start   */
+    uint8_t ss[CAT_GP_PROBE_MAX];           /* the second it reported         */
+    int16_t flip_t_ms[CAT_GP_PROBE_FLIPS];  /* bracket midpoint, ms from start*/
+    uint8_t flip_ss[CAT_GP_PROBE_FLIPS];    /* the second it flipped TO       */
+    int16_t bracket_ms[CAT_GP_PROBE_FLIPS]; /* uncertainty of that midpoint   */
+    int16_t step_ms[CAT_GP_PROBE_FLIPS];    /* gap since the previous flip    */
+    int16_t delta_ms[CAT_GP_PROBE_FLIPS];   /* SNTP minus GP; + means GP late */
+} cat_gp_probe_t;
+
+/* secs 1..10; gap_ms 0..500 is the pause between polls - a knob because the
+ * probe can PERTURB what it measures: at ~6 ms between polls the measured lag
+ * moved (634-649 ms, then 788-869 ms over repeated bursts), which is what a
+ * saturated CAT task in the radio would look like. use_tm asks TM; instead of
+ * GP; through the identical code, so the two sources are compared on one
+ * timebase rather than across two different measurements. */
+esp_err_t cat_gps_gp_probe(int secs, int gap_ms, bool use_tm, cat_gp_probe_t *out);
+
+/* Exposed for the host harness: parses the trailing YYYYMMDDHHMMSS of a GP
+ * reply and range-checks it. Deliberately ignores the coordinate fields. */
+bool cat_gps_gp_parse(const char *resp, size_t len,
+                      int *y, int *mo, int *d, int *h, int *mi, int *s);
+
+/* Latitude and longitude from the last GP reply, in DECIMAL DEGREES (the
+ * radio's own format - not the degrees-and-minutes NMEA uses). False when the
+ * radio has never reported a position this session. */
+bool cat_qmx_gps_position(double *lat, double *lon);
+
 bool cat_qmx_gps_source_internal(void);
+/* False until the radio has actually answered the GPS-source question. Callers
+ * that would CHANGE the radio's state on the strength of "no GPS" must wait for
+ * this, because "no" and "not yet" are otherwise indistinguishable. */
+bool cat_qmx_gps_source_known(void);
 /**
  * @brief True once VOX has been confirmed OFF (Q3; readback == 0) for the
  * current connection. The panadapter keys the QMX via CAT (TX;/TA;/RX;), never
@@ -340,6 +402,34 @@ void cat_query_af_gain(void);
  * Divide by 4 for the dB figure the QMX displays. */
 int cat_get_af_gain(void);
 
+/* ---- CW keyer speed (KS), in words per minute --------------------------
+ *
+ * Asked for by Ralph Hellmig on the group, 2026-10-10: there was no way to
+ * set the keyer speed from anything but the radio's own encoder.
+ *
+ * ⭐ 0 IS A REAL VALUE, NOT "unset". The QMX operation manual, section 4.5:
+ * "Setting speed to 0 enables Straight Key mode regardless of the keyer mode
+ * setting". So 0 must pass through to the radio rather than being clamped
+ * away as an empty field, and anything that caches this must not use 0 as
+ * its sentinel - see the cache-sentinel rule that BP_CW already broke once.
+ *
+ * ⚠ THE RADIO IS THE AUTHORITY ON THE RANGE. The CAT manual documents KS as
+ * "the specified number of words per minute" and states no limits, so this
+ * sends what it is given and READS BACK what the radio settled on. Whatever
+ * the QMX clamps to is what gets displayed, rather than a ceiling guessed
+ * here and then shown as if it were the radio's. */
+void cat_request_keyer_wpm(uint16_t wpm);
+
+/* Ask the radio for its current keyer speed; the answer lands in
+ * cat_get_keyer_wpm(). Same drawer-open/page-load read-back reasoning as AF
+ * gain: a surface that shows a stale value is worse than one that shows
+ * none. */
+void cat_query_keyer_wpm(void);
+
+/* Last keyer speed read back from the radio, in WPM. -1 until it has
+ * answered - NOT 0, which is straight-key mode. */
+int cat_get_keyer_wpm(void);
+
 /* ---- RF gain (RG), Stan's suggestion via Samuel W7STF, 2026-08-07 ----------
  *
  * The QMX's per-band "RF gain (dB)" from its Band Configuration screen, exposed
@@ -399,7 +489,7 @@ int cat_get_rf_gain(void);
  * which would otherwise read a deliberate menu visit as a fault and eventually
  * power-cycle the USB port under the operator's hands.
  *
- * Deliberately separate from cat_poll_set_paused(): that flag belongs to the
+ * Deliberately separate from cat_poll_hold()/cat_poll_release(): that flag belongs to the
  * FT8 TX burst and is cleared at the end of every burst, which would silently
  * cancel the operator's pause.
  *
@@ -433,7 +523,40 @@ void cat_request_cw_passband(uint32_t hz);
  *
  * @param paused  true to pause polling, false to resume
  */
-void cat_poll_set_paused(bool paused);
+/* ⛔ IT IS A COUNT OF OWNERS, NOT A FLAG, AND THAT IS WHY.
+ *
+ * It WAS a plain bool, and five independent callers set it: the FT8 burst, the
+ * WSPR burst, the QMX RTC read and the GPS tick. Last writer won, so one owner
+ * released another's hold.
+ *
+ * Measured on bench dev 2026-10-02, inside a live 110.6 s WSPR transmission:
+ *
+ *   295201 background poll PAUSED        <- the burst takes the link
+ *   325934 background poll PAUSED        <- cat_query_qmx_time() takes it again
+ *   325955 background poll resumed       <- ...and releases it. The burst's
+ *   325955 QMX RTC time: 19:06:32           hold is gone, 80 s before the end
+ *   405804 background poll resumed       <- the burst releases what is already free
+ *
+ * For those 80 seconds the poll task sent FA;/MD;/FW; every 50 ms to a radio
+ * that was keyed - the exact interleaving this mechanism exists to prevent.
+ * The RTC read runs every 300 s, so it lands inside roughly 4% of FT8 bursts
+ * too, and those are only 12.6 s long.
+ *
+ * Holding is counted now, so releasing one owner's hold cannot release
+ * another's, and the log names who. A caller that must not merely queue behind
+ * a burst but must NOT RUN AT ALL during one - anything that writes to the
+ * radio - still has to ask cat_poll_held_by_other() first. */
+typedef enum {
+    CAT_HOLD_TX_BURST  = 1u << 0,   /* an FT8 or WSPR burst owns the link */
+    CAT_HOLD_TIME_SYNC = 1u << 1,   /* the GPS tick or the QMX RTC read */
+} cat_hold_t;
+
+void cat_poll_hold(cat_hold_t who);
+void cat_poll_release(cat_hold_t who);
+
+/* True when anyone OTHER than `me` is holding the link. The question a caller
+ * asks before writing to the radio. */
+bool cat_poll_held_by_other(cat_hold_t me);
 
 /* ⛔ A "FORCED" FREQUENCY WRITE CAN STILL BE DEFERRED, AND IT RETURNS ESP_OK.
  * cat_set_frequency_forced() is forced against the 200 ms RATE LIMITER only.
@@ -472,6 +595,19 @@ typedef struct {
  * @return pointer to static array of cat_band_entry_t
  */
 const cat_band_entry_t *cat_get_band_list(int *out_count);
+
+/* True when the radio reports this band by name, OR when CAT has not reported
+ * its band list yet (then everything is allowed - see the note in cat.c).
+ * Every list of bands offered to a USER must pass through this; the Tab5
+ * screens have always filtered, the web server did not. */
+bool cat_radio_has_band(const char *name);
+
+/* === BAND-LIST TEST STUB (Brian WA6JFK, 2026-10-04). KEPT DELIBERATELY -
+ * not a temp instrument, do not delete it at a cleanup; see the note in cat.c.
+ * Pretend the radio reports only these bands, e.g. "160,80,60,40,30,20".
+ * RAM only, cleared by a reboot. NULL or "" restores the real list.
+ * Returns the number of bands now stubbed, or -1 when cleared. */
+int cat_band_stub_set(const char *csv);
 
 /**
  * @brief Set the QMX's onboard real-time clock (time-of-day only, no date).
@@ -519,3 +655,15 @@ esp_err_t cat_gps_tick_sync(int *out_hour, int *out_min, int *out_sec, int64_t *
 // QMX transmitting until he power-cycled it.
 void cat_request_force_rx(void);
 bool cat_force_rx_pending(void);
+
+/* ⛔ DELIBERATE TEST ENTRY POINT for the band-scan restore (John W5JSS).
+ *
+ * The bench QMX's "Band config." menus do not move the dial, so the restore
+ * branch is unreachable on this hardware however many CAT link-ups are watched.
+ * This runs the REAL restore with a "where the scan found it" the caller
+ * supplies: a known-wrong value makes the radio move, which is the only way the
+ * FA;/MD; writes have ever gone out.
+ *
+ * Reached from POST /api/cmd {"action":"band_scan_restore_test", ...}. Nothing
+ * calls it in normal operation; it sends no TX. */
+void cat_band_scan_restore_test(uint32_t pre_freq, char pre_mode_digit);

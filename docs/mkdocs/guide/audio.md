@@ -13,19 +13,33 @@ The RF passband is split into two channels:
 - **Right**: Upper-frequency station (panned fully right)
 - **Center blend**: Dry/wet mix between the two
 
-Three live controls tune the effect mid-QSO without leaving the exchange:
+Three live controls tune the effect mid-QSO without leaving the exchange, grouped under **Panoramic split — adjust while listening**:
 
-- **Pan Width** — Frequency spread between the two stations. Wider = greater separation.
-- **Pan Blend** — Dry/wet audio mix. Left is pure lower channel; right is pure upper channel.
+- **Width** — Frequency spread between the two stations. Wider = greater separation.
+- **Blend** — Dry/wet audio mix. Left is pure lower channel; right is pure upper channel.
 - **Overlap** — Frequency range for each station. Wider ranges allow more signal capture.
 
 ### Enabling Panoramic CW
 
-1. Tap and hold the **top bar** in the Panadapter view
-2. Open **Resource Management**
-3. Enable **CW Audio**
+1. Open the settings drawer and tap **Audio Settings** (just below SelfSpotter)
+2. Tick **RX Audio (speaker/headphone)**, then **Binaural CW (stereo separation)**
 
-The three pan controls appear in the Panadapter view once enabled.
+!!! warning "Switching RX audio on needs a restart of the Tab5"
+
+    The audio hardware claims its memory during start-up, before the USB host
+    takes that pool, so it is started at boot or not at all. If you boot with
+    **RX Audio** off and tick it later, the setting is saved but you will hear
+    nothing until the Tab5 is restarted — it tells you so on screen when you
+    tick it. Your QMX will need a power cycle after that restart, as it does
+    after any Tab5 restart.
+
+!!! note "Which modes produce audio"
+
+    **CW, CW-R, USB and LSB only.** **AM is silent** — there is no AM
+    or FM demodulator yet, so listening to an AM station means putting the
+    radio in USB.
+
+The three pan controls sit directly under the Binaural CW row in the same window. They stay greyed out until both boxes above are ticked, because they shape a split that is not being produced otherwise.
 
 ### On the Air
 
@@ -52,19 +66,34 @@ Binaural separation works best with **bandwidths of 300 Hz and above**.
 | 200–300 Hz | Fair | Tight pileup; separation possible but marginal |
 | <200 Hz   | Poor | Not recommended; too much spectral overlap |
 
-## Resource Management
+## Audio Settings
 
 Audio decoding shares the Tab5's compute and memory budget with the spectrum, waterfall, and FT8/FT4 decode paths. Not all features can run simultaneously.
 
-### Opening Resource Management
+!!! note "Renamed in v1.16.4"
 
-**Tap and hold the top bar in the Panadapter view**, then select **Resource Management**. 
+    This window used to be called **Resource Management**. It is **Audio
+    Settings** now, because that is what it is — volume, AGC, binaural and the
+    panoramic split. The old name described how it works rather than what it does.
 
-The window shows:
-- Current resource usage by each component
-- Available headroom
-- Which features can be toggled on/off
-- Warnings if enabling a feature would exceed capacity
+### Opening Audio Settings
+
+Open the **settings drawer** and tap **Audio Settings**, directly below SelfSpotter.
+
+!!! note "Top-bar shortcut removed in v1.16.8"
+
+    A long-press on the top bar used to open Audio Settings too. It shared its
+    area with the Band, Mode, BW and Frequency pickers, so it was easy to open
+    the wrong thing by accident. The drawer button is now the only way in.
+
+The window lists RX audio and the background network feeds that compete with it for the same scarce memory, each with a tick box:
+
+- **RX Audio (speaker/headphone)** — with RX Volume and the three AGC controls described below
+- **Binaural CW (stereo separation)** — with the three panoramic-split controls
+- **SelfSpotter**, **RBN**, **DX cluster**, **PSK Reporter — who's hearing me** — these grey out and are held off while RX audio is on
+- **POTA / SOTA spots**, **PSK Reporter — report my decodes** — these keep running
+
+The list scrolls; the **Close** button stays put at the bottom.
 
 **Toggle audio on and off as needed** — the resource footprint is immediate, and disabling a feature instantly frees that headroom.
 
@@ -73,6 +102,21 @@ The window shows:
 - **Audio ON, Waterfall ON, Decode ON** → Some margin left; FT8/FT4 decode still runs steadily
 - **Audio ON, Waterfall ON, Decode ON, Web streaming ON** → Tight; any spike can cause temporary frame drops
 - **Audio ON, full WiFi + web load** → Audio is the first to suffer if the load spikes; consider disabling audio or the waterfall if you need reliable web streaming
+
+## Headphones
+
+Plug headphones into the Tab5's 3.5 mm jack and the **internal speaker goes
+quiet on its own**. Unplug them and it comes back. Nothing to switch.
+
+Before v1.16.4 you heard both at once, which made headphones close to useless in
+a quiet shack *(Roy KI0ER)*.
+
+!!! tip "The internal speaker is small and trebly"
+
+    Several operators have said so, and they are right — it is a tablet
+    speaker. Headphones or a powered external speaker on the jack are a large
+    improvement, and now that the internal one mutes itself either is
+    practical.
 
 ## Which modes produce audio
 
@@ -85,47 +129,115 @@ Audio and the panoramic split are not the same thing, and it is worth being clea
 | DiGi | No | No |
 | AM, FM | No | No |
 
-So you **do** get audio on SSB; what you do not get there is the left/right split, because that is a CW feature. In DiGi, AM and FM there is no audio at all yet — nothing is broken if you hear silence in those.
+So you **do** get audio on SSB; what you do not get there is the left/right split, because that is a CW feature. In DiGi and AM there is no audio at all yet — nothing is broken if you hear silence in those.
 
 ## Known Limitations
 
+- **Audio breaks up while a web page is open.** Known and unfixed as of v1.16.3. With a browser connected to the panadapter page the audio task misses some of its deadlines and you hear a regular crackle; closing the page clears it. Measured, but the cause is not yet found — if you need clean audio, close the web page.
 - **Stereo rendering requires a headset or speaker with stereo output.** Mono output collapses both channels; panning does not work.
 - **The split is CW-only** (see the table above). On SSB you hear the signal, but it is not placed left or right.
 - **Limited to the audio passband.** If the audio filter is 300 Hz wide, the maximum usable separation is about 300 Hz. A wider filter in the radio settings increases the available range.
-- **Level depends on an AGC that is still being tuned.** If a signal is quieter than you expect even at full volume, that is the AGC's gain ceiling rather than your volume control. It is adjustable live — see below.
+- **Level is set by an automatic gain control, not by the volume slider.** If a signal is quieter than you expect even at full volume, the AGC's ceiling is what is holding it back. All three AGC controls are adjustable live — see below.
 
-## If the level is too low
+## The AGC controls
 
-Audio level is set by an automatic gain control that is still being tuned, and on some signals it does not bring the level up far enough — turning the volume up does not help, because the volume control is not what is holding it back.
+All four audio level controls live in **Audio Settings** (settings drawer → Audio Settings), on their own rows under **RX Audio**:
 
-**Check which control you are actually on first.** The sliders marked **Volume** — in Resource Management and in the Advanced pane — stop at 100, and turning them to 100 is *not* the same as turning the gain up. They are two different things, and reaching the end of the volume slider does not mean you have run out of level.
+| Control | Range | Default | What it does |
+|---|---|---|---|
+| **RX Volume** | 0 – 100 | 60 | Output level to the speaker or headphones. |
+| **AGC Ceiling** | 50 – 1500 | 200 | How far the AGC may lift a *weak* signal. Raise it if quiet stations stay quiet. |
+| **AGC Attack** | 1 – 50 ms | 3 ms | How fast the gain comes *down* when a signal arrives. Shorter catches sharp CW edges; too short can sound clipped. |
+| **AGC Release** | 10 – 500 ms | 150 ms | How fast the gain comes back *up* afterwards. Longer is steadier on CW; shorter follows speech better. |
 
-The control that decides how hard weak signals are lifted is **Gain**:
+All four are remembered across restarts and travel in a config backup.
 
-| | |
-|---|---|
-| **Where** | Long-press the top bar on the Panadapter page to open **Resource Management**, then the **RX Audio** line |
-| **Range** | 50 to 800 |
-| **Default** | 200 |
+**AGC presets.** Four buttons under the sliders set the timing in one tap:
 
-Turn it up if a signal is quieter than it should be. Several operators run it around 380. It is remembered across restarts and travels in a config backup.
+| Preset | Attack | Release | For |
+|---|---|---|---|
+| **Fast** | 1 ms | 30 ms | CW |
+| **Med** | 3 ms | 150 ms | general, and the shipped default |
+| **Slow** | 5 ms | 400 ms | SSB, where a fast release pumps on speech pauses |
+| **Off** | — | — | no automatic gain at all |
+
+Move either slider and the caption reads **Custom** — the sliders *are* the
+custom setting, so there is no fifth button.
+
+**Off is a real bypass, not a very slow AGC.** The gain follows the signal at
+every attack and release value, so no combination of the sliders switches it
+off. With **Off** selected the gain is pinned at **AGC Ceiling**, and that
+slider becomes a plain manual gain control.
+
+⚠ **What to expect when you try them.** The AGC only starts regulating once a
+signal is strong enough; below that it already sits at the ceiling, so the gain
+is the same number whether the AGC is on or off. On a quiet band **every preset
+correctly sounds identical** — the difference is heard in how fast the noise
+returns between signals when the band is busy. The attack values (1–5 ms) are
+all far quicker than the ear resolves; **Release** is the audible one.
+
+**Volume and Ceiling are not the same thing.** Volume sets how loud the output is; Ceiling decides how hard a weak signal is lifted before it gets there. Running Volume to 100 does not mean you have run out of level — if it is still too quiet, raise **AGC Ceiling**.
+
+### What changed in v1.16.3
+
+- **AGC Ceiling was called "Gain".** The name was wrong: it never was a plain gain, it is the ceiling on the AGC's own weak-signal boost, and calling it Gain led people to look for an AGC that was already there. Its range also went up from 800 to 1500, because the Tab5's internal speaker wants more headroom than the old ceiling allowed.
+- **Attack and Release are new** — the AGC's timing was fixed before, and is now yours to set.
+- **Presets arrived in v1.16.5** *(Samuel W7STF)*, along with a genuine **Off**.
+- **RX Volume moved here from the settings drawer**, and the drawer's RX Audio section is gone entirely. That includes its on/off box: **Audio Settings is now the only place to switch RX audio on or off.**
+
+### What changed in v1.16.4
+
+- **The window is called Audio Settings**, and it has a door of its own in the
+  settings drawer. The top-bar long-press still works.
+- **Headphones mute the internal speaker** automatically.
 
 ## Strong signals
 
-A peak limiter sits after the automatic gain, so a loud station cannot arrive at full scale and startle you in headphones. It holds the peaks down and leaves the average level alone, which means turning **Gain** up to hear weak stations does not make the strong ones painful.
+A peak limiter sits after the automatic gain, so a loud station cannot arrive at full scale and startle you in headphones. It holds the peaks down and leaves the average level alone, which means raising **AGC Ceiling** to hear weak stations does not make the strong ones painful.
 
-This is the part of the beta I most want reports on: which mode, roughly how strong the signal was, and whether more gain fixed it.
+This is the part of the beta I most want reports on: which mode, roughly how strong the signal was, and whether more ceiling fixed it.
 
-## Future Work — Web Audio (IQ Streaming)
+## Where the receive signal comes from (new in v1.17.0)
 
-The next phase will stream **I/Q channels only** from the Tab5 to a PC browser, allowing the browser's own CPU to do the audio processing locally. This approach:
+Until now the panadapter always listened to the **radio's USB audio**. There is now a
+**receive source** selector, on the Tab5 and in the browser, with a level meter and a
+clip indicator beside it.
+
+| Source | State |
+|---|---|
+| **QMX USB** | The default, and what every earlier release did. |
+| **Line in (3.5 mm jack)** | **Declared beta** - see the warning below. |
+| Generic I/Q | Declared, not implemented. Selecting it is refused. |
+| Internal mics | Declared, not implemented. Selecting it is refused. |
+
+**Line in** *(asked for by Tony, @tony1tf, in issue #17)* feeds the panadapter from the
+Tab5's own 3.5 mm headphone jack instead of the radio's USB. Tony ran a test build on his
+own Tab5 to find where the jack lands — the mic ring arrives on the audio chip's third
+channel — which is the measurement the whole feature rests on. The jack is a single real audio channel, not I/Q, so the second
+channel is synthesised: a 255-tap filter builds the quadrature pair the decoders need.
+The jack wiring is drawn on screen so you can see which contact carries what.
+
+⚠ **No signal has been decoded through line in yet.** The path runs, samples flow and
+the levels read correctly with nothing plugged in - that is the whole of what has been
+verified. Treat it as unfinished. Changing the source needs a restart, and the Tab5
+does the restart itself when you press **Save**.
+
+⛔ **In line-in mode the USB radio connection is off by design.** One or the other, not
+both - so CAT, the S-meter and the band/mode display go quiet while line in is
+selected.
+
+## Not implemented: audio in the browser
+
+Audio does **not** reach the web page in this release, and there is no date for it. The
+shape it would take is to stream **I/Q channels only** to the browser and let the PC's own
+CPU do the audio work, because:
 
 - **Reduces Tab5 load** — the device sends raw I/Q data (~768 kbps at 48 kHz stereo), no processing
 - **Offloads processing to the PC** — your computer does the heavy lifting
 - **Allows richer audio features** — filtering, EQ, advanced separation, and recording
 - **Works with any audio software** — your browser runs the decoder
 
-Timeline: **After v1.16.0**, pending real-world feedback on the current implementation.
+Timeline: pending real-world feedback on the current implementation.
 
 ## Feedback
 
