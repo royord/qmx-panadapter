@@ -25,6 +25,23 @@ static const char *TAG = "cpu";
 // one-frame blink is an accepted cost of invoking it.
 #define CPU_STATS_PERIOD_MS  10000
 
+/* Latest sample, published for the on-screen readout (operator 2026-10-15:
+ * "add to the view the CPU utilization, near the time"). Written only here,
+ * read only by cpu_stats_get_idle() - two statics, no lock, no allocation. The
+ * writer is a 10 s task and the reader is the 1 Hz status task, so a torn or
+ * stale read is harmless: the numbers are a 10 s average anyway, which is why
+ * the sequence number exists (below) rather than a mutex. */
+static volatile uint16_t s_idle0_tenths = 0;
+static volatile uint16_t s_idle1_tenths = 0;
+static volatile uint32_t s_idle_seq      = 0;   /* 0 = never sampled yet */
+
+void cpu_stats_get_idle(uint16_t *tenths0, uint16_t *tenths1, uint32_t *seq)
+{
+    if (tenths0) *tenths0 = s_idle0_tenths;
+    if (tenths1) *tenths1 = s_idle1_tenths;
+    if (seq)     *seq     = s_idle_seq;
+}
+
 static void cpu_stats_task(void *arg)
 {
     (void)arg;
@@ -48,6 +65,9 @@ static void cpu_stats_task(void *arg)
                 uint32_t p1 = (uint32_t)(((uint64_t)(i1 - prev_idle1) * 1000) / dt);
                 if (p0 > 1000) p0 = 1000;
                 if (p1 > 1000) p1 = 1000;
+                s_idle0_tenths = (uint16_t)p0;
+                s_idle1_tenths = (uint16_t)p1;
+                s_idle_seq++;
                 // fps alongside idle, because they answer different questions and
                 // only one of them is what the operator actually perceives. Both
                 // are O(1) counter reads - no heap or stack walk - so this stays

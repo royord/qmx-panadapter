@@ -3,6 +3,7 @@
 #include "util/pan_view.h"
 #include "util/format_freq.h"   // #302: ONE frequency format
 #include "util/freq_gridlines.h"
+#include "util/cpu_stats.h"   // latest per-core idle sample, for the bottom-bar CPU readout
 #include "ui_theme.h"
 #include "gps_status_view.h"   // tapping the UTC field opens the GPS page
 #include "cw_decode.h"   /* the QMX decodes CW itself; this just shows it */
@@ -212,6 +213,68 @@ static float s_zoom_factor    = 1.0f;
 static int   s_pan_offset_bins = 0;
 static lv_obj_t *s_zoom_label  = NULL;  // top bar zoom indicator
 static lv_obj_t *s_zoom_popup  = NULL;  // zoom preset dropdown panel
+
+/* ---- auto-recentre after a touch-pan (operator, 2026-10-15) --------------
+ *
+ * "Always keep the frequency centered in the monitor, if I touch to focus to a
+ * different location that's fine - 2 second delay and then center." Band changes
+ * stay as they are; he confirmed that behaviour is good. So this is ONLY about
+ * the touch-pan peek, and only in STILL mode - the one mode where a swipe moves
+ * the view instead of retuning (in centred mode the drag strolls and settles by
+ * RETUNING, so there is no pan left behind to undo; see the release handler).
+ *
+ * ⚠ WHY IT RESTORES A CAPTURED "HOME" RATHER THAN WRITING 0.
+ * In still mode the pan is not decoration - still_view_follow_dial() walks it so
+ * the view holds still while the capture window slides under it, so s_sv_pan_hz is
+ * normally some non-zero value that is CORRECT for the current dial. Writing 0
+ * would slam the view to a dial-centred frame the operator never asked for and
+ * fight the tracking. So the pan in effect the instant the peek began is captured
+ * once (s_pan_home_hz), held for the whole peek however many gestures it takes,
+ * and restored. That is literally "go back to where you were before you touched",
+ * which is a re-centre without inventing a second definition of centred.
+ *
+ * ⛔ The home is captured only on the FIRST gesture of a peek. Re-capturing on
+ * each gesture would make the second peek of a peeked-at view restore the PEEK -
+ * so the view would ratchet further off centre every two seconds instead of
+ * returning.
+ */
+#define PAN_RECENTRE_MS 2000
+static int64_t s_pan_recentre_at_us = 0;   /* esp_timer deadline; 0 = not armed */
+static int64_t s_pan_home_hz        = 0;   /* pan to return to */
+static int64_t s_pan_peek_end_hz    = 0;   /* pan the peek left behind */
+static bool    s_pan_peeking        = false;
+
+static void pan_recentre_disarm(void)
+{
+    s_pan_recentre_at_us = 0;
+    s_pan_peeking        = false;
+}
+
+/* Called when a gesture BEGINS to pan: capture the home on the first one and
+ * push the deadline out on every one, so a long drag never has the view yanked
+ * out from under the finger. */
+static void pan_recentre_note_gesture(void)
+{
+    if (!s_pan_peeking) {
+        s_pan_home_hz = ui_get_pan_offset_hz();
+        s_pan_peeking = true;
+    }
+    s_pan_recentre_at_us = esp_timer_get_time() + (int64_t)PAN_RECENTRE_MS * 1000;
+}
+
+/* Called when a gesture COMMITS a pan, so the tick can tell "the peek is still
+ * sitting there" from "something else has legitimately re-framed the view
+ * since" - see the guard in pan_recentre_tick_cb(). */
+static void pan_recentre_note_commit(int64_t end_hz)
+{
+    s_pan_peek_end_hz = end_hz;
+    pan_recentre_note_gesture();
+}
+
+/* Defined down beside stroll_cancel(), which is where the pan statics and
+ * sv_apply_pan_hz() are all in scope; forward-declared here because ui_init()
+ * creates its timer with it. */
+static void pan_recentre_tick_cb(lv_timer_t *t);
 
 // Top-bar Band/Mode/BW/Freq/Zoom hit-zones (see hit_zones[] in ui_init): each
 // spans the top of the screen as a direct child of `scr`, foregrounded above
@@ -2569,6 +2632,12 @@ static lv_obj_t *s_bot_left   = NULL;
 static lv_obj_t *s_bot_batt_icon = NULL;  /* battery glyph, colored by charge level */
 static lv_obj_t *s_bot_batt_slash = NULL; /* red diagonal stroke over the glyph when no pack is attached */
 static lv_obj_t *s_bot_center_suffix = NULL;
+/* CPU utilization readout, sits immediately left of the UTC clock. Refreshed
+ * from cpu_stats' 10 s sample - see ui_set_bottom_clock(), which is where it
+ * runs, and the seq guard there. */
+static lv_obj_t *s_bot_cpu = NULL;
+static uint32_t s_bot_cpu_seq = 0;      /* last cpu_stats sample drawn */
+static char     s_bot_cpu_txt[16] = ""; /* last string drawn, to skip no-op writes */
 
 /* X span of the UTC field in the bottom bar, recorded when it is laid out.
  * The tap is arbitrated by x inside bottom_edge_swipe_cb() - see the note at
@@ -4260,13 +4329,9 @@ void ui_set_iq_mode_warning(bool active)
     }
 }
 
-static void iq_warn_banner_keepalive_cb(lv_timer_t *t)
-{
-    (void)t;
-    if (!s_iq_warn_active || !s_iq_warn_banner) return;
-    if (reader_view_is_active()) return;   // don't draw over the docs Reader
-    lv_obj_move_foreground(s_iq_warn_banner);
-}
+/* The I/Q warning banner's keepalive moved into banner_keepalive_cb() below -
+ * one timer for all three, in a fixed order. See the note there for why the
+ * three separate 1 Hz timers could not hold the top. */
 
 // ---- I/Q test-tone generator: the "it is running" banner --------------------
 //
@@ -4281,13 +4346,10 @@ static void iq_warn_banner_keepalive_cb(lv_timer_t *t)
 // modals are screen children too and would otherwise cover it.
 static lv_obj_t *s_siggen_banner = NULL;
 
-static void siggen_banner_keepalive_cb(lv_timer_t *t)
-{
-    (void)t;
-    if (!rx_audio_siggen_is_on() || !s_siggen_banner) return;
-    if (reader_view_is_active()) return;   // don't draw over the docs Reader
-    lv_obj_move_foreground(s_siggen_banner);
-}
+/* Keepalive moved into banner_keepalive_cb() below - one timer for all three
+ * banners, in a fixed order. The operator's 2026-10-15 report ("tap here to
+ * stop" not in the top layer while being prompted for other things) was this
+ * banner being buried by anything that climbs on a text change. */
 
 /* Show/hide the running banner AND keep the drawer's switch agreeing with it.
  * Two entry points take the generator down - this banner's tap (any page, even
@@ -4332,12 +4394,45 @@ static void siggen_banner_tap_cb(lv_event_t *e)
 // to leave it.
 static lv_obj_t *s_pause_banner = NULL;
 
-static void pause_banner_keepalive_cb(lv_timer_t *t)
+/* ---- ONE keepalive for all three banners, and why it has to be one --------
+ *
+ * These were three separate 1000 ms timers, each calling lv_obj_move_foreground()
+ * on itself. That is a race with three losers: LVGL draws a parent's children in
+ * CREATION order, so the banner whose timer happened to run last owned the top
+ * and the other two were buried for up to a second. The operator's report
+ * (2026-10-15) - the siggen "tap here to stop" banner "isn't in the top layer
+ * when it's being displayed and I'm being prompted for other things" - is that
+ * race, and also something the three-timer arrangement could not fix on its own:
+ *
+ * ⛔ THE PERIOD WAS THE ACTUAL BUG, NOT ONLY THE RACE. Anything that raises
+ * itself when its text changes climbs over everything built before it. The CW
+ * decode strip does exactly that, and its own note says so - it "keeps climbing"
+ * - and a KX3 whose dial is drifting rewrites the frequency text a couple of
+ * times a second. So each of those climbs buried a 1 Hz banner for a full
+ * second afterwards. No amount of three-way arbitration fixes a one-second hole;
+ * the hole is the cadence.
+ *
+ * One timer, 200 ms, fixed order. The order removes the race outright, and 200 ms
+ * turns a second-long hole into one the eye reads as instant. Cost when nothing
+ * is active is three NULL/boolean tests five times a second.
+ *
+ * Precedence, bottom to top: I/Q warning, then "release the radio", then the
+ * I/Q test tone. The tone is last because it is the operator's explicit ask and
+ * the only one of the three with a tap affordance on it. If a different order is
+ * wanted it is this one list - nothing else depends on it. */
+static void banner_keepalive_cb(lv_timer_t *t)
 {
     (void)t;
-    if (!s_pause_banner || !cat_user_pause_active()) return;
-    if (reader_view_is_active()) return;   // don't draw over the docs Reader
-    lv_obj_move_foreground(s_pause_banner);
+    /* None of the three draws over the docs Reader - unchanged from the three
+     * separate callbacks, which each returned early for the same reason. */
+    if (reader_view_is_active()) return;
+
+    if (s_iq_warn_active && s_iq_warn_banner)
+        lv_obj_move_foreground(s_iq_warn_banner);
+    if (s_pause_banner && cat_user_pause_active())
+        lv_obj_move_foreground(s_pause_banner);
+    if (s_siggen_banner && rx_audio_siggen_is_on())
+        lv_obj_move_foreground(s_siggen_banner);
 }
 
 static void pause_banner_tap_cb(lv_event_t *e)
@@ -6534,6 +6629,33 @@ static void build_bottom_bar(lv_obj_t *parent)
         lv_obj_set_style_text_font(s_bot_center_suffix, font, 0);
         lv_obj_align(s_bot_center_suffix, LV_ALIGN_LEFT_MID, x0 + clock_w, 0);
 
+        /* CPU utilization, immediately left of the clock (operator 2026-10-15:
+         * "add to the view the CPU utilization, near the time"). Right-aligned
+         * to the clock's left edge, so it sits against the time and cannot move
+         * when the digits change.
+         *
+         * ⚠ IT SHOWS UTILIZATION; THE LOG SHOWS IDLE. Same measurement, two
+         * conventions, and cpu_stats' own header calls idle% the headline
+         * number - so "CPU 86/31%" here means "86% of core 0 is BUSY", the
+         * opposite sign of "idle0 14% idle1 69%". Printing idle under the word
+         * CPU would mislead anyone who has read the diag log.
+         *
+         * Both cores, because they are not interchangeable: core 0 carries
+         * LVGL, the renderer and the audio path and is the one that saturates,
+         * while core 1 usually idles high. One number would hide which core
+         * hurt.
+         *
+         * The left zone (s_bot_left at LEFT_MID 44) is where this would
+         * normally collide, but ui_set_bottom_left() has no callers at all, so
+         * that space is empty. Kept clear of it deliberately rather than using
+         * it, so the day someone wires that zone up this cannot silently land
+         * on top of it. */
+        s_bot_cpu = lv_label_create(bar);
+        lv_label_set_text(s_bot_cpu, "CPU --/--%");
+        lv_obj_set_style_text_color(s_bot_cpu, lv_color_hex(UI_COLOR_TEXT_SECONDARY), 0);
+        lv_obj_set_style_text_font(s_bot_cpu, &lv_font_montserrat_20, 0);
+        lv_obj_align(s_bot_cpu, LV_ALIGN_RIGHT_MID, -(DISPLAY_H_RES - x0) + 16, 0);
+
         /* The UTC field is a tap target for the GPS page - but NOT as an
          * object of its own.
          *
@@ -7733,7 +7855,6 @@ void ui_init(lv_display_t *disp)
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
         lv_obj_center(lbl);
     }
-    lv_timer_create(iq_warn_banner_keepalive_cb, 1000, NULL);
 
     // "I/Q test tone running" banner (see the block comment by the keepalive
     // above it: the visible-while-running guarantee + tap-to-stop). Amber so
@@ -7762,7 +7883,6 @@ void ui_init(lv_display_t *disp)
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
         lv_obj_center(lbl);
     }
-    lv_timer_create(siggen_banner_keepalive_cb, 1000, NULL);
 
     // "Radio released" banner (see ui_set_cat_paused). Same geometry and
     // keepalive as the IQ banner, deliberately a calm blue rather than the
@@ -7790,8 +7910,13 @@ void ui_init(lv_display_t *disp)
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_22, 0);
         lv_obj_center(lbl);
     }
-    lv_timer_create(pause_banner_keepalive_cb, 1000, NULL);
     lv_timer_create(osk_bt_retire_cb, 500, NULL);   /* #273 */
+
+    // One keepalive for the three status banners (I/Q warning, release-the-radio,
+    // I/Q test tone), 200 ms, raising them in a fixed order. Replaces three
+    // separate 1000 ms timers that raced each other for the top layer and left a
+    // full-second hole whenever something else climbed - see banner_keepalive_cb.
+    lv_timer_create(banner_keepalive_cb, 200, NULL);
     /* BLE keystrokes, applied on this thread - see ui_kbd_feed(). */
     s_kbd_q = xQueueCreate(32, sizeof(kbd_q_ev_t));
     lv_timer_create(kbd_q_drain_cb, 20, NULL);
@@ -7955,6 +8080,11 @@ void ui_init(lv_display_t *disp)
     // Pinch/pan polling timer: 50 ms, reads raw touch driver directly.
     lv_timer_create(pinch_poll_cb, 50, NULL);
 
+    // Auto-recentre after a touch-pan (operator 2026-10-15). 250 ms is coarse on
+    // purpose: the deadline is 2 s, the callback is a few integer compares when
+    // nothing is armed, and a display move does not want 50 ms cadence.
+    lv_timer_create(pan_recentre_tick_cb, 250, NULL);
+
     // Display sleep (#34): 1 Hz idle check against the persisted timeout.
     {
         qmx_settings_t scfg;
@@ -7991,8 +8121,58 @@ static void stroll_apply_offset(int off)
  * drawer opening, or the page changing under it. Before this the pan was
  * simply frozen: its tooltip stayed on screen and the next finger-lift settled
  * it, which in centred mode RETUNES the radio. */
+/* Auto-recentre tick. Runs on the LVGL task, so it may move the zoom/pan state
+ * directly like every other UI callback here.
+ *
+ * ⛔ IT MUST NOT FIRE MID-GESTURE. A finger still down on the spectrum means the
+ * operator is aiming, and slamming the view back under their finger is worse than
+ * not recentring at all - so an active gesture pushes the deadline out instead.
+ * The three flags are the ones the pan handler already maintains:
+ * s_touch_on_spectrum = "finger down anywhere on the spectrum", s_stroll_active
+ * = "panning right now", s_tune_mode_locked = "a dwell armed a tune, so the pan
+ * branch is not ours".
+ *
+ * Only still mode has a pan to undo (see the note at s_pan_home_hz), and only a
+ * pan that actually moved is worth a log line. */
+static void pan_recentre_tick_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (s_pan_recentre_at_us == 0) return;
+
+    if (s_touch_on_spectrum || s_stroll_active || s_tune_mode_locked) {
+        s_pan_recentre_at_us = esp_timer_get_time() + (int64_t)PAN_RECENTRE_MS * 1000;
+        return;
+    }
+    if (esp_timer_get_time() < s_pan_recentre_at_us) return;
+
+    /* ⚠ HAS SOMETHING ELSE RE-FRAMED THE VIEW SINCE? A band change, a zoom, or
+     * still_view_follow_dial() all move the pan legitimately, and the operator
+     * confirmed the tune/band-change behaviour is right. Yanking it back to a
+     * home captured before those would undo a correct re-frame - so a pan
+     * differing from what the peek left behind means this is no longer my peek.
+     * Stand down and leave it alone. */
+    if (ui_get_pan_offset_hz() != s_pan_peek_end_hz) {
+        pan_recentre_disarm();
+        return;
+    }
+
+    int64_t home = s_pan_home_hz;
+    pan_recentre_disarm();
+
+    if (!sv_effective() || ui_get_pan_offset_hz() == home) return;  /* nothing to do */
+
+    sv_apply_pan_hz(home);
+    dsp_set_zoom(s_zoom_factor, s_pan_offset_bins, ui_get_if_bin_shift(DSP_FFT_SIZE));
+    ESP_LOGI("pan", "auto-recentred to %lld Hz after %d ms",
+             (long long)home, PAN_RECENTRE_MS);
+}
+
 static void stroll_cancel(void)
 {
+    /* A gesture something else took over never committed a pan, so there is no
+     * peek to time out. Leaving it armed would restore a home captured for a
+     * pan that never happened. */
+    pan_recentre_disarm();
     if (s_stroll_active) {
         stroll_apply_offset(0);
         update_bandplan_strip(s_last_qmx_freq_hz);
@@ -8318,6 +8498,12 @@ static void pinch_poll_cb(lv_timer_t *t)
                      * phase 3, and the reason panning is now worth having. */
                     ESP_LOGI("pinch", "still pan: %lld -> %lld Hz (span %ld)",
                              (long long)s_stroll_start_pan, (long long)want, (long)span);
+                    /* Operator 2026-10-15: a touch-pan is a peek. It gets
+                     * PAN_RECENTRE_MS to be looked at, then the view returns to
+                     * where it was. Re-armed here (not only at pan start) so the
+                     * clock measures from the END of the gesture, not its start -
+                     * a 3 s drag must still get its full 2 s of being looked at. */
+                    pan_recentre_note_commit(want);
                 }
                 s_stroll_active = false;
                 s_pan_start_x = 0;
@@ -8415,6 +8601,7 @@ static void pinch_poll_cb(lv_timer_t *t)
                 s_stroll_start_hz  = (int64_t)s_last_qmx_freq_hz;
                 s_stroll_target_hz = (int64_t)s_last_qmx_freq_hz;
                 s_stroll_start_pan = ui_get_pan_offset_hz();   /* #298 phase 4 */
+                pan_recentre_note_gesture();  /* capture home + defer the recentre */
                 s_pinch_mid_x      = lx0;
                 s_target_x = -1;  // Clear cyan line when pan activates
                 if (s_tune_tooltip) lv_obj_add_flag(s_tune_tooltip, LV_OBJ_FLAG_HIDDEN);
@@ -10539,6 +10726,44 @@ void ui_set_bottom_clock(int h, int m, int s, bool valid, const char *suffix)
         }
         if (s_bot_center_suffix && suffix)
             lv_label_set_text(s_bot_center_suffix, suffix);
+
+        /* CPU utilization, same 1 Hz pass as the clock so it costs no second
+         * display lock - but redrawn only when cpu_stats has a NEW sample.
+         *
+         * ⛔ THE SEQ GUARD IS THE POINT, NOT AN OPTIMISATION. The sampler runs
+         * every 10 s; this runs every 1 s. Without the guard the label would
+         * rewrite the same digits nine times out of ten, which looks exactly
+         * like a live meter and reads as though the number were current. With
+         * it the number only changes when it is a fresh measurement - so the
+         * display is honest about being a 10 s average, and a change is always
+         * a real update. */
+        if (s_bot_cpu) {
+            uint16_t t0 = 0, t1 = 0;
+            uint32_t seq = 0;
+            cpu_stats_get_idle(&t0, &t1, &seq);
+            if (seq == 0) {
+                /* No completed window yet (the first lands 10 s after boot).
+                 * Say so rather than drawing a confident 0%, which would read
+                 * as "both cores idle" - the opposite of the truth. */
+                if (strncmp(s_bot_cpu_txt, "CPU --/--%", 11) != 0) {
+                    lv_label_set_text(s_bot_cpu, "CPU --/--%");
+                    snprintf(s_bot_cpu_txt, sizeof(s_bot_cpu_txt), "CPU --/--%%");
+                }
+            } else if (seq != s_bot_cpu_seq) {
+                s_bot_cpu_seq = seq;
+                /* Utilization = 100 - idle, in whole percent. Clamped so a
+                 * counter that somehow exceeds 1000 tenths shows 100% instead
+                 * of a three-digit field that would resize the label. */
+                unsigned u0 = (t0 >= 1000) ? 100u : (unsigned)((1000u - t0) / 10u);
+                unsigned u1 = (t1 >= 1000) ? 100u : (unsigned)((1000u - t1) / 10u);
+                char buf[16];
+                snprintf(buf, sizeof(buf), "CPU %u/%u%%", u0, u1);
+                if (strncmp(buf, s_bot_cpu_txt, sizeof(s_bot_cpu_txt)) != 0) {
+                    lv_label_set_text(s_bot_cpu, buf);
+                    snprintf(s_bot_cpu_txt, sizeof(s_bot_cpu_txt), "%s", buf);
+                }
+            }
+        }
         display_unlock();
     }
 }

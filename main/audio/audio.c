@@ -982,6 +982,54 @@ static esp_err_t open_and_start(uint8_t addr, uint8_t iface_num)
     s_dropped_this_period = 0;
     s_flat_reset_pending = true;
 
+    /* ⛔ THE CAPTURE GAIN WAS NEVER SET, AND ON AN ANALOG I/Q SOURCE THAT IS THE
+     * WHOLE PICTURE.
+     *
+     * uac_host exposes a volume control (uac_host_device_set_volume /
+     * _get_volume / _get_volume_db) and this file called none of them, so the
+     * I/Q source has always run at whatever the device's power-on default is.
+     * For a digital source that is harmless - a QMX's samples are already
+     * full-scale-ish. For the KX3's ANALOG I/Q off the line-in it is not:
+     * measured on the bench 2026-10-15, a 077D:07AF stereo dongle streamed
+     * healthily at ~48k pairs/s while the sample peak was 4 of 32767 (~-88 dBFS),
+     * which is why the waterfall showed nothing at all. The same attenuation was
+     * visible on the Tab5's own siggen loopback through the same dongle (peak
+     * 7-12), so it is the capture gain and not the operator's signal path.
+     *
+     * LOGGED BEFORE AND AFTER rather than just set, because the two failures
+     * need different answers and the log has to tell them apart:
+     *   - no volume control at all (ESP_ERR_NOT_SUPPORTED) -> the level has to
+     *     come from somewhere else, so look at the jack and the source level;
+     *   - volume set fine but the peak still tiny -> no amount of gain will
+     *     help, because the signal is not reaching the input.
+     *
+     * 100, not a middling value: we want every count the converter can give,
+     * because the DSP can attenuate in software and cannot recover a signal the
+     * ADC never sampled. If the noise floor later proves too high, this is the
+     * one number to walk back - and it is a single call here, not a setting
+     * spread across the UI. */
+    {
+        uint8_t vol_before = 0;
+        esp_err_t vget = uac_host_device_get_volume(s_uac_dev, &vol_before);
+        ESP_LOGI(TAG, "I/Q source capture volume: %s (%u%%)",
+                 (vget == ESP_OK) ? "readable" : esp_err_to_name(vget),
+                 (unsigned)vol_before);
+        esp_err_t vset = uac_host_device_set_volume(s_uac_dev, 100);
+        if (vset == ESP_OK) {
+            uint8_t vol_after = 0;
+            if (uac_host_device_get_volume(s_uac_dev, &vol_after) == ESP_OK)
+                ESP_LOGI(TAG, "I/Q source capture volume set 100%% (reads back %u%%)",
+                         (unsigned)vol_after);
+            else
+                ESP_LOGI(TAG, "I/Q source capture volume set 100%%");
+        } else {
+            ESP_LOGW(TAG, "I/Q source has no usable volume control (%s) - an "
+                          "analog I/Q level that is this low is a wiring or "
+                          "source-level problem, not a gain one",
+                     esp_err_to_name(vset));
+        }
+    }
+
     ESP_LOGI(TAG, "UAC stream started: %lu Hz, %u ch, %u-bit",
              (unsigned long)s_sample_freq, s_channels, s_bit_res);
     return ESP_OK;

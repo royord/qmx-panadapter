@@ -266,10 +266,13 @@ static volatile char s_pending_mode_digit = 0;
 static char hamlib_mode_to_digit(const char *mode);  // forward declaration
 
 // Kenwood mode digit -> display string, and "is this digit a CW mode", both
-// radio-aware: the QMX and the KX3 disagree about what nearly every digit
-// means (QMX: 3=CW 4=FM 5=AM 6=DiGi 8=TUNE; KX3: 3=FM 4=AM 5=CW 6=DATA
-// 8=DATA-R). "DATA"/"DATA-R" are deliberately reported as "DiGi"/"DiGi-R" so
-// every consumer that keys FT8 on the string "DiGi" keeps working unchanged.
+// radio-aware: the QMX and the KX3 differ at 8 (QMX SWR Tune, KX3 DATA-R), and
+// that is now the ONLY digit they disagree about - 1=LSB 2=USB 3=CW 4=FM 5=AM
+// 6=DATA/FSK 7=CW-R on both. The KX3 was previously modelled as 3=FM 4=AM 5=CW,
+// which was wrong; measured on the bench 2026-10-15 (radio in CW, top bar read
+// FM, radio answered "MD3;"). "DATA"/"DATA-R" are deliberately reported as
+// "DiGi"/"DiGi-R" so every consumer that keys FT8 on the string "DiGi" keeps
+// working unchanged.
 static const char *mode_digit_to_str(char d);
 static bool mode_is_cw(char d);
 
@@ -1044,11 +1047,12 @@ static void process_cat_message(const char *msg, size_t len)
         return;
     }
 
-    // MD response: "MDn;" — Kenwood mode digit. The digit -> mode map is the
-    // radio's, not the protocol's: QMX uses 1=LSB 2=USB 3=CW 5=AM 6=FSK 7=CW-R
-    // 8=SWR Tune 9=FSK-R (see docs/qmx-1_04-cat-comparison.md), the KX3 uses
-    // 1=LSB 2=USB 3=FM 4=AM 5=CW 6=DATA 7=CW-R 8=DATA-R. mode_digit_to_str()
-    // holds the per-radio table.
+    // MD response: "MDn;" — Kenwood mode digit. Both radios now share the low
+    // digits - 1=LSB 2=USB 3=CW 4=FM 5=AM 6=DATA/FSK 7=CW-R - and differ only at
+    // 8/9: QMX 8=SWR Tune 9=FSK-R (see docs/qmx-1_04-cat-comparison.md), KX3
+    // 8=DATA-R. The KX3 was previously documented here as 3=FM 4=AM 5=CW, which
+    // was wrong (measured 2026-10-15: a KX3 in CW answered "MD3;").
+    // mode_digit_to_str() holds the per-radio table.
     if (len == 4 && msg[0] == 'M' && msg[1] == 'D') {
         char d = msg[2];
         if (d < '1' || d > '9') {
@@ -3793,16 +3797,27 @@ const char *cat_get_mode_str(void)
     return mode_digit_to_str(s_last_mode_digit);
 }
 
-/* Per-radio Kenwood mode digit -> display string. QMX: 3=CW 4=FM 5=AM
- * 6=DiGi 8=TUNE; KX3: 3=FM 4=AM 5=CW 6=DATA 8=DATA-R. The KX3's "DATA" and
- * "DATA-R" are reported as "DiGi"/"DiGi-R" on purpose: every consumer in this
- * firmware (FT8 TX gating, the spot lane, rigctld) keys on "DiGi". */
+/* Per-radio Kenwood mode digit -> display string. Both radios: 3=CW 4=FM 5=AM
+ * 6=DATA 7=CW-R; they differ at 8 (QMX SWR Tune, KX3 DATA-R) and 9. The KX3's
+ * "DATA" and "DATA-R" are reported as "DiGi"/"DiGi-R" on purpose: every consumer
+ * in this firmware (FT8 TX gating, the spot lane, rigctld) keys on "DiGi". */
 static const char *mode_digit_to_str(char d)
 {
     if (d < '1' || d > '9') return "";
     if (radio_get_kind() == RADIO_KX3) {
+        /* ⛔ THE KX3 USES THE SAME KENWOOD DIGITS AS EVERY OTHER KENWOOD/
+         * ELECRRAFT RADIO. This table used to say 3=FM 4=AM 5=CW, and it was
+         * WRONG. Measured on the bench 2026-10-15 - radio in CW, top bar reading
+         * FM: the KX3 answered "MD3;", so 3 is CW. The only reading consistent
+         * with both that measurement and the Kenwood convention every other digit
+         * already followed (1=LSB 2=USB ...) is the one below; the permutation
+         * that was here matches no convention. See mode_is_cw() for the three
+         * separate behaviours that one wrong table was also breaking.
+         *
+         * The KX3 differs from the QMX only at 8, where the QMX has SWR Tune and
+         * the KX3 has DATA-R. */
         static const char *const kx3[] = {
-            "?", "LSB", "USB", "FM", "AM", "CW", "DiGi", "CW-R", "DiGi-R", ""
+            "?", "LSB", "USB", "CW", "FM", "AM", "DiGi", "CW-R", "DiGi-R", ""
         };
         return kx3[d - '0'];
     }
@@ -3812,20 +3827,31 @@ static const char *mode_digit_to_str(char d)
     return qmx[d - '0'];
 }
 
-/* Is this radio's Kenwood mode digit a CW mode? QMX: 3 and 7; KX3: 5 and 7. */
+/* Is this radio's Kenwood mode digit a CW mode? Both radios: 3 and 7.
+ *
+ * ⛔ THE KX3 ARM USED TO ANSWER '5' AND '7', AND THAT WAS WRONG - with three
+ * consequences beyond the wrong label on screen:
+ *   - cat_get_cw_offset_hz() is consulted only when mode_is_cw() says so, so a
+ *     KX3 actually in CW was treated as not-CW and its CW LO offset was never
+ *     applied - a real frequency error.
+ *   - That offset is also what ui_get_if_offset_hz() folds into the centre, so
+ *     the spectrum was centred as though the radio were in SSB. This is in the
+ *     same area as the operator's "the centre frequency is off to the edge"
+ *     report (2026-10-15) and is worth re-checking once this is on the bench.
+ *   - hamlib_mode_to_digit() is the TX direction: asking a KX3 for CW sent MD5,
+ *     which on the real digit map is AM. */
 static bool mode_is_cw(char d)
 {
-    if (radio_get_kind() == RADIO_KX3)
-        return d == '5' || d == '7';
     return d == '3' || d == '7';
 }
 
 // ---- Phase 9 (v0.9.6): setters used by rigctld_server -------------------
 
 // Map a Hamlib mode string (case-insensitive) to the ACTIVE radio's Kenwood
-// mode digit. Returns 0 for unknown. The digit map differs between the QMX
-// (3=CW 4=FM 5=AM 6=DiGi 8=TUNE) and the KX3 (3=FM 4=AM 5=CW 6=DATA
-// 8=DATA-R), so the same string has to land on the right digit per radio.
+// mode digit. Returns 0 for unknown. CW/AM/FM/LSB/USB/CW-R/DATA are the same
+// digit on both radios; only the reverse-digital and SWR-Tune digits differ
+// (QMX 9=FSK-R 8=TUNE, KX3 8=DATA-R and no TUNE), so the same string still has
+// to land on the right digit per radio.
 static char hamlib_mode_to_digit(const char *mode)
 {
     if (!mode) return 0;
@@ -3843,9 +3869,14 @@ static char hamlib_mode_to_digit(const char *mode)
     if (strcmp(buf, "CW-R") == 0 || strcmp(buf, "CWR") == 0)    return '7';
     if (strcmp(buf, "LSB")    == 0) return '1';
     if (strcmp(buf, "USB")    == 0) return '2';
-    if (strcmp(buf, "CW")     == 0) return kx3 ? '5' : '3';
-    if (strcmp(buf, "FM")     == 0) return kx3 ? '3' : '4';
-    if (strcmp(buf, "AM")     == 0) return kx3 ? '4' : '5';
+    /* CW/AM/FM are the SAME DIGITS ON BOTH RADIOS. The KX3 ternaries that used
+     * to be here (CW->'5', FM->'3', AM->'4') came from the same wrong table as
+     * mode_digit_to_str() and were measured wrong on 2026-10-15 - see the note
+     * there. In THIS direction the bug is worse than a label: a KX3 asked for CW
+     * would have been put in AM, and then keyed. */
+    if (strcmp(buf, "CW")     == 0) return '3';
+    if (strcmp(buf, "FM")     == 0) return '4';
+    if (strcmp(buf, "AM")     == 0) return '5';
     // Reverse digital modes: QMX 9 = FSK-R; KX3 8 = DATA-R.
     if (strcmp(buf, "FSK-R")  == 0 || strcmp(buf, "RTTYR") == 0 ||
         strcmp(buf, "DIGI-R") == 0 || strcmp(buf, "PKTLSB") == 0)

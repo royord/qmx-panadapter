@@ -54,6 +54,13 @@ const char *cat_get_mode_str(void);
  *   CW-R/CWR=7, FSK-R/DIGI-R/RTTYR=9.
  * Anything unrecognised returns ESP_ERR_INVALID_ARG.
  *
+ * Digits 1-7 are the same on the QMX and the KX3 - and this list was RIGHT about
+ * that while the code's KX3 branch was not: it had the KX3 as 3=FM 4=AM 5=CW,
+ * measured wrong on 2026-10-15 (a KX3 in CW answers "MD3;"). Fixed, and the
+ * disagreement now is only at the top: DiGi-R/FSK-R is digit 9 on the QMX and
+ * digit 8 on the KX3 (whose 8 the QMX spends on SWR Tune), and "TUNE" is
+ * rejected outright for a KX3, which has no MD measure mode.
+ *
  * Shares the 200 ms TX rate-limit with cat_set_frequency().
  *
  * @param mode  Hamlib mode string (case-insensitive)

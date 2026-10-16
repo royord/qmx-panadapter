@@ -31,6 +31,25 @@ extern "C" {
 // every ~71 min; unsigned delta arithmetic makes that harmless.
 esp_err_t cpu_stats_init(void);
 
+/* The latest per-core IDLE sample, for the on-screen CPU readout.
+ *
+ * Values are in TENTHS of a percent (855 == 85.5% idle), clamped to 0..1000,
+ * and describe the last COMPLETED CPU_STATS_PERIOD_MS window - not "now". A
+ * caller that repaints faster than that must use the sequence number, or it
+ * will redraw the same digits as though they were fresh.
+ *
+ * @param tenths0  out: core 0 idle, tenths of a percent (may be NULL)
+ * @param tenths1  out: core 1 idle, tenths of a percent (may be NULL)
+ * @param seq      out: increments once per completed sample; 0 means none has
+ *                 been taken yet, which is the only time the numbers mean
+ *                 nothing. May be NULL.
+ *
+ * Cheap by construction: the sampler is O(1) counter reads (the whole reason
+ * v2 dropped uxTaskGetSystemState()), this is three plain loads, and there is
+ * deliberately no lock - the reader is displaying a 10 s average, for which a
+ * torn read is not a hazard. */
+void cpu_stats_get_idle(uint16_t *tenths0, uint16_t *tenths1, uint32_t *seq);
+
 #ifdef __cplusplus
 }
 #endif
