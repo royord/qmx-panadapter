@@ -35,9 +35,37 @@ Three live controls tune the effect mid-QSO without leaving the exchange, groupe
 
 !!! note "Which modes produce audio"
 
-    **CW, CW-R, USB and LSB only.** **AM is silent** — there is no AM
-    or FM demodulator yet, so listening to an AM station means putting the
-    radio in USB.
+    **CW, CW-R, USB, LSB and AM.** **FM is still silent** — there is no FM
+    demodulator, so an FM signal has to be listened to in USB or not at all.
+
+    AM is demodulated on the Tab5 itself, from the I/Q the radio sends, so the
+    bandwidth is set by the Tab5 and not by the filter in the radio. Tap **BW**
+    in the top bar to choose it: **2.0, 3.0, 4.0, 6.0, 8.0, 9.6, 10.0 or
+    20.0 kHz**, quoted as the width of the whole signal, the way amateur AM
+    figures always are. 6.0 kHz is the default and the standard — 3 kHz per
+    sideband, what most commercial rigs hard-code. The same list is on the
+    web page's **BW** button.
+
+    Go **narrower** when someone is sitting on top of you: 2.0 and 3.0 kHz
+    sound like a telephone line and that is the point, they keep a signal
+    copyable in heavy QRM. Go **wider** on a clear channel — 9.6 kHz carries a
+    broadcaster's full 4.5 kHz of audio. On a crowded shortwave evening prefer
+    8.0: broadcast channels are spaced 5 kHz, so 8.0 keeps a full 1 kHz clear
+    of the neighbour's carrier while 9.6 leaves only 200 Hz.
+
+    **10.0 kHz** is the legal maximum for amateur AM on HF. **20.0 kHz** is
+    for broadcast listening: it passes a station's full ±5 kHz of audio, which
+    is the best a shortwave broadcaster transmits. It is wider than the 5 kHz
+    channel spacing, so use it on a clear channel and expect the neighbour
+    when there is one.
+
+    The two wide settings are expensive. They run the receive chain at half
+    the decimation the other six use, and on the bench that takes the second
+    CPU core from about 25% idle to under 1%. The audio stays clean, but
+    there is no headroom left for anything else, so pick 10.0 or 20.0 kHz
+    when you want the bandwidth and drop back to 9.6 or below when you do
+    not. The six narrower widths cost exactly what they always did, and CW
+    and SSB are untouched at any setting.
 
 The three pan controls sit directly under the Binaural CW row in the same window. They stay greyed out until both boxes above are ticked, because they shape a split that is not being produced otherwise.
 
@@ -126,10 +154,11 @@ Audio and the panoramic split are not the same thing, and it is worth being clea
 |------|-------|----------------------------|
 | CW, CW-R | Yes | **Yes** |
 | USB, LSB | **Yes** | No — single channel, both ears the same |
+| AM | **Yes**, to about 3 kHz | No — AM has no stereo content to split |
 | DiGi | No | No |
-| AM, FM | No | No |
+| FM | No | No |
 
-So you **do** get audio on SSB; what you do not get there is the left/right split, because that is a CW feature. In DiGi and AM there is no audio at all yet — nothing is broken if you hear silence in those.
+So you **do** get audio on SSB and AM; what you do not get there is the left/right split, because that is a CW feature. In DiGi and FM there is no audio at all — nothing is broken if you hear silence in those.
 
 ## Known Limitations
 
@@ -197,7 +226,7 @@ A peak limiter sits after the automatic gain, so a loud station cannot arrive at
 
 This is the part of the beta I most want reports on: which mode, roughly how strong the signal was, and whether more ceiling fixed it.
 
-## Where the receive signal comes from (new in v1.17.0)
+## Where the receive signal comes from
 
 Until now the panadapter always listened to the **radio's USB audio**. There is now a
 **receive source** selector, on the Tab5 and in the browser, with a level meter and a
@@ -226,18 +255,36 @@ does the restart itself when you press **Save**.
 both - so CAT, the S-meter and the band/mode display go quiet while line in is
 selected.
 
-## Not implemented: audio in the browser
+## Listen in the browser
 
-Audio does **not** reach the web page in this release, and there is no date for it. The
-shape it would take is to stream **I/Q channels only** to the browser and let the PC's own
-CPU do the audio work, because:
+From **v1.20.0** the panadapter streams its own demodulated audio to any browser on
+your network. Open the web page and click the **▶** button at the top right, just to
+the right of **F**. It becomes a **■** while it is playing; click it again to stop.
 
-- **Reduces Tab5 load** — the device sends raw I/Q data (~768 kbps at 48 kHz stereo), no processing
-- **Offloads processing to the PC** — your computer does the heavy lifting
-- **Allows richer audio features** — filtering, EQ, advanced separation, and recording
-- **Works with any audio software** — your browser runs the decoder
+What you hear is exactly what the Tab5's own speaker gets — the same demodulated
+audio, tapped after the filter and the AGC — so the two can never disagree about what
+the radio is doing. It works even if the Tab5 booted with its speaker turned off.
 
-Timeline: pending real-world feedback on the current implementation.
+**The speaker and the browser are exclusive.** While a browser is listening the Tab5
+mutes its own speaker, and it hands the audio back when you stop listening or close the
+page. There is no setting for this: one listener at a time was the point.
+
+Only the modes the Tab5 demodulates produce audio: **CW, CW-R, USB, LSB and AM**. In any
+other mode the button lights up but nothing arrives, and hovering it says so.
+
+**Hover the ■ button for the health of the stream** — it reports frame gaps, re-primes
+and chunks dropped to clock drift. On a quiet network all three stay at zero.
+
+Notes on what this costs and what it does not:
+
+- It runs over the web page's existing connection, so it needs no extra port and no
+  extra setup.
+- It costs about **9 percentage points of one CPU core** — measured — and nothing
+  measurable on the core that serves the web page.
+- Audio is 12 kHz µ-law, which is a telephone-grade codec chosen because it survives a
+  lossy Wi-Fi link without a jitter buffer deep enough to be annoying.
+- **Only one browser gets the page at a time.** Opening the panadapter page in a second
+  browser takes the connection from the first, which takes the audio with it.
 
 ## Feedback
 

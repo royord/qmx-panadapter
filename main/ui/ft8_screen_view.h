@@ -59,6 +59,15 @@ void ft8_screen_view_request_cq(void);
 void ft8_screen_view_request_freetext(const char *text);
 void ft8_screen_view_freetext_result(char *out, size_t out_len);
 
+/* The JS8 macro buttons from the browser: 0 = SNR, 1 = GRID. Records the
+ * request only - both end in ft8_tx_arm() or js8_ftx_start(), which belong to
+ * the LVGL task, the same deferral as the free text above. The outcome lands
+ * in the same web-result line the page already shows.
+ *
+ * ⛔ THESE ARE THE ONLY WAY A JS8 REPORT LEAVES THIS STATION BY HAND NOW. A
+ * row click selects and transmits nothing - see js8_target.h. */
+void ft8_screen_view_request_js8_macro(int which);
+
 // CQ slot parity: -1 = any, 0 = EVEN only, 1 = ODD only. The Tab5's cycling
 // TXCQ button and the web page drive the SAME state - set is deferred to the
 // LVGL task, get is a plain read.
@@ -102,6 +111,19 @@ void ft8_screen_view_nudge_confirm(int delta);
  * Called from the view itself on a sub-mode change; exposed so anything else
  * that changes the sub-mode can keep the screen honest. */
 void ft8_screen_view_js8_tabs_refresh(void);
+
+/* Repaint the big MODE label. It names the JS8 SUBMODE when that is not
+ * Normal ("JS8 TURBO"), because a non-Normal submode decodes nothing from the
+ * Normal stations everyone runs and is persisted across reboots - Ryan KK6DZB
+ * lost JS8 entirely to it and the screen still said "MODE: JS8". Call it from
+ * anywhere that changes the submode: the drawer picker and /api/cmd. */
+void ft8_screen_view_refresh_mode_label(void);
+
+/* Flush the JS8 conversation from the browser - the Tab5 tab bar's Flush has
+ * always done this and the web page had no equivalent (Ryan KK6DZB,
+ * 2026-10-14). Records the request only; the LVGL tick clears and repaints,
+ * so both surfaces run the one code path. */
+void ft8_screen_view_request_js8_flush(void);
 
 /* Which JS8 pane is showing. Reported in /api/status so the capture and the
  * API can say what is on the screen without asking the operator. */

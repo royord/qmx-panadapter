@@ -33,6 +33,8 @@
 // info pane alongside "ME: <call> <grid>".
 #include "ft8_tx.h"
 #include "js8_ftx.h"
+#include "js8_submode.h"   /* the submode table and the one refusal rule */
+#include "js8_target.h"
 #include "ft8_qso.h"
 #include "ft8_hound.h"   // Fox/Hound: a tap at a Fox calls from the hound region
 #include "ft8_pileup.h"
@@ -633,6 +635,14 @@ static void row_activate_ex(int idx, bool direct);
 /* Defined with the JS8 panes, far below; the 1 Hz clock timer drives it. */
 static void conv_repaint(void);
 static void js8_tabs_apply(void);
+static bool js8_mode_now(void);
+/* The JS8 TX bar - the target chip and the SNR/GRID macro buttons. Defined
+ * with the JS8 panes; a row tap up here has to refresh it. */
+static void js8_tx_bar_sync(void);
+/* The two macro sends. Workers rather than callbacks, because the browser
+ * presses them too and needs the refusal text - see their definitions. */
+static bool js8_send_snr(char *out, size_t out_len);
+static bool js8_send_grid(char *out, size_t out_len);
 
 static void row_activate(int idx) { row_activate_ex(idx, false); }
 
@@ -650,6 +660,28 @@ static void row_activate_ex(int idx, bool direct)
 
     const char *call = lv_label_get_text(r->l_call);
     if (!call || !call[0]) return;
+
+    /* ⛔ IN JS8 A TAP SELECTS AND TRANSMITS NOTHING - not the modal, and
+     * not the long-press auto-pounce either. See js8_target.h for the two
+     * operator reports behind this; the short version is Ryan KK6DZB's, who
+     * held a real QSO: "anytime I would click on a call it would auto start
+     * sending the SNR which is not handy in this mode. Works in FT8 :) but not
+     * so much in JS8 Call."
+     *
+     * `direct` (the long press) is deliberately NOT an exception. It starts the
+     * full auto-sequencer, which is the one thing JS8 operators do not want
+     * happening without a press per message. The SNR and GRID buttons are the
+     * explicit sends, and the free-text box is addressed to this selection. */
+    if (js8_mode_now()) {
+        js8_target_set(call);
+        s_confirmed_row_idx = idx;
+        char tb[48];
+        snprintf(tb, sizeof(tb), "Working %s - SNR / GRID to send", call);
+        ui_toast(tb);
+        conv_repaint();          /* the pane filters to this station */
+        js8_tx_bar_sync();       /* the macro buttons and the target chip */
+        return;
+    }
 
     // A grey-listed station's row offers "Clear from grey-list" instead of
     // the TX modal (the auto pickers skip it; a manual pounce needs the
@@ -1283,6 +1315,20 @@ static void t_slotbar_cb(lv_timer_t *t)
 static void start_cq_run(bool interactive);          // defined below
 static volatile bool s_web_cq_pending;               // set from the HTTP task
 
+/* The MODE label repaint, raised from the drawer or the HTTP task and serviced
+ * on the LVGL task in this file's tick. Defined with mode_label() further
+ * down, next to the text it paints. */
+static volatile bool s_mode_label_dirty;
+static void mode_label_repaint(void);
+
+/* The browser's Flush. Ryan KK6DZB, 2026-10-14: "No flush button in the
+ * webUI?" - the Tab5 tab bar has had one since the JS8 page shipped and the
+ * page did not. Deferred rather than done on the HTTP task because
+ * js8_chat_clear() is a bare memset of a shared store and the repaint is
+ * LVGL's: doing it here makes the browser's Flush the SAME code path as the
+ * button, rather than a second one that races differently. */
+static volatile bool s_web_js8_flush_pending;
+
 /* JS8 free-text send requested from the browser. Same deferral as the CQ flag
  * and for the same reason: the HTTP task leaves the text behind and the 1 Hz
  * LVGL timer acts on it. The result travels back through /api/status, because
@@ -1290,6 +1336,9 @@ static volatile bool s_web_cq_pending;               // set from the HTTP task
 static char          s_web_ftx_text[256];
 static volatile bool s_web_ftx_pending;
 static char          s_web_ftx_result[64];
+/* The JS8 SNR/GRID macros from the browser. -1 = nothing pending, 0 = SNR,
+ * 1 = GRID. Same deferral and the same reason as the free text above. */
+static volatile int  s_web_js8_macro = -1;
 // Randy N4OPI: the web FT8 page had no way to choose the CQ slot parity, so a
 // browser operator could start a CQ but not say which window it went out in.
 // -2 = nothing pending. Same deferral as s_web_cq_pending: s_cq_parity and the
@@ -1354,16 +1403,15 @@ static volatile int s_web_override_pending;
 // repaints two labels, and it must run on taskLVGL. Same deferral as the CQ and
 // override requests: the HTTP task leaves a request, the 1 Hz timer performs it.
 // Packed rather than two variables so a half-applied request cannot be drained.
-/* The protocol a sub-mode means. ft8_test.c's ft8_op_mode_protocol() answers
- * for the mode we are IN; this answers for one we are about to ask for, which
- * is what the log lines below need. */
+/* The protocol a sub-mode means, for the log lines below.
+ *
+ * ⛔ THIS USED TO BE ITS OWN COPY OF ft8_op_mode_protocol()'s SWITCH, and the
+ * JS8 submodes are exactly what a duplicate like that gets wrong: the copy
+ * would have kept saying "JS8" while the operator had selected Turbo. The one
+ * implementation now lives in ft8_test.c and takes the mode as an argument. */
 static inline ftx_protocol_t mode_protocol(ft8_op_mode_t m)
 {
-    switch (m) {
-    case FT8_OP_MODE_FT4: return FTX_PROTOCOL_FT4;
-    case FT8_OP_MODE_JS8: return FTX_PROTOCOL_JS8;
-    default:              return FTX_PROTOCOL_FT8;
-    }
+    return ft8_op_mode_protocol_for(m);
 }
 
 static void apply_freq_preset(uint32_t freq_hz, ft8_op_mode_t mode, const char *src);   // defined below
@@ -1661,6 +1709,40 @@ static void t_clock_cb(lv_timer_t *t)
      * every slot, so 1 Hz is the right cadence - the 500 ms list refresh is
      * for the Stations table and does nothing here. */
     conv_repaint();
+    /* The selection can be made from the BROWSER too, so the chip and the two
+     * macro buttons are refreshed on the clock rather than only on a tap -
+     * the same "one piece of state, both surfaces" rule as cq_parity. */
+    js8_tx_bar_sync();
+
+    /* ⭐ SAY WHEN A FREE-TEXT RUN FINISHES. Ryan KK6DZB's complaint was that he
+     * "could not tell if it had transmitted my full message yet": the TX line
+     * simply vanished when the last frame landed, which reads exactly like a
+     * run that died halfway.
+     *
+     * Watched as an EDGE here rather than announced from js8_ftx.c, because
+     * the shared status line is overwritten by the decode loop within a second
+     * (measured - see the note there). These two homes persist: a toast, and
+     * the sticky web result that a completed QSO uses for the same reason.
+     *
+     * The total is remembered while the run is up, because js8_ftx zeroes the
+     * run the moment it completes and there would be nothing left to count. */
+    {
+        static bool s_ftx_was_active;
+        static int  s_ftx_last_total;
+        int sent = 0, total = 0;
+        bool now_active = js8_ftx_active(&sent, &total);
+        if (now_active) s_ftx_last_total = total;
+        if (s_ftx_was_active && !now_active && s_ftx_last_total > 0) {
+            char b[48];
+            snprintf(b, sizeof(b), "Free text sent - %d frame%s",
+                     s_ftx_last_total, s_ftx_last_total == 1 ? "" : "s");
+            ui_toast(b);
+            web_result_set_sticky("%s", b);
+            ESP_LOGI(TAG, "%s", b);
+            s_ftx_last_total = 0;
+        }
+        s_ftx_was_active = now_active;
+    }
 
     // Drain a web CQ request BEFORE the visibility gate below, so it is consumed
     // either way. If the FT8 view is not up there is nothing to run a CQ on, and a
@@ -1681,6 +1763,29 @@ static void t_clock_cb(lv_timer_t *t)
      * is active: one bool. */
     js8_ftx_tick();
 
+    /* The macro buttons, drained on this task because both of them arm the
+     * radio. Reuses the Tab5 button callbacks rather than copying what they
+     * do - one implementation of "send the report", one of "send the grid",
+     * whichever surface pressed it. */
+    if (s_web_js8_macro >= 0) {
+        int which = s_web_js8_macro;
+        s_web_js8_macro = -1;
+        if (!js8_mode_now()) {
+            web_result_set("Not in JS8 mode");
+        } else if (!js8_target_any()) {
+            web_result_set("Click a station first");
+        } else {
+            /* ⛔ REPORT WHAT HAPPENED, not that it was asked for. The arm can
+             * still be refused (busy, station aged out of the heard table, no
+             * grid set) and the browser operator is the one person who cannot
+             * see the radio - so the refusal is the message, verbatim. */
+            char msg[80];
+            bool ok = (which == 0) ? js8_send_snr(msg, sizeof(msg))
+                                   : js8_send_grid(msg, sizeof(msg));
+            web_result_set("%s%s", ok ? "" : "Refused: ", msg);
+        }
+    }
+
     if (s_web_ftx_pending) {
         s_web_ftx_pending = false;
         char err[64];
@@ -1691,6 +1796,22 @@ static void t_clock_cb(lv_timer_t *t)
             snprintf(s_web_ftx_result, sizeof(s_web_ftx_result), "sending");
         }
         s_web_ftx_text[0] = ' ';
+    }
+
+    /* The MODE label, repainted on the LVGL task - see
+     * ft8_screen_view_refresh_mode_label(). It names a non-Normal JS8 submode,
+     * which is the only thing on the screen that can explain why JS8 has
+     * stopped decoding. */
+    if (s_mode_label_dirty) {
+        s_mode_label_dirty = false;
+        mode_label_repaint();
+    }
+
+    if (s_web_js8_flush_pending) {
+        s_web_js8_flush_pending = false;
+        js8_chat_clear();
+        conv_repaint();
+        ESP_LOGI(TAG, "js8 conversation flushed by the browser");
     }
 
     if (s_web_cq_pending) {
@@ -2590,6 +2711,14 @@ void ft8_screen_view_request_cq(void)
     s_web_cq_pending = true;
 }
 
+/* The browser's Flush - same effect as the Tab5 tab bar's own, and no
+ * confirmation for the same reason: js8_chat is a DISPLAY store, the QSOs are
+ * in ADIF. See the note on tab_flush_cb(). */
+void ft8_screen_view_request_js8_flush(void)
+{
+    s_web_js8_flush_pending = true;
+}
+
 /* JS8 free text from the browser. Only records the request - the 1 Hz LVGL
  * timer starts it, because js8_ftx_start() encodes and arms, and neither
  * belongs on the HTTP task. */
@@ -2599,6 +2728,12 @@ void ft8_screen_view_request_freetext(const char *text)
     snprintf(s_web_ftx_text, sizeof(s_web_ftx_text), "%s", text);
     s_web_ftx_result[0] = ' ';
     s_web_ftx_pending = true;
+}
+
+void ft8_screen_view_request_js8_macro(int which)
+{
+    if (which != 0 && which != 1) return;
+    s_web_js8_macro = which;
 }
 
 /* What became of it, for /api/status. "" until the timer has acted. */
@@ -2889,13 +3024,186 @@ static uint32_t mode_accent_hex(ft8_op_mode_t mode)
     }
 }
 
+/* ⛔ IN JS8 THIS LABEL ALWAYS NAMES THE SPEED, Normal included. The submode
+ * is a different physical layer - slot period, symbol rate, tone spacing, sync
+ * arrays - so a station on Turbo decodes NOTHING from the Normal stations
+ * everyone else runs, and it is persisted in NVS, so it survives a reboot and
+ * a power cycle. This label said "MODE: JS8" whatever was set.
+ *
+ * Ryan KK6DZB, 2026-10-14, after the webUI submode picker shipped: "I could
+ * hear activity but no more decodes... Rebooted tab5 and qmx. STILL NO MORE
+ * DECODES... FT8 still works." He had also asked, in the same message, where
+ * the speed control was on the Tab5 - so he had no way to see what was set or
+ * to put it back.
+ *
+ * ⚠ THE FIRST CUT SHOWED THE SPEED ONLY WHEN IT WAS NOT NORMAL, which still
+ * leaves an operator unable to confirm the speed is right - absence of a word
+ * is not a reading. The operator asked for it on every submode.
+ *
+ * ⭐ WIDTHS ARE MEASURED, from lv_font_montserrat_48.c's own adv_w table
+ * against the 288 px of left-pane content (LEFT_W 320 less 2x16 padding):
+ *
+ *     MODE: JS8   267.1 px      JS8 TURBO   275.9 px
+ *     MODE: FT8   271.4 px      JS8 SLOW    251.0 px
+ *     JS8 NORM    258.3 px      JS8 FAST    221.9 px
+ *     JS8 NORMAL  321.9 px  <-- DOES NOT FIT, hence NORM
+ *
+ * ⛔ An earlier version of this comment claimed the submode text is "never
+ * longer than MODE: JS8". It is not: JS8 TURBO is 9 px wider. Both fit, so
+ * nothing broke, but the claim was a guess and this table is not.
+ *
+ * ftx_protocol_label(), not ftx_protocol_name(): the latter must keep saying
+ * plain "JS8" because it is the ADIF mode and the PSK Reporter mode. See the
+ * note on both in ft8/constants.c. */
 static const char *mode_label(ft8_op_mode_t mode)
 {
+    static char buf[24];
     switch (mode) {
     case FT8_OP_MODE_FT4: return "MODE: FT4";
-    case FT8_OP_MODE_JS8: return "MODE: JS8";
+    case FT8_OP_MODE_JS8: {
+        const ftx_protocol_t p = ft8_op_mode_protocol_for(mode);
+        snprintf(buf, sizeof buf, "JS8 %s",
+                 p == FTX_PROTOCOL_JS8_FAST  ? "FAST"  :
+                 p == FTX_PROTOCOL_JS8_TURBO ? "TURBO" :
+                 p == FTX_PROTOCOL_JS8_SLOW  ? "SLOW"  : "NORM");
+        return buf;
+    }
     default:              return "MODE: FT8";
     }
+}
+
+/* Re-read the mode label. The submode is settable from the drawer AND from
+ * /api/cmd, neither of which goes through the preset path that used to be the
+ * only thing that repainted this label.
+ *
+ * ⛔ THE API CALLER IS THE HTTP TASK, SO THIS ONLY RAISES A FLAG. LVGL is
+ * not thread-safe and every other web-initiated screen change in this file
+ * defers the same way - s_web_cq_pending, s_web_ftx_pending. The repaint
+ * happens in the 1 Hz tick below. */
+/* ⭐ THE MODE LABEL IS THE SUBMODE CONTROL, in JS8 only.
+ *
+ * Ryan KK6DZB asked where the speed setting was on the Tab5 in the same
+ * message that reported JS8 decoding nothing. It was in the settings drawer
+ * and nowhere else, and he never found it.
+ *
+ * It goes on the label rather than in the JS8 tab row because the tab row is
+ * FULL: Conversation 8..200, Flush 208..400, Stations 408..600, the target
+ * chip 608..744, SNR 752..844, GRID 852..944 of RIGHT_W = 960. Nothing there
+ * could be shrunk without making the three tabs narrower than their text.
+ *
+ * The label is also the right place on its own merits: it is what NAMES the
+ * submode ("JS8 TURBO"), so the thing that tells an operator something is set
+ * is the thing they tap to change it.
+ *
+ * ⛔ THE TAP CANNOT LAND ON THE LABEL ITSELF. ui_init()'s top-bar hit
+ * zones are direct children of the screen spanning its full 200 px top, and
+ * s_lbl_mode sits at screen y 68..120 inside s_container - LVGL hit-tests a
+ * parent's direct children in reverse creation order, so those zones win over
+ * the whole s_container branch however it is foregrounded internally. The
+ * real target is s_lbl_mode_hit below, a screen-level sibling, exactly the
+ * arrangement s_btn_freq_hit already uses for the frequency button. */
+static lv_obj_t *s_lbl_mode_hit = NULL;   /* screen-level click target */
+static lv_obj_t *s_submode_popup = NULL;
+
+static void submode_popup_close(void)
+{
+    if (s_submode_popup) { lv_obj_del(s_submode_popup); s_submode_popup = NULL; }
+}
+
+static void submode_overlay_cb(lv_event_t *e) { (void)e; submode_popup_close(); }
+
+static void submode_pick_cb(lv_event_t *e)
+{
+    const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    submode_popup_close();
+
+    /* The refusal rule and the value list are js8_submode_set()'s - see
+     * js8_submode.h. A control that silently did nothing would read as
+     * broken, so the reason is shown. */
+    const char *why = NULL;
+    if (!js8_submode_set(js8_submode_value(idx), &why))
+        ui_toast(why ? why : "JS8 submode not changed");
+}
+
+static void submode_popup_open(lv_event_t *e)
+{
+    (void)e;
+    if (ft8_op_mode_get() != FT8_OP_MODE_JS8) return;   /* JS8 only */
+    submode_popup_close();
+
+    const int n = js8_submode_count();
+    const int btn_h = 64, panel_w = 300;
+
+    lv_obj_t *ov = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(ov, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_pos(ov, 0, 0);
+    lv_obj_set_style_bg_opa(ov, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(ov, 0, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(ov, submode_overlay_cb, LV_EVENT_CLICKED, NULL);
+    s_submode_popup = ov;
+
+    lv_obj_t *panel = lv_obj_create(ov);
+    lv_obj_set_size(panel, panel_w, n * btn_h + 4);
+    lv_obj_set_pos(panel, 16, MID_Y + 60);
+    lv_obj_set_style_pad_all(panel, 0, 0);
+    lv_obj_set_style_pad_row(panel, 0, 0);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(UI_COLOR_SURFACE), 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(JS8_ACCENT_HEX), 0);
+    lv_obj_set_style_border_width(panel, 2, 0);
+    lv_obj_set_style_radius(panel, 8, 0);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    const int cur = js8_submode_index_of(settings_get_js8_submode());
+    for (int i = 0; i < n; i++) {
+        lv_obj_t *btn = lv_btn_create(panel);
+        lv_obj_set_size(btn, panel_w - 4, btn_h - 2);
+        lv_obj_set_pos(btn, 0, i * btn_h);
+        lv_obj_set_style_radius(btn, 0, 0);
+        lv_obj_set_style_border_width(btn, 0, 0);
+        /* The one in force is filled, the rest are flat - the same way this
+         * screen marks a selected tab. */
+        lv_obj_set_style_bg_color(btn,
+            lv_color_hex(i == cur ? JS8_ACCENT_HEX : UI_COLOR_SURFACE), 0);
+        lv_obj_add_event_cb(btn, submode_pick_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)i);
+        lv_obj_t *l = lv_label_create(btn);
+        lv_label_set_text(l, js8_submode_label(i));
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(l,
+            lv_color_hex(i == cur ? 0x000000 : 0xFFFFFF), 0);
+        lv_obj_center(l);
+    }
+}
+
+static void mode_label_repaint(void)        /* LVGL task only */
+{
+    if (!s_lbl_mode) return;
+    const ft8_op_mode_t now = ft8_op_mode_get();
+    lv_label_set_text(s_lbl_mode, mode_label(now));
+    lv_obj_set_style_text_color(s_lbl_mode,
+                                lv_color_hex(mode_accent_hex(now)), 0);
+
+    /* The label is only a control in JS8, so the hit target follows the mode
+     * as well as the screen. It is foregrounded every time it is shown, for
+     * the same reason s_btn_freq_hit is: it has to out-rank the top-bar hit
+     * zones, which are created after this object. A submode popup left open
+     * when the mode changes under it would offer to set a submode that no
+     * longer applies. */
+    if (s_lbl_mode_hit) {
+        if (s_active && now == FT8_OP_MODE_JS8) {
+            lv_obj_clear_flag(s_lbl_mode_hit, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(s_lbl_mode_hit);
+        } else {
+            lv_obj_add_flag(s_lbl_mode_hit, LV_OBJ_FLAG_HIDDEN);
+            submode_popup_close();
+        }
+    }
+}
+
+void ft8_screen_view_refresh_mode_label(void)
+{
+    s_mode_label_dirty = true;
 }
 
 static lv_obj_t *s_ft8_freq_popup = NULL;
@@ -2970,6 +3278,12 @@ static void apply_freq_preset(uint32_t freq_hz, ft8_op_mode_t mode, const char *
     settings_set_ft8_freq_hz(freq_hz);
 
     ft8_op_mode_set(mode);
+    /* ⛔ THE DRAWER HAS TO BE TOLD. FT8, FT4 and JS8 share one ui_mode_t, so
+     * nothing in the mode plumbing notices this change - and DRAWER_SEC_JS8SUB
+     * is shown for JS8 alone. Without this the submode picker appears only
+     * after some OTHER thing re-lays the drawer (a Basic/Advanced toggle, a
+     * page change), which reads as a control that is sometimes missing. */
+    ui_drawer_relayout();
     // Re-assert the breathing red simulation border from the setting. It does
     // NOT depend on the sub-mode: this comment used to say "FT4 TX is always
     // forced through the simulation interlock (see ft8_tx.c's FT4 SAFETY note)"
@@ -2978,16 +3292,13 @@ static void apply_freq_preset(uint32_t freq_hz, ft8_op_mode_t mode, const char *
     // has to be re-foregrounded over it.
     ui_refresh_sim_mode_indicator();
     ft8_screen_clear();  // flush stale decodes from previous mode/band
-    if (s_lbl_mode) {
-        /* Read back from the engine rather than from `mode`: ft8_op_mode_set()
-         * is allowed to REFUSE (an unimplemented protocol), and a label that
-         * showed what was asked for rather than what took effect is exactly the
-         * "screen says JS8 while FT8 goes out" failure that refusal exists to
-         * prevent. */
-        const ft8_op_mode_t now = ft8_op_mode_get();
-        lv_label_set_text(s_lbl_mode, mode_label(now));
-        lv_obj_set_style_text_color(s_lbl_mode, lv_color_hex(mode_accent_hex(now)), 0);
-    }
+    /* Read back from the engine rather than from `mode`: ft8_op_mode_set() is
+     * allowed to REFUSE (an unimplemented protocol), and a label that showed
+     * what was asked for rather than what took effect is exactly the "screen
+     * says JS8 while FT8 goes out" failure that refusal exists to prevent.
+     * mode_label_repaint() does that read itself, and also shows or hides the
+     * submode hit target - which is why this is a call and not two lines. */
+    mode_label_repaint();
     /* The sub-mode decides whether the right pane has tabs at all, and whether
      * TXCQ parity is shown. Called here rather than from the refresh timer so
      * the screen changes with the mode, not up to half a second later. */
@@ -3502,6 +3813,191 @@ static void conv_row_clicked_cb(lv_event_t *e)
     ui_toast("Station no longer heard");
 }
 
+/* ===================================================================
+   THE JS8 TX BAR - the selected station, and the two macro sends
+
+   ⛔ THESE BUTTONS EXIST BECAUSE THE TAP NO LONGER TRANSMITS. Ryan KK6DZB,
+   after a real QSO on v1.18.0: "we need a button that will send the SNR and a
+   button to send GRID as macros". A tap selects (js8_target.h); nothing goes
+   on the air until one of these is pressed.
+
+   They live in the JS8 tab bar, which is 960 px wide with its three tabs
+   ending at 600 - so the chip and both buttons fit in the free 344 px without
+   taking a single row from the conversation grid, which has 10 px of slack in
+   580 and could not have given one up.
+   =================================================================== */
+
+static lv_obj_t *s_js8_chip;       /* who is selected; tap to clear */
+static lv_obj_t *s_js8_chip_lbl;
+static lv_obj_t *s_btn_js8_snr;
+static lv_obj_t *s_btn_js8_grid;
+
+/* Grey a macro button out when there is nobody to send it to. Disabled state
+ * AND opacity: LV_STATE_DISABLED alone still looks pressable on this theme. */
+static void js8_macro_btn_enable(lv_obj_t *b, bool on)
+{
+    if (!b) return;
+    if (on) {
+        lv_obj_clear_state(b, LV_STATE_DISABLED);
+        lv_obj_set_style_opa(b, LV_OPA_COVER, 0);
+    } else {
+        lv_obj_add_state(b, LV_STATE_DISABLED);
+        lv_obj_set_style_opa(b, LV_OPA_40, 0);
+    }
+}
+
+static void js8_tx_bar_sync(void)
+{
+    if (!s_js8_chip_lbl) return;
+    char call[FT8_CALL_MAX_LEN];
+    js8_target_get(call, sizeof(call));
+    char b[32];
+    /* ⚠ "tap a call" AND NOT "tap a station", MEASURED ON THE GLASS: the
+     * chip is 136 px between the Stations tab (ends at 600) and SNR (starts at
+     * 752), and at font 20 the longer wording rendered as "> tap a stat...".
+     * A callsign is at most 15 characters but a real one is 4-6, so the
+     * selected form fits with room to spare. */
+    if (call[0]) snprintf(b, sizeof(b), "> %s", call);
+    else         snprintf(b, sizeof(b), "tap a call");
+    if (strcmp(lv_label_get_text(s_js8_chip_lbl), b) != 0)
+        lv_label_set_text(s_js8_chip_lbl, b);
+    js8_macro_btn_enable(s_btn_js8_snr,  call[0] != ' ');
+    js8_macro_btn_enable(s_btn_js8_grid, call[0] != ' ');
+}
+
+/* Arm ONE message, the way the TX modal's Transmit button does - never
+ * ft8_qso_start(), which would hand the exchange to the auto-sequencer and put
+ * back exactly the behaviour these buttons replace. */
+static bool js8_arm_one(ft8_tx_request_t *req, char *err, size_t err_len)
+{
+    char busy_target[24];
+    if (ft8_qso_is_busy(busy_target, sizeof(busy_target))) {
+        if (busy_target[0]) snprintf(err, err_len, "Busy: working %s", busy_target);
+        else                snprintf(err, err_len, "Busy: calling CQ");
+        return false;
+    }
+    if (!ft8_tx_arm(req, err, err_len)) return false;
+    if (req->target_call[0]) ft8_qso_note_manual_target(req->target_call);
+    return true;
+}
+
+/* SNR: the JS8-native signal report, built by the same code the FT8 ladder
+ * uses - ft8_qso_build_manual_reply() takes the JS8 branch at ft8_qso.c:510
+ * and formats the report through js8_fmt_report(), whose -30..+31 range is
+ * wider than FT8's. So this is the proven path, moved from the tap to a
+ * button, not a second copy of it. */
+static bool js8_send_snr(char *out, size_t out_len)
+{
+    char call[FT8_CALL_MAX_LEN];
+    js8_target_get(call, sizeof(call));
+    if (!call[0]) { snprintf(out, out_len, "Tap a station first"); return false; }
+
+    ft8_call_t *snap = table_snapshot();
+    if (!snap) { snprintf(out, out_len, "Internal: no snapshot buffer"); return false; }
+    int n = 0;
+    ft8_screen_get_all(snap, FT8_CALL_TABLE_SIZE, &n);
+    const ft8_call_t *match = NULL;
+    for (int i = 0; i < n; i++)
+        if (strcmp(snap[i].call, call) == 0) { match = &snap[i]; break; }
+    if (!match) { snprintf(out, out_len, "%s no longer heard", call); return false; }
+
+    ft8_tx_request_t req;
+    char err[64];
+    if (!ft8_qso_build_manual_reply(match, ft8_tx_pick_tone_hz(), &req, NULL,
+                                    err, sizeof(err))) {
+        snprintf(out, out_len, "%s", err[0] ? err : "Could not build the report");
+        return false;
+    }
+    if (!js8_arm_one(&req, err, sizeof(err))) {
+        snprintf(out, out_len, "%s", err);
+        ESP_LOGW(TAG, "JS8 SNR macro refused: %s", err);
+        return false;
+    }
+    snprintf(out, out_len, "Armed: %s", req.display_text);
+    ESP_LOGI(TAG, "JS8 SNR macro armed: '%s'", req.display_text);
+    return true;
+}
+
+static void js8_snr_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    char msg[80];
+    js8_send_snr(msg, sizeof(msg));
+    ui_toast(msg);
+}
+
+/* GRID goes out as FREE TEXT, and that is a protocol fact rather than a
+ * shortcut.
+ *
+ * ⛔ A Directed frame has no locator field: js8_text_to_frame() refuses a
+ * grid `rest` outright (js8_text.c, "No JS8 Directed form"), because inventing
+ * a frame for it would key the radio with something no JS8Call station
+ * answers. JS8_CMD_GRID exists in the vocabulary (js8_message.h) but neither
+ * direction is implemented at the text seam, and implementing it blind is the
+ * one thing this project will not do - only a real JS8Call station settles
+ * what it should look like.
+ *
+ * The free-text path, by contrast, HAS been read by a real JS8Call (J8, proven
+ * on air 2026-10-10), and "THEM US GRID" is the shape Ryan asked for anyway.
+ *
+ * ⚠ FOUR characters. A six-character locator cost a station its whole JS8
+ * CQ once already - 517acc69. */
+static bool js8_send_grid(char *out, size_t out_len)
+{
+    char call[FT8_CALL_MAX_LEN];
+    js8_target_get(call, sizeof(call));
+    if (!call[0]) { snprintf(out, out_len, "Tap a station first"); return false; }
+
+    qmx_settings_t cfg;
+    settings_load_all(&cfg);
+    if (!cfg.my_callsign[0] || !cfg.my_grid[0]) {
+        snprintf(out, out_len, "Set your callsign and grid first");
+        return false;
+    }
+    char msg[64];
+    snprintf(msg, sizeof(msg), "%s %s %.4s", call, cfg.my_callsign, cfg.my_grid);
+
+    char err[64];
+    if (!js8_ftx_start(msg, 0, err, sizeof(err))) {
+        snprintf(out, out_len, "%s", err[0] ? err : "Could not send the grid");
+        ESP_LOGW(TAG, "JS8 GRID macro refused: %s", err);
+        return false;
+    }
+    snprintf(out, out_len, "Sending: %s", msg);
+    ESP_LOGI(TAG, "JS8 GRID macro: '%s'", msg);
+    return true;
+}
+
+static void js8_grid_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    char msg[80];
+    if (!js8_send_grid(msg, sizeof(msg))) {
+        /* The one refusal with somewhere to go: no callsign or grid set yet
+         * means the identity modal, the same as a failed manual reply. */
+        qmx_settings_t cfg;
+        settings_load_all(&cfg);
+        if (!cfg.my_callsign[0] || !cfg.my_grid[0]) {
+            ui_toast(msg);
+            identity_config_modal_show();
+            return;
+        }
+    }
+    ui_toast(msg);
+}
+
+/* Tapping the chip clears the selection, which also unfilters the pane. The
+ * only way back to the whole conversation, so it is not optional. */
+static void js8_chip_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!js8_target_any()) return;
+    js8_target_set(NULL);
+    ui_toast("Showing all stations");
+    conv_repaint();
+    js8_tx_bar_sync();
+}
+
 static void conv_repaint(void)
 {
     if (!s_conv_pane || !js8_mode_now() || !s_tab_conversation) return;
@@ -3517,11 +4013,18 @@ static void conv_repaint(void)
             return;
         }
     }
-    int n = js8_chat_count();
-    if (n > JS8_CHAT_MAX_MSGS) n = JS8_CHAT_MAX_MSGS;
-    int have = 0;
-    for (int i = 0; i < n; i++)
-        if (js8_chat_at(i, &s_conv->msgs[have])) have++;
+    /* ⭐ FILTERED TO THE SELECTED STATION, which is what Ryan KK6DZB asked
+     * for in as many words: "anytime you click on a call sign in the
+     * conversation mode it clears the conversations out and becomes a directed
+     * message to the call sign you clicked on. Nothing else in the
+     * conversation window."
+     *
+     * ⛔ THE FILTER IS IN js8_chat_copy() AND NOT HERE, because /api/js8
+     * draws this same pane for the browser and the first cut filtered only
+     * this one. Measured on the bench: the glass filtered, the web did not. */
+    char sel[FT8_CALL_MAX_LEN];
+    js8_target_get(sel, sizeof(sel));
+    int have = js8_chat_copy(sel, s_conv->msgs, JS8_CHAT_MAX_MSGS);
 
     js8_page_render(s_conv->msgs, have, (int64_t)time(NULL),
                     s_conv->lines, s_conv->row_msg);
@@ -3715,6 +4218,52 @@ static void build_js8_tabs(void)
         lv_obj_center(l);
         *tabs[i].out = b;
     }
+    /* The TX bar - see "THE JS8 TX BAR" above for why it goes here. The three
+     * tabs end at 600; this uses 608..944 of the 960 and takes nothing from
+     * the conversation grid. Children of s_tabbar, so they appear and vanish
+     * with it and js8_tabs_apply needs no extra case. */
+    {
+        s_js8_chip = lv_obj_create(s_tabbar);
+        lv_obj_remove_style_all(s_js8_chip);
+        lv_obj_set_size(s_js8_chip, 136, 40);
+        lv_obj_set_pos(s_js8_chip, 608, 2);
+        lv_obj_clear_flag(s_js8_chip, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(s_js8_chip, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(s_js8_chip, js8_chip_cb, LV_EVENT_CLICKED, NULL);
+        s_js8_chip_lbl = lv_label_create(s_js8_chip);
+        lv_label_set_long_mode(s_js8_chip_lbl, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(s_js8_chip_lbl, 136);
+        lv_obj_set_style_text_font(s_js8_chip_lbl, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(s_js8_chip_lbl, lv_color_hex(JS8_ACCENT_HEX), 0);
+        lv_label_set_text(s_js8_chip_lbl, "> tap a station");
+        lv_obj_center(s_js8_chip_lbl);
+
+        struct { lv_obj_t **out; const char *text; int x; lv_event_cb_t cb; } mac[2] = {
+            { &s_btn_js8_snr,  "SNR",  752, js8_snr_btn_cb  },
+            { &s_btn_js8_grid, "GRID", 852, js8_grid_btn_cb },
+        };
+        for (int i = 0; i < 2; i++) {
+            lv_obj_t *b = lv_btn_create(s_tabbar);
+            lv_obj_set_size(b, 92, 40);
+            lv_obj_set_pos(b, mac[i].x, 2);
+            lv_obj_set_style_radius(b, 6, 0);
+            lv_obj_set_style_border_width(b, 2, 0);
+            lv_obj_set_style_bg_color(b, lv_color_hex(JS8_BTN_HEX), 0);
+            lv_obj_set_style_border_color(b, lv_color_hex(JS8_ACCENT_HEX), 0);
+            lv_obj_set_style_pad_hor(b, 0, 0);
+            lv_obj_add_event_cb(b, mac[i].cb, LV_EVENT_CLICKED, NULL);
+            lv_obj_t *l = lv_label_create(b);
+            lv_label_set_text(l, mac[i].text);
+            lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
+            lv_obj_set_style_text_color(l, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_set_width(l, 92);
+            lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+            lv_obj_center(l);
+            *mac[i].out = b;
+        }
+        js8_tx_bar_sync();      /* greyed out until a station is tapped */
+    }
+
     /* Set once: tab_paint() deliberately skips Flush, so nothing else will
      * ever colour it. Same two colours an unselected tab wears. */
     if (s_tab_btn_flush) {
@@ -3897,6 +4446,26 @@ void ft8_screen_view_init(lv_obj_t *parent)
     lv_obj_add_flag(s_btn_freq_hit, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(s_btn_freq_hit, LV_OBJ_FLAG_HIDDEN);  // shown only while FT8 is active
     lv_obj_add_event_cb(s_btn_freq_hit, ft8_freq_label_clicked_cb, LV_EVENT_CLICKED, NULL);
+
+    /* The MODE label's own screen-level click target - the JS8 submode
+     * picker. Same arrangement and the same reason as s_btn_freq_hit above.
+     * s_left_pane sits at screen (0, MID_Y) with pad_top 8 / pad_left 16 and
+     * s_lbl_mode is at (0,0) inside that padded box, so the label starts at
+     * screen (16, MID_Y+8). The height stops at MID_Y+60 so it stays clear of
+     * s_btn_freq_hit, which begins at MID_Y+63. Kept in sync by hand with the
+     * s_lbl_mode geometry below - if that moves, move this.
+     *
+     * Hidden here and shown only by mode_label_repaint(), which is the one
+     * place that knows whether the sub-mode is JS8. */
+    s_lbl_mode_hit = lv_obj_create(parent);
+    lv_obj_set_size(s_lbl_mode_hit, 288, 52);
+    lv_obj_set_pos(s_lbl_mode_hit, 16, MID_Y + 8);
+    lv_obj_set_style_bg_opa(s_lbl_mode_hit, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_lbl_mode_hit, 0, 0);
+    lv_obj_clear_flag(s_lbl_mode_hit, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_lbl_mode_hit, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_lbl_mode_hit, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_lbl_mode_hit, submode_popup_open, LV_EVENT_CLICKED, NULL);
 
     // UTC clock removed — it's in the center bottom bar already
 
@@ -4388,6 +4957,11 @@ void ft8_screen_view_show(void)
         lv_obj_move_foreground(s_btn_freq_hit);
     }
 
+    /* The MODE label's hit target is shown by the same function that paints
+     * the label, because the two have the same condition: it is a control
+     * only while the sub-mode is JS8. */
+    mode_label_repaint();
+
     // Own-call cache and grid-derived location are kept live in rebuild_list()
     // (runs every refresh cycle off the same settings_load_all() call), not
     // just here on screen entry - see the comment there for why.
@@ -4399,6 +4973,8 @@ void ft8_screen_view_hide(void)
     if (!s_container) return;
     lv_obj_add_flag(s_container, LV_OBJ_FLAG_HIDDEN);
     if (s_btn_freq_hit) lv_obj_add_flag(s_btn_freq_hit, LV_OBJ_FLAG_HIDDEN);
+    if (s_lbl_mode_hit) lv_obj_add_flag(s_lbl_mode_hit, LV_OBJ_FLAG_HIDDEN);
+    submode_popup_close();   /* never leave a picker over another screen */
     s_active = false;
     webserver_ws_set_paused(false);  // back to Panadapter - resume the WS spectrum stream
     ESP_LOGI(TAG, "hide");

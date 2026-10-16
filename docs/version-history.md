@@ -4231,7 +4231,64 @@ Audio and binaural CW remain a **declared beta**.
 
 ⚠ **If you have set "Never exceed PA voltage"**, remember it caps the calibration sweep too. A band calibrated under a limit only describes the radio up to that limit, so raise it and recalibrate if you later want the full curve.
 
+⛔ **A correction to what v1.17.0 told you about JS8, because it was misleading.** That release said "a full automatic two-way JS8 QSO has not been completed yet". That was true in the sense I meant it — I had not proven a complete exchange on air — but it reads as though the automatic exchange is not implemented, and it is. If you have automatic replies switched on, **your Tab5 answers JS8 callers with a signal report by itself**, and has done since v1.17.0. Gyula HA3HZ found this in his own log, with four stations answered unattended, after I had told him it was not possible. Nothing is broken and nothing has changed in this release — but if you did not know your station was answering on its own, now you do, and the automatic-reply setting is where you turn it off.
+
 ⚠ **Everything said about JS8 in v1.17.0 still stands**: it is a beta, a full automatic two-way QSO has not been completed, and nothing has yet been decoded through the 3.5 mm jack.
+
+### Shipped in v1.19.0 — 2026-10-15
+
+**AM is demodulated on the Tab5 itself, and the SWR limit now stops a WSPR burst the way it has always stopped an FT8 one.**
+
+- ⭐⭐ **AM, on the Tab5, from the I/Q** *(Samuel W7STF)*. Put the radio in AM and you hear it. The demodulator runs on the Tab5 from the raw I/Q the radio already sends, which is why the bandwidth is yours rather than the radio's: the QMX's own AM filter is fixed at 3.2 kHz and sits in its audio, not in the I/Q path. Tap **BW** in the top bar while in AM and choose **4.0, 6.0, 8.0 or 9.6 kHz**. 6.0 is the default. **Proven on air** on a broadcast station at 7.260 MHz. Until now AM was silent and an AM station meant listening to it in USB.
+
+- **Why 6.0 kHz and not the widest.** A shortwave broadcaster transmits about 4.5 kHz of audio, so 9.6 kHz carries the whole thing — but the channels are spaced only 5 kHz apart, and at 9.6 the filter edge sits about 45 Hz from the next station's carrier. On a quiet channel take 9.6 and hear the station in full; on a crowded evening 6.0 is the one that keeps the neighbour out. Your choice is remembered.
+
+- ⭐ **Your SWR limit now protects a WSPR transmission** *(Bryan N0LUF)*. Bryan's radio transmitted all night after his Tab5 restarted mid-burst, and looking into it showed that the SWR limit did nothing at all in WSPR — it cut an FT8 or FT4 burst, while WSPR measured the figure, wrote it in the log and carried on. His antenna reaches 5.1:1 in the rain. WSPR now samples through the burst and stops it where it stands, and refuses to arm the next one until you clear the latch. **Proven on air**: 2.4:1 against a 2.0:1 limit cut a transmission after 11 seconds instead of 110. ⚠ The WSPR chapter has promised this for some time; the firmware did not do it.
+
+- **One limit, one latch, whatever the mode.** A bad antenna is a fact about your station and not about the mode you were using, so a trip in WSPR stops FT8 as well and the other way round.
+
+- **The panadapter now asserts receive when it reconnects to the radio.** If the Tab5 restarted while the radio was keyed, it reconnected and left it keyed. ⚠ This would not have saved Bryan — his radio's USB had already locked up, so nothing sent could reach it — and nothing on the Tab5 can guarantee the radio stops when the Tab5 is what died. Your radio's own `CAT config → Timeout` is the protection for that case; it is enabled by default at 120 seconds, and it has to be off if you use VOX.
+
+- ⛔ **The browser acted on the WSPR page's top bar while the Tab5 refused to** *(John W5JSS)*. On the Tab5, Band, Mode, BW and Zoom are greyed out on the WSPR page because that page owns the dial. The web page drew them grey and then acted on them anyway. Picking 20 m from the browser wrote the FT8 frequency to the radio while WSPR carried on labelling its spots 160 m — so John saw no spots, a mismatch warning he had to find on the glass, and his own signal reported on a band he was not on. Four of the six things he reported were this one defect. The browser now refuses those four controls there, with a reason, exactly as the Tab5 does. Freq stays live on purpose, so a beacon off the standard dial can still be chased.
+
+- ⭐ **JS8 Slow, Fast and Turbo are selectable**, from the **JS8 speed** row in the drawer and from the JS8 tab in the browser. ⚠ **Only Normal is proven on air** — the others are built and they transmit, but no contact has been made on any of them. Turbo was thought to be out of reach over the control link; the tone command measures about 250 microseconds, so the Tab5's side of it is fast enough. The radio's side is not measured.
+
+- **A tap on a JS8 station now selects it** *(Ryan KK6DZB)*, who held a real JS8 QSO on the Tab5 and sent a full UI draft back. Tapping a row selects that station; the SNR and GRID buttons send to it; free text opens with the pair of callsigns already in place; a CQ is sent once rather than repeating. Three smaller things from the same work: the conversation filter worked on the glass and not in the browser, the target chip truncated a station to "tap a stat...", and the "free text sent" line was overwritten within a second of appearing.
+
+- **A finished FT8 QSO held the radio for a whole extra cycle** *(Bruce N9JCV)*. The check that closes a completed exchange ran once per slot, so a QSO that finished early stayed busy until the next slot boundary. It now closes when the final transmission leaves the air — measured at 19 milliseconds on a real contact.
+
+- **The version in the firmware could be a release behind.** The version string was baked in when the project was last configured rather than when it was built, so a binary could report a release it was not. If you ever compared the version on your screen against what you flashed and they disagreed, that is why.
+
+- **Every path that can key the radio is now written down and checked** — eleven places that can arm a transmission, six of which can do it unattended, verified against the code by a tool that runs every release. This exists because v1.18.0 went out without my knowing my own release answered JS8 callers by itself, and a user had to tell me.
+
+### Shipped in v1.20.0 — 2026-10-15
+
+**You can listen to the radio in your browser, and AM reaches broadcast widths.**
+
+- ⭐⭐ **Listen to the receiver in the browser** *(Samuel W7STF, asked 2026-07-15)*. Click the **▶** button at the top right of the web page, immediately right of **F**, and you hear the radio through your computer or your phone. What is streamed is the Tab5's own demodulated audio, tapped after the filter and the AGC, so the browser and the speaker cannot disagree about what the radio is doing. It works even on a Tab5 that booted with its speaker off.
+
+- **The speaker and the browser are exclusive, deliberately.** A browser listener mutes the Tab5's speaker and hands the audio back when it stops or the page closes. Audio in two places at once is not something I wanted to build, and one listener at a time is what the design says.
+
+- **Hover the ■ button and it tells you how the stream is doing** — frame gaps, re-primes, and chunks dropped to clock drift. On a quiet network all three stay at zero. CW, CW-R, USB, LSB and AM produce audio; in any other mode the button lights and nothing arrives, and the tooltip says so.
+
+- **The card was interrupting the audio, not the network.** Browser audio broke up about twice a minute, and the cause was the 30-second write that mirrors the diagnostic log to the SD card: measured at 150–700 ms per tick and once at 4.8 s, long enough to run the player dry. That tick is now held off while anybody is listening, and the backlog waits in RAM, which is what the RAM ring is for. The cost, stated plainly: a crash while you are listening loses the tail of the diagnostic log.
+
+- ⭐ **AM reaches 10.0 kHz and 20.0 kHz.** The AM list already spanned 2.0 to 9.6 kHz; the two widest settings needed the decimator run at half the rate, which costs a whole core, so the rate now follows the **width** you chose rather than the mode. Below 4.8 kHz of half-bandwidth nothing changed.
+
+- ⚠ **The QMX has no AM bandwidth of its own to match.** Its firmware reports a fixed 3200 Hz in every mode but CW, and the eight selectable filter widths are CW-only. The Tab5's own AM filter therefore both exceeds and undercuts anything the radio offers, and the widths above are the only ones that matter.
+
+- ⛔ **Every FT8 action button disabled itself the moment you hovered it** *(Randy N4OPI and Ryan KK6DZB, same day)*. A v1.19.0 regression: the rule that locks the dial on the WSPR page had been pasted into the list of hover selectors, so hovering any FT8 button greyed it out. Fixed, and the web checker now refuses that shape.
+
+- **The CW decode strip is four rows**, and the row count is one number rather than two that could disagree.
+
+- **JS8 speed is pickable on the JS8 screen itself**, not just in the drawer, and a non-Normal submode now says which one it is on the glass. ⛔ A JS8 submode other than Normal decodes nothing and survives a power cycle, so a radio left on Fast or Turbo looks like a dead receiver — the label is there to stop exactly that.
+
+- **The JS8 transmit pane prints the words going out**, not "frame 3 of 7", and the frame counter stops counting when the run ends. The JS8 page no longer offers what it cannot do and names what it is.
+
+- **A Flush button in the web UI**, and JS8 lines that are addressed to you are marked as such.
+
+- **The SelfSpotter screen says why the feeds are empty** when receive audio is holding them off, instead of showing nothing and explaining nothing.
+
 
 ---
 

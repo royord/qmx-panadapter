@@ -432,6 +432,16 @@ typedef struct {
     // short and latched off rather than driving a mismatched load for the
     // whole 12.7 s. The QMX's finals are the thing being protected here.
     uint8_t  swr_limit_x10;
+    /* JS8 submode, as JS8Call's own NSUBMODE: 0 Normal, 1 Fast, 2 Turbo,
+     * 4 Slow. ⛔ NOT an index - the numbering is JS8Call's and it is not
+     * dense (3 and 5..7 do not exist; 8 is Ultra, which this firmware does
+     * not implement). Appended, so an old NVS blob reads back 0 = Normal,
+     * which is what every existing installation is running.
+     *
+     * Each submode is a different physical layer - NSPS, slot period, tone
+     * spacing and sync arrays all change - so this is not a quality knob and
+     * two stations must agree on it before they can hear each other at all. */
+    uint8_t  js8_submode;
     /* RX audio, persisted so a level set by ear is not lost at the next boot -
      * these were live RAM-only values tuned over /api/cmd during development,
      * which is not something a user can reach. Scaled integers, same idiom as
@@ -451,6 +461,13 @@ typedef struct {
      * manual gain control, which is what "AGC off plus a gain knob" means on
      * any other receiver. */
     bool     rxaud_agc_off;
+    /* AM demodulator half-bandwidth, in units of 100 Hz (30 = 3000 Hz, a 6 kHz
+     * wide signal). The Tab5 demodulates AM from the raw I/Q, so this is the
+     * filter the operator actually listens through - the radio's own AM
+     * bandwidth is fixed at 3.2 kHz and is not in that path. See
+     * RX_AUDIO_AM_HALF_BW_HZ in audio/rx_audio.h for the ceiling and why the
+     * default is not it. */
+    uint8_t  rxaud_am_half_bw_h100;
     /* Mute the internal speaker when headphones are detected (v1.16.4).
      * Default TRUE - it is what everyone expects. Switchable because the
      * detection is a single I2C read that DOES fail in the field, and two
@@ -505,12 +522,27 @@ typedef struct {
     // The spot map (ui/spot_map_view.c) and the three self-spot feeds behind
     // it: PSK Reporter over MQTT, wsprnet polling, and hamqsl band conditions,
     // plus the QRZ callbook lookups that place an RBN skimmer on the map.
-    // ⛔ NOT A USER SETTING ANY MORE (2026-09-13) - there is no drawer checkbox
-    // for this, on the Tab5 or the web, and it is never written to NVS. It is
-    // driven ENTIRELY by ui/spot_map_view.c's own show()/hide(): true for as
-    // long as the SELFSPOTTER overlay is open, false the instant it closes,
-    // exactly mirroring what a permanent "on" checkbox used to mean while it
-    // was checked. Reasons this exists at all, unchanged from when it was a
+    // ⛔ THIS COMMENT WAS STALE AND IT MISLED A DIAGNOSIS (2026-10-15).
+    // It said spotmap_en is "driven ENTIRELY by ui/spot_map_view.c's own
+    // show()/hide(): true for as long as the SELFSPOTTER overlay is open".
+    // That has not been true since the operator reversed it: spot_map_view.c
+    // sets it TRUE ONCE AT INIT and its own comment there says "show()/hide()
+    // no longer touch this", because PSK Reporter and RBN are live pushes with
+    // no history - a session opened when the map opens can only show what
+    // arrives afterwards, so it has to collect from boot.
+    //
+    // Never written to NVS. The writers are: spot_map_view.c's init (true),
+    // ui/resource_mgmt_modal.c's Spot map checkbox, and a config import.
+    //
+    // ⚠ RX AUDIO HOLDS IT OFF, which is what an operator actually sees.
+    // resource_mgmt_modal.c's refresh_gating() greys and disables the Spot
+    // map, RBN, DX cluster and PSK-RX rows while rx_audio_is_enabled(), and
+    // pskr_self.c:331 tears the MQTT session down on the same test. Gyula
+    // HA3HZ reported it as "checking the Audio Setting causes these settings
+    // to be cleared" - nothing is cleared, they are held off, and the modal
+    // says so in a warning line he did not connect to it.
+    //
+    // Reasons this gating exists at all, unchanged from when it was a
     // checkbox:
     //   - it holds a STANDING MQTT session to mqtt.pskreporter.info subscribed
     //     on the operator's own callsign, for the life of the session. An
@@ -519,8 +551,7 @@ typedef struct {
     //     -6.6 KB and the MALLOC_CAP_DMA pool -2.6 KB, which is roughly half
     //     the headroom that pool has left. That pool is what fails SD mounts,
     //     USB endpoint allocation and TLS when it runs dry (#65/#284) - which
-    //     is exactly why it is now tied to the SCREEN being open rather than
-    //     to a switch someone could forget they left on.
+    //     is exactly why RX audio takes it back - see refresh_gating().
     // Applies live, no reboot: each feed re-reads this every pass, the same
     // way psk_rx_en and rbn_en are read (see net/pskr_self.c).
     bool     spotmap_en;
@@ -942,6 +973,13 @@ void    settings_set_spots_mode_filter(bool v);  // show only spots for the curr
 void    settings_set_swr_limit_x10(uint8_t v);   // 0 = off, else limit x10 (25 = 2.5:1)
 uint8_t settings_get_swr_limit_x10(void);
 
+/* JS8 submode as JS8Call's NSUBMODE: 0 Normal, 1 Fast, 2 Turbo, 4 Slow.
+ * Anything else is clamped to 0 - an unknown submode must not reach the
+ * physical layer, where it would pick the wrong sync arrays and transmit
+ * something nobody can decode. */
+void    settings_set_js8_submode(uint8_t v);
+uint8_t settings_get_js8_submode(void);
+
 /* RX audio level and panoramic-split shape. Stored scaled; the Resource
  * Management sliders are the only writers. Ranges are clamped to what
  * rx_audio.h documents, so a bad stored value cannot put the DSP somewhere
@@ -961,6 +999,8 @@ uint16_t settings_get_rxaud_agc_release_ms(void);
 // AGC bypass - gain pinned at the ceiling instead of tracking. Default false.
 void    settings_set_rxaud_agc_off(bool v);
 bool    settings_get_rxaud_agc_off(void);
+void    settings_set_rxaud_am_half_bw_h100(uint8_t v);  // 10..100 (default 30 = 3000 Hz; 100 = the D=2 ceiling)
+uint8_t settings_get_rxaud_am_half_bw_h100(void);
 // Speaker auto-mute on headphone insert. Default true.
 void    settings_set_hp_mute_en(bool v);
 bool    settings_get_hp_mute_en(void);
