@@ -450,6 +450,8 @@ Switch the QMX to any band and watch it come alive. This is the foundation of th
 
 **Watch the S-meter.** The Signal field in the top bar is a live tick-scale bar (S1 through S9+20), driven by the actual signal under your VFO cursor.
 
+**Keep an eye on the CPU.** The bottom status bar carries a live `CPU nn/nn%` readout at the right — **utilisation** for each core, so higher means busier (the serial log reports the complement, *idle* %, and is easy to misread against this). It reads `--/--` for the first 10 seconds after boot, because the first measurement window has not closed yet and a confident `0/0` would read as "both cores idle", which is the opposite of the truth. It then updates on each new 10-second sample rather than continuously — if the number is not moving, nothing has changed since the last sample, which is the honest way to present a 10 s average as though it were a live meter. It is there for diagnosing slow redraws and heavy settings, not as something to watch.
+
 **Flat-spectrum mode.** Toggle **Flat spectrum** in the settings drawer to switch from absolute dBm to dB-above-local-noise-floor. Noise collapses to a calm baseline; real signals — including weak CW tones in the mud — pop sharply above it. Recommended on noisy bands.
 
 **Save your spots.** Swipe up from the bottom edge to open the memory channel picker — a 4×8 grid of 32 channels. It doesn't greet you with blank cells: a fresh device arrives with a handful of **example channels already filled in**, and each one is **colour-coded by mode** (CW green, DiGi teal, USB brick-red, LSB purple) so you can read the whole grid at a glance without opening a single label. The very first time you open it, a quick **guided animation** walks you through the gestures — watch a channel slide to a new slot, then drop into the wastebin and vanish — so you learn "drag to move, drag to delete" in about ten seconds, once, and never again.
@@ -528,10 +530,15 @@ What the firmware does: the Tab5 probes the CAT device at your configured baud a
 
 Where things stand:
 
-- Firmware is implemented — radio-type selector, CAT probe (including the CP210x vendor-request handling a DigiRig's serial half needs), stereo dongle auto-adopt. **No working radio/cable setup has reached the bench yet:** the CAT dongle enumerates and the probe goes out, but nothing answers. Check the radio side first: radio powered up, cable in the right jack, DigiRig set to logic-level mode, and the KX3 **CAT** menu configured.
+- Firmware is implemented — radio-type selector, CAT probe (including the CP210x vendor-request handling a DigiRig's serial half needs), stereo dongle auto-adopt. **Verified on the bench: the radio answers.** `FA` / `MD` / `FR` all work. A watchdog asks every 3 seconds which VFO the radio is receiving on and, if it is not A, sends `FR0;` to bring it back — because every frequency this firmware writes addresses VFO A only, so a KX3 left on VFO B makes touch-to-tune silently do nothing audible. The warning it logs when it does this is normal operation, not a fault. The probe walks your configured baud then 38400 / 9600 / 19200 / 4800, `VN;` first and `FA;` as the plan B.
+- **The I/Q chain is decoding.** The stereo dongle is auto-adopted and remembered, the stream runs at 48 kHz / 2 channels / 16-bit, and a signal shows up on the waterfall at a healthy level.
+- **The capture gain is set automatically** when the I/Q source opens. This matters more than it sounds: some dongles ship with a very low capture volume, which leaves the waterfall nearly blank even though everything is working. Setting it to 100% is also why **faint bands and the noise floor are more visible on a KX3 than on a QMX** — that is the true noise floor being shown, not a new fault. The serial log reports the volume it found and what it set it to.
+- **Still to be corrected: the KX3's I/Q centre is measured roughly 4 kHz off the dial frequency**, so the tuned-frequency line and a known signal do not quite agree. Nothing in the firmware can currently compensate for it, and the offset may differ per mode. The QMX does not have this problem — its 12 kHz offset is known and applied. Treat this as a known limitation of the experimental KX3 support, not something you have misconfigured.
 - A device that is plugged in but never opens (a foreign dongle, a USB stick) is **left alone** — the Tab5 never power-cycles the port for a device it would not open. (That is also the fix for the long-standing bench reboot: an earlier version raced that replug into an ESP-IDF `hub.c` abort on a ~68 s cycle.)
 
 **I/Q test tone** — the settings drawer's **I/Q test tone** section plays a 1 kHz quadrature tone on the Tab5's own audio out (L = I = cos, R = Q = sin) and shows an amber tap-to-stop banner while it runs. It exercises the whole audio path end to end with **no radio in the loop**, so a dead cable is told apart from a dead Tab5. RAM-only by design: a restart always clears it, so it can never be left on by accident.
+
+📋 Working on this at the bench? **[NEXTSTEPS.md](NEXTSTEPS.md)** has the checklist — what to check, what each result means, and what to bring (a beacon on a known frequency, for the I/Q offset measurement).
 
 ---
 
@@ -541,7 +548,9 @@ Where things stand:
 
 Tap anywhere on the spectrum or waterfall to place the cyan tune cursor. Drag and the cursor snaps grid-point to grid-point — you can see exactly which frequency will be tuned before you lift. The snap grid is **mode-aware**:
 
-**Tune vs. pan — how your finger is read.** A quick horizontal swipe (more than ~70 px within 250 ms) pans the view instead of tuning — see [Zoom & Pan](https://tab5.lav.dk/guide/panadapter/#8-zoom-pan). A slower touch-and-hold (250 ms without that much movement) locks into tune mode, after which dragging moves the snap cursor as described below. In short: swipe fast to pan, hold-then-drag to tune.
+**Tune vs. pan — how your finger is read.** With **Still spectrum off** (the default), this is simple: **any drag or swipe tunes**, to the frequency under your finger, and lifts to retune. A quick horizontal swipe (>~70 px within 250 ms) does move the view as it goes, so a swipe along the band slides the picture and retunes as it passes — that is the fastest way to travel along a band.
+
+Turn **Still spectrum on** and the gesture splits in two, because panning without moving the dial is now possible and needs its own gesture: a quick swipe (>~70 px within 250 ms) pans the view and **leaves the radio alone**, while a slower touch-and-hold (250 ms without that much movement) locks into tune mode so you can drag the snap cursor and lift to tune. In short — swipe fast to pan, hold-then-drag to tune. See [Gestures](#gestures) for both modes side by side.
 
 | Mode | Snap step |
 |------|-----------|
@@ -558,7 +567,13 @@ Taps always tune to exactly where you touched (snapped to the mode-aware grid ab
 
 **Passband indicator.** Two grey vertical lines mark your current filter edges. A faint coloured tint fills the passband. The amber VFO marker shows where the QMX is tuned; in CW mode it sits at dial + CW pitch offset so it marks the actual received tone frequency, not the suppressed carrier. The offset comes from the radio and is re-read every few seconds while you are in CW, so changing it on the radio is followed rather than leaving the display compensating by a stale figure.
 
-**Still spectrum.** By default, from ×2 zoom up, the spectrum and waterfall **hold still and the VFO marker moves across them**, so a signal stays where you last saw it while you tune towards it and the waterfall's history stays lined up under the frequency it belongs to.
+**The view follows the dial.** This is the default. The tuned frequency sits in the middle of the screen and the spectrum and waterfall **scroll with it**, so the waterfall's history stays lined up under the frequency it belongs to and the cursor stays over the signal you are working. Tuning on the radio scrolls the waterfall left or right under a stationary tuned-frequency line; a tap retunes to exactly where you touched and the view re-centres when you lift.
+
+Switch on **Settings → Radio & display → Still spectrum** if you would rather the picture held still and the VFO marker travelled across it — the opposite trade, described next.
+
+#### Still spectrum (off by default)
+
+With Still spectrum on, the spectrum and waterfall **hold still and the VFO marker moves across them**, so a signal stays where you last saw it while you tune towards it.
 
 The display is never dragged along by the dial. It holds, completely, until it pages in one step:
 
@@ -572,7 +587,9 @@ Half a filter width is the whole allowance, and it is a deliberate compromise: l
 
 **Tapping a spot** moves only the VFO marker when that spot is already comfortably on screen — the picture stays put, which is the point of the feature. If the spot is off screen, or so close to an edge that your passband would not fit, the display re-frames on it instead of leaving it stranded at the edge.
 
-Switch it off under **Settings → Radio & display → Still spectrum**. At ×1 the view is already the whole 48 kHz the radio sends, so it stays centred on the dial.
+**Panning in Still spectrum** is the one gesture that moves the picture without retuning it: swipe, and the view slides to look somewhere else on the band. Because a peek away from the dial is easy to lose track of, the view **returns to where it was 2 seconds after you let go** — so you can have a look at a neighbouring part of the band and then find your signal again without tuning back and forth. A band change, a zoom or a retune inside the window cancels the pending return rather than undoing it.
+
+This auto-return is **part of Still spectrum only**. In the default dial-centred mode a swipe is a retune, so there is no peek to come back from.
 
 **The hatched region.** The QMX's local oscillator sits 12 kHz below the dial, so the 48 kHz it delivers covers dial−36 kHz to dial+12 kHz — there is no data above dial+12, and that part of the display is hatched and inert. Before v1.10.5 it was filled by wrapping the bottom of the band into it and labelling it as dial+12 to +24, so tapping a signal there tuned you about 48 kHz away.
 
@@ -867,6 +884,15 @@ clock that is wrong, WiFi that will not hold, a card that stops being written.
 | Tap or swipe ↓ | Top-bar item (Band/Mode/BW/Freq/Zoom) | Open that item's selector |
 | Touch and hold ~250 ms | FT8 decode list row | Dim preview at ~80 ms; full selection at 250 ms (scroll locks, drag moves highlight, lift to confirm) |
 | Quick swipe | FT8 decode list | Scroll the list normally |
+
+Two of these rows change with **Still spectrum** (off by default — see [Touch-to-tune](#touch-to-tune)):
+
+| Gesture | Dial-centred (default) | Still spectrum on |
+|---|---|---|
+| Touch + drag | **Tunes** on release, no dwell needed — any drag is a tune | **Dwell ~250 ms first, then drag** to tune; the dwell is what tells a tune apart from a pan |
+| Fast horizontal swipe | Strolls the view **and retunes** to the new centre | Strolls the view **without retuning** — a peek at another part of the band |
+
+The dwell exists only because Still spectrum gives panning and tuning separate gestures; with it off there is nothing to disambiguate, so a plain drag tunes straight away.
 
 ### Per-unit IF calibration
 
