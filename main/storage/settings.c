@@ -119,6 +119,10 @@ static const char *TAG = "settings";
 #define KEY_CW_DECODE       "cw_dec_en"
 #define KEY_RIT_PILL_SHOW  "rit_pill"
 #define KEY_STILL_VIEW     "still_vw"
+/* Version marker for the still_view default migration - see settings_init().
+ * Absent (or <1) means "never migrated": still_view is forced to dial-centred
+ * once, then stamped, so an operator who chooses #298 afterwards keeps it. */
+#define KEY_STILL_VER      "still_v2"
 #define KEY_STILL_NOTICE   "still_note"
 #define KEY_SPUR_SUP       "spur_sup"
 #define KEY_FT8_EARLY_DEC  "ft8_earlydec"
@@ -831,6 +835,54 @@ void settings_init(void)
 
     s_ready = true;
 
+    /* ---- ONE-SHOT MIGRATION: the still-display default is now DIAL-CENTRED ---
+     *
+     * ⛔ WHY A MIGRATION AND NOT JUST A CHANGED DEFAULT. still_view is PERSISTED
+     * (KEY_STILL_VIEW), so flipping the compile-time default in load_from_nvs()
+     * changes nothing on a unit that has ever saved it - which is every unit that
+     * has run a build new enough to have the setting. That is precisely why this
+     * has to run once here, with a writable handle, rather than being left to the
+     * default.
+     *
+     * ⛔ WHY THE DEFAULT IS BEING REVERSED AT ALL. The operator, 2026-10-16, on a
+     * KX3 bench: "we need to keep the tuned frequency in the center of the
+     * screen. When I change the frequency on the radio the water fall should
+     * scroll left and right leaving the tuned frequency line in the middle.
+     * When I touch to tune the frequency should be changed to the location that
+     * I touch and centered and waterfall updated after I untouch." Still
+     * Display (#298) does the opposite by design - it holds the spectrum and
+     * moves the CURSOR, and it splits the touch gesture so a swipe PANS and
+     * only a dwell-then-drag TUNES. Reported as "touch to tune isn't working
+     * any longer", which it is not broken, it is the other mode.
+     *
+     * This is a REVERSAL of an operator-requested feature (#298, the
+     * point-and-hold-then-drag gesture is quoted from him, 2026-08-31), not a
+     * bug fix, and it is recorded as such. The setting is untouched and still in
+     * the drawer: he can have either mode with one tap, and this migration only
+     * decides which one a unit STARTS in.
+     *
+     * ⚠ THE PAN PEEK IS INERT WITH IT OFF, and that is the trade being made.
+     * The 2 s auto-recentre after a touch-pan (ui.c, PAN_RECENTRE_MS) only has
+     * meaning while a pan can exist; in dial-centred mode any drag is a retune,
+     * so there is no pan left to undo. The two modes are mutually exclusive by
+     * construction - "any drag tunes" and "any drag peeks" cannot both be true.
+     *
+     * ONE-SHOT, version-stamped, same idiom as the WSPR schedule migration below:
+     * the marker key is written in the same breath, so this can never re-run and
+     * can never re-apply to a value the operator chose afterwards. Touches no
+     * other key - radio kind, dongle identity and callsign are all left alone. */
+    {
+        uint8_t still_ver = 0;
+        if (nvs_get_u8(s_nvs, KEY_STILL_VER, &still_ver) != ESP_OK || still_ver < 1) {
+            nvs_set_u8(s_nvs, KEY_STILL_VIEW, 0);   /* 0 = dial-centred */
+            nvs_set_u8(s_nvs, KEY_STILL_VER,  1);
+            nvs_commit(s_nvs);
+            ESP_LOGI(TAG, "still_view migration v1: dial-centred is now the default "
+                          "(spectrum follows the dial; a drag retunes). Set "
+                          "\"Still spectrum\" in the drawer to get #298 back.");
+        }
+    }
+
     // Seed s_pending from NVS so the setters' "unchanged, skip write" checks
     // compare against the persisted value, not a zero-initialized struct.
     // Without this, the first call to a setter in a session that happens to
@@ -885,7 +937,8 @@ static void load_from_nvs(qmx_settings_t *out)
      * dial-centred view turns it off in the drawer, and is told once that they
      * can - see the notice in ui.c. still_notice_done stays false so an
      * upgrading unit shows that notice exactly once. */
-    out->still_view = true;      // opt-OUT, same reason as the line above
+    out->still_view = false;     // dial-centred is the default - see the
+                                 // still_view migration in settings_init()
     // Spur suppression is opt-IN for now: it nudges the dial 25 Hz to learn a
     // frequency, which is a visible side effect, and it is out with the beta
     // testers before it can be a default.

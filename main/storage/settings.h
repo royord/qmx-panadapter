@@ -506,7 +506,10 @@ typedef struct {
      * still and the VFO marker moves across them; false = the old behaviour,
      * the view re-centres on the dial on every tune. A real preference, not a
      * dev switch: it changes how the main screen is read. */
-    bool     still_view;        // spectrum holds, VFO moves (default TRUE)
+    bool     still_view;        // spectrum holds, VFO moves (DEFAULT FALSE -
+                                // dial-centred, reversed 2026-10-16 at the
+                                // operator's request; one-shot migration in
+                                // settings_init() moves existing units off it)
     bool     still_notice_done; // the one-time "you can switch back" toast has been shown
     uint8_t  spur_mode;         // 0=off 1=subtract 2=interpolate (see spur_map.h); default 0, opt-in
     bool     ft8_early_decode; // FT8 monitoring: cut capture ~1.8 s early so decodes surface BEFORE the

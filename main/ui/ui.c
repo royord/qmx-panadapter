@@ -4180,6 +4180,11 @@ static int     s_wf_view_x     = WF_MARGIN;
 static int64_t s_wf_anchor_hz  = 0;
 static int32_t s_wf_anchor_span = 0;
 static bool    s_wf_anchor_ok  = false;
+/* Which mode the anchor was taken in, and whether that has ever been recorded.
+ * The anchor is the absolute frequency at canvas column 0, and it is only
+ * meaningful for the mode that produced it - see wf_track_viewport(). */
+static bool    s_wf_anchor_still    = false;
+static bool    s_wf_anchor_mode_ok  = false;
 static int     s_wf_stroll_off = 0;   /* the pan gesture's own offset, added on top */
 
 static void wf_apply_x(void);    /* defined beside the row push, used from ui_init */
@@ -10358,20 +10363,54 @@ static void wf_blank_cols(int x, int n)
  * since the last tick is applied in one shift and the fresh row lands in the
  * right place.
  *
- * ⛔ STILL MODE ONLY. In centred mode the view follows the dial by definition,
- * so tracking it would scroll the history away on every tune - a visible change
- * to the behaviour people already have, and the switch exists precisely so that
- * choosing "centred" gets today's device back exactly. The same latent smear is
- * present there and is left alone deliberately. */
+ * RUNS IN BOTH MODES as of 2026-10-16 - it used to be still-mode only and
+ * deliberately left a "latent smear" in centred mode. That smear is what the
+ * operator reported as "the waterfall doesn't seem to move with the frequency
+ * change ... so that I can watch my tuned frequency line up with the water
+ * fall object". The reasoning for excluding it was backwards; see the long note
+ * at the top of the function. */
 static void wf_track_viewport(void)
 {
     if (!s_wf_canvas_buf) return;
 
-    if (!sv_effective()) {
-        if (s_wf_view_x != WF_MARGIN || s_wf_anchor_ok) {
-            wf_clear_all();          /* leaving still mode: history is not aligned */
-        }
-        return;
+    /* ⛔ THIS NOW RUNS IN BOTH MODES, and that is the fix for a defect the
+     * previous version documented and deliberately left.
+     *
+     * It used to read: "⛔ STILL MODE ONLY. In centred mode the view follows the
+     * dial by definition, so tracking it would scroll the history away on every
+     * tune ... The same latent smear is present there and is left alone
+     * deliberately." - and then it cleared the waterfall instead of tracking.
+     *
+     * The reasoning inverts once you follow the pixels. A waterfall row is not
+     * relative to anything: it is a picture of ABSOLUTE frequencies, and it stays
+     * true forever. Tuning by delta moves the VIEW WINDOW by delta, which does
+     * not move the truth - it only moves where on screen that truth should be
+     * drawn. So the correct response is to shift the image by the same delta, and
+     * then a signal stays vertically under itself in the waterfall while the
+     * cursor walks to meet it.
+     *
+     * That is what "tracking it would scroll the history away" describes - and
+     * scrolling the history IS the point. Not tracking it is what smeared: the
+     * old rows stayed at their old pixel columns, the axis and the tuned-frequency
+     * line moved over them, and the two described DIFFERENT frequencies. The
+     * operator reported it as "the waterfall doesn't seem to move with the
+     * frequency change" and then, exactly, "so that I can watch my tuned
+     * frequency line up with the water fall object" (2026-10-16).
+     *
+     * ⚠ ONE CASE STILL CLEARS, AND IT IS THE ONLY ONE: switching between the two
+     * modes. The anchor records the frequency at canvas column 0 for the mode
+     * that produced it, and the two modes ask different questions of the same
+     * canvas (one holds the window still, the other carries it with the dial), so
+     * an anchor carried across a mode change is meaningless and the history it
+     * describes cannot be shown correctly. Scale changes clear for the same class
+     * of reason, already handled below.
+     */
+    if (s_wf_anchor_mode_ok && s_wf_anchor_still != (sv_effective() != 0)) {
+        ESP_LOGI(TAG, "wf: mode changed - history is not aligned to the new view, clearing");
+        wf_clear_all();
+        s_wf_anchor_ok     = false;
+        s_wf_anchor_mode_ok = false;
+        s_wf_view_x        = WF_MARGIN;
     }
 
     int32_t span = 0;
@@ -10382,9 +10421,11 @@ static void wf_track_viewport(void)
      * a different Hz/px and rescaling them would be a lie. Start again. */
     if (!s_wf_anchor_ok || s_wf_anchor_span != span) {
         wf_clear_all();
-        s_wf_anchor_span = span;
-        s_wf_anchor_hz   = view_lo - (int64_t)WF_MARGIN * span / DISPLAY_H_RES;
-        s_wf_anchor_ok   = true;
+        s_wf_anchor_span   = span;
+        s_wf_anchor_hz     = view_lo - (int64_t)WF_MARGIN * span / DISPLAY_H_RES;
+        s_wf_anchor_ok     = true;
+        s_wf_anchor_still  = (sv_effective() != 0);
+        s_wf_anchor_mode_ok = true;
         return;
     }
 
