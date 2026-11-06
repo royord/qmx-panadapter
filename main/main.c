@@ -53,6 +53,8 @@
 #include "ft8_qso.h"
 #include "ft8_pileup.h"
 #include "ft8_sim.h"
+#include "cw_qso.h"
+#include "js8_sim.h"
 #include "net/pskreporter.h"
 #include "net/spots.h"
 #include "net/qrz_coords.h"
@@ -199,6 +201,14 @@ void app_main(void)
     // operator sent a diagnostic download containing everything except the one
     // thing needed. No-op on a clean boot.
     panic_hook_report_previous();
+
+    /* T138: and the other record, which covers the reset the one above cannot
+     * see. A hardware-watchdog reset never runs the panic handler, so it
+     * leaves no crash record - Michael KZ4LY's v1.23.1 reset came back as
+     * reset_reason=other-watchdog with nothing else at all. This one is
+     * written by the code ENTERING a cache-off stretch, not by a handler, so
+     * it survives a reset that gives the CPU no turn. No-op on a clean boot. */
+    panic_hook_report_previous_crumb();
 
     // Apply any pending selective NVS reset requested from the web UI before a
     // reboot. Must run before nvs_flash_init()/settings_init() open handles on
@@ -594,6 +604,29 @@ void app_main(void)
                     12000);
     }
 
+    /* ⛔ SAY IT ON THE SCREEN WHEN NOTHING CAN BE SAVED.
+     *
+     * Sergei AA1SL, issue #21: a Tab5 installed with the M5Launcher, whose
+     * partition layout has no `user_nvs`. The firmware opens no settings
+     * store, every setter becomes a no-op, and the device receives perfectly
+     * while forgetting the callsign - at which point every transmit refuses
+     * with "Set your callsign first". He re-flashed twice, the same way, and
+     * had no way to know he was chasing the wrong thing.
+     *
+     * Same reasoning as the brownout toast above: the firmware knew and told
+     * only the serial console. Longer, because this one is not a one-off -
+     * EVERY save this session will fail - and it names the cure, because the
+     * cure is not something an operator would guess. */
+    if (!settings_persist_ok()) {
+        ESP_LOGE(TAG, "SETTINGS CANNOT BE SAVED - the user_nvs partition did not open. "
+                      "Nothing entered this session will be kept. Re-flash with the "
+                      "project flasher and choose E (clean), which rewrites the "
+                      "partition table; the M5Launcher's layout has no user_nvs.");
+        ui_toast_ms("Settings cannot be saved on this unit - nothing you enter will be kept. "
+                    "Re-flash with the QMX-Panadapter flasher and choose E (clean).",
+                    30000);
+    }
+
     // Restore last-known VFO frequency (display only; QMX is source of truth).
     if (cfg->last_vfo_hz != 0) {
         ESP_LOGI(TAG, "Restored last VFO: %lu Hz", (unsigned long)cfg->last_vfo_hz);
@@ -607,16 +640,23 @@ void app_main(void)
     /* #302: the stored frequency punctuation, applied before any UI is built.
        Every caller reads g_freq_style at format time, so this is the only
        place it has to be set. */
+    uint8_t cw_rows_boot = 0;
     {
         /* Heap, not stack - same reasoning as the cfg block above. */
         qmx_settings_t *fs = heap_caps_malloc(sizeof(*fs), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (fs) {
             settings_load_all(fs);
             g_freq_style = (fs->freq_sep_style == 1) ? FREQ_STYLE_COMMA : FREQ_STYLE_DOTS;
+            cw_rows_boot = fs->cw_decode_rows;
             heap_caps_free(fs);
         }
     }
     cw_decode_init();
+    /* AFTER cw_decode_init(): it creates the mutex that cw_decode_set_rows()
+       takes, and clears the grid the setter would otherwise have just wiped.
+       The stored choice has to reach the decoder, not only the UI, because it
+       is the wrap modulus - see cw_decode_set_rows(). */
+    if (cw_rows_boot == 2 || cw_rows_boot == 4) cw_decode_set_rows(cw_rows_boot);
     /* No USB host means no CDC-ACM to find. Starting CAT anyway leaves its
      * link task retrying a device that cannot appear, and the UI showing a
      * radio that is not there. */
@@ -728,6 +768,8 @@ void app_main(void)
     render_waterfall_set_floor_blend((float)cfg->wf_floor_blend / 100.0f);
     dsp_set_window(cfg->wf_window);
     render_set_waterfall_rows_per_s(cfg->wf_rows_per_s);
+    ui_set_peak_hold_s(cfg->spec_peak_s);
+    rx_audio_set_cw_peak_hz(cfg->cw_peak_hz);
     if (cfg != &s_cfg_fallback) heap_caps_free(cfg);  // last read of cfg - see its declaration above
     cfg = NULL;
 
@@ -796,6 +838,7 @@ void app_main(void)
     ft8_qso_init();
     ft8_pileup_init();
     ft8_sim_init();
+    js8_sim_init();
     pskreporter_init();
     spots_init();          // live POTA spots on the spectrum (WiFi, opt-out)
     psk_rx_selftest();     // attribute names still match the collector's output
@@ -841,6 +884,12 @@ void app_main(void)
     ft8_hash_selftest();
     ft8_sim_synth_selftest();
     ft8_arrl_fd_e2e_selftest();
+    cw_qso_hint_selftest();   // CW copilot classifier (no radio needed)
+    /* ⛔ NOT ui_apply_saved_mode() - feat/cw-page called that here, but main
+     * has since SPLIT it into ui_apply_saved_mode_view() (before the backlight
+     * fades in, above) and ui_apply_saved_mode_start() (already called above,
+     * where audio/dsp/cat exist). Restoring the single call would not even
+     * link. */
 
     // Background firmware-update poller for the docs Reader page. Self-throttles
     // (first check ~30 s after boot, then every 6 h) and no-ops while WiFi is

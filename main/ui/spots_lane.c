@@ -184,7 +184,10 @@ static work_t *s_w;
 
 // What each drawn callsign points at, so a tap can act on it. The label carries
 // its index here in user_data (stored +1, so 0 means "nothing").
-typedef struct { uint32_t freq_hz; uint8_t mode; uint32_t colour; int16_t x; } tap_target_t;
+/* The callsign rides along so a tap can record WHO is being worked, not just
+ * where - the manual log window pre-fills from it (operator, 2026-10-27). */
+typedef struct { uint32_t freq_hz; uint8_t mode; uint32_t colour; int16_t x;
+                 char call[16]; } tap_target_t;
 static tap_target_t s_label_target[MAX_LABELS];
 static int          s_label_n = 0;      // how many labels are currently drawn
 
@@ -211,7 +214,14 @@ static int freq_to_x(uint32_t hz)
 {
     if (s_view_hi <= s_view_lo) return -1;
     double span = (double)s_view_hi - (double)s_view_lo;
-    return (int)(((double)hz - (double)s_view_lo) / span * (double)DISPLAY_H_RES);
+    /* Across the DRAWN view, which the CW page narrows to clear its keyer pane.
+     * The lane sits on top of the spectrum, so it has to use the trace's
+     * mapping - a spot 320 px from where its signal is drawn is worse than no
+     * spot at all. ui_spec_x0() is 0 everywhere else, so the panadapter and
+     * the host self-test below are unchanged. */
+    const int x0 = ui_spec_x0();
+    const int vw = DISPLAY_H_RES - x0;
+    return x0 + (int)(((double)hz - (double)s_view_lo) / span * (double)vw);
 }
 
 // Full opacity while fresh, linearly down to half at AGE_HALF_S, hidden past
@@ -383,7 +393,8 @@ static void repaint(void)
         s_w->opa[i]    = age_opa(s_w->buf[i].heard_unix, now);
     }
 
-    // The off-screen counts are scoped to the BAND we are looking at, not to all
+    // The off-screen counts are scoped to the BAND we are looking at (on the CW
+    // page, to its CW + DiGi range - see ui_page_range_hz()), not to all
     // of HF. Counting globally (the first cut) reported things like "51 <" while
     // every one of those spots was on 40 m and 80 m - an arrow inviting the
     // operator to tune somewhere that has nothing to do with where they are.
@@ -396,7 +407,10 @@ static void repaint(void)
     {
         uint32_t mid = s_view_lo + (s_view_hi - s_view_lo) / 2;
         uint32_t lo, hi;
-        if (ui_validate_band_freq_hz(mid, &lo, &hi)) { band_lo = lo; band_hi = hi; }
+        /* The PAGE's range, not merely the band's: on the CW page that is the
+         * CW + DiGi segments the tune clamp allows, and a counter pointing past
+         * it invites a jump the page will refuse. */
+        if (ui_page_range_hz(mid, &lo, &hi)) { band_lo = lo; band_hi = hi; }
     }
 
     // Split into visible / off-screen-left / off-screen-right.
@@ -421,7 +435,7 @@ static void repaint(void)
             continue;
         }
         int x = freq_to_x(s_w->buf[i].freq_hz);
-        if (x < 0 || x >= DISPLAY_H_RES) continue;
+        if (x < ui_spec_x0() || x >= DISPLAY_H_RES) continue;
         s_w->idx[vis_n] = (uint16_t)i;
         s_w->x[vis_n]   = (int16_t)x;
         vis_n++;
@@ -484,7 +498,7 @@ static void repaint(void)
         int gap = (tag && tg) ? 4 : 0;
         int w = call_w + gap + tag_w;                   // combined block width
         int x = s_w->x[i] - w / 2;                      // centre the BLOCK on its tick
-        if (x < 0) x = 0;
+        if (x < ui_spec_x0()) x = ui_spec_x0();
         if (x + w > DISPLAY_H_RES) x = DISPLAY_H_RES - w;
 
         int row = pick_row(x, w, row_end);
@@ -503,6 +517,8 @@ static void repaint(void)
         s_label_target[used].mode    = (uint8_t)sp->mode;
         s_label_target[used].colour  = s_w->colour[si];
         s_label_target[used].x       = (int16_t)s_w->x[i];   // the tick, for drag-snap
+        snprintf(s_label_target[used].call, sizeof(s_label_target[used].call),
+                 "%s", sp->call);
         lv_obj_set_user_data(lb, (void *)(uintptr_t)(used + 1));
         lv_obj_clear_flag(lb, LV_OBJ_FLAG_HIDDEN);
 
@@ -567,14 +583,30 @@ static void repaint(void)
     // edge of the spectrum gives no clue what it counts or that it can be tapped
     // (operator's request). The arrow still says which way they are.
     char b[24];
+    // ⛔ THE LEFT COUNTER MUST FOLLOW ui_spec_x0(), AND IT IS RE-ALIGNED EVERY
+    // REPAINT, NOT ALIGNED ONCE AT BUILD. The lane object is full width, so
+    // LV_ALIGN_BOTTOM_LEFT means the screen's left edge - which on the CW page
+    // is 256 px underneath the keyer pane. Operator-reported 2026-09-11: on the
+    // CW page only "spots (n) >" was visible, never "< spots (n)". The right
+    // one was fine because it anchors to the right edge, which no pane covers.
+    // Build-time alignment cannot work here: the pane appears and disappears as
+    // the operator swipes between pages, so the inset has to be re-applied -
+    // which is also why the right label has always been re-aligned below.
+    // Everything else in this file already respected x0 (freq_to_x(), the tick
+    // clip, the label clamp); these two objects were the gap.
+    const int ex0 = ui_spec_x0();      // CW page's keyer pane width; 0 elsewhere
     if (off_l > 0 && s_edge_l) {
         snprintf(b, sizeof(b), "< spots (%d)", off_l);
         lv_label_set_text(s_edge_l, b);
         // Coloured like the spot it will take you to, so it reads as part of the
         // same picture rather than as chrome (operator's request).
         lv_obj_set_style_text_color(s_edge_l, lv_color_hex(s_off_l.colour ? s_off_l.colour : COL_POTA), 0);
+        lv_obj_align(s_edge_l, LV_ALIGN_BOTTOM_LEFT, ex0 + EDGE_INSET, -EDGE_INSET);
         lv_obj_clear_flag(s_edge_l, LV_OBJ_FLAG_HIDDEN);
-        if (s_edge_l_hit) lv_obj_clear_flag(s_edge_l_hit, LV_OBJ_FLAG_HIDDEN);
+        if (s_edge_l_hit) {
+            lv_obj_align(s_edge_l_hit, LV_ALIGN_BOTTOM_LEFT, ex0, 0);
+            lv_obj_clear_flag(s_edge_l_hit, LV_OBJ_FLAG_HIDDEN);
+        }
     }
     if (off_r > 0 && s_edge_r) {
         snprintf(b, sizeof(b), "spots (%d) >", off_r);
@@ -655,6 +687,10 @@ static void tune_to_spot(const tap_target_t *t, const char *what)
     // Via the poll task: the LVGL thread must never write the CDC pipe directly
     // (it races the FA/MD/FW poll and the QMX answers '?;').
     if (mode) cat_request_mode(mode);
+    /* Remember WHO, so the manual log window opens with the callsign already
+     * in it. Kept in spots.c rather than here because the pick outlives this
+     * lane - the operator tunes, works the station, then opens the log. */
+    spots_note_pick(t->call, t->mode, t->freq_hz);
 }
 
 // Highlight: the callsign inverts - its own colour becomes the fill and the text

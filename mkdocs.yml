@@ -24,12 +24,14 @@ nav:
   - Getting Help: getting-help.md
   - User Guide:
     - Panadapter: guide/panadapter.md
-    - Audio (beta): guide/audio.md
+    - Audio: guide/audio.md
     - Live Spots: guide/spots.md
     - Spot Map: guide/spot-map.md
     - Web UI: guide/web-ui.md
     - FT8 RX: guide/ft8-rx.md
     - FT8 TX: guide/ft8-tx.md
+    - CW (beta): guide/cw.md
+    - Web Radio: guide/webradio.md
     - JS8 (beta): guide/js8.md
     - Time Sync: guide/time-sync.md
     - WSPR: guide/wspr.md
@@ -39,6 +41,7 @@ nav:
     - Gestures & Controls: reference/gestures.md
     - Hardware: reference/hardware.md
     - Web API: reference/web-api.md
+    - Hamlib rigctld: reference/rigctld.md
     - Troubleshooting: reference/troubleshooting.md
     - Glossary: reference/glossary.md
   - For Builders:

@@ -1,5 +1,7 @@
 #include "cat.h"
 #include "radio.h"        // which radio we are wired to - CAT identity + IQ source
+#include "cat_keying_cmds.h"
+#include "tx_band_guard.h"
 #include "util/cat_restore.h"   // what the band scan sends to undo itself
 
 #include <string.h>
@@ -24,6 +26,7 @@
 
 #include "wspr_rx.h"   // wspr_pa_guard_release_pending - see the VN; handler
 #include "ui.h"
+#include "cw_screen_view.h"   // cw_screen_feed_decoded() (TB; RX path)
 #include "diag_log.h"
 #include "cw_decode.h"   // TB; - the QMX decodes CW itself, we just read it
 #include "settings.h"     // cw_tx_offset_hz - the CW split maintainer reads it live
@@ -64,6 +67,48 @@ static TaskHandle_t s_poll_task = NULL;
 static EventGroupHandle_t s_evt_group = NULL;
 static cdc_acm_dev_hdl_t s_cdc_dev = NULL;
 static volatile bool s_cat_ready = false;
+
+/* ⭐ THE ONE PLACE A CAT COMMAND LEAVES THIS FIRMWARE (T46).
+ *
+ * Every write to the radio goes through here. Before 2026-10-21 this file made
+ * 68 `cdc_acm_host_data_tx_blocking()` calls, 65 of them repeating
+ * `s_cdc_dev` plus the cast, the length and the timeout by hand. Jim KC9KKO
+ * found that while writing a network transport and had to re-apply the same
+ * funnel on every release of ours; it was 63 sites when he measured it on
+ * v1.16.11,
+ * which is the shape of the problem - roughly one new write site a week.
+ * (A plain grep says 69 or 71: two of those are comments, and one is this
+ * function's own call. The number of CALL SITES was 68.)
+ *
+ * ⛔ THE REASON TO DO IT IS NOT THE NETWORK TRANSPORT. We are not taking that
+ * (the radio and the Tab5 are co-located by design, and handing the burst
+ * schedule to a relay would move transmit timing - and six unattended keying
+ * paths - onto software this tree cannot audit). It is that 65 copies of a
+ * transport call cannot be changed, instrumented or guarded in one place.
+ *
+ * ⚠ IT TAKES A LOCAL COPY OF THE HANDLE, deliberately. Every old call site
+ * passed the global straight in, so a site that had already checked
+ * `if (!s_cdc_dev)` could still hand NULL to the driver if EVT_DEV_GONE
+ * cleared it in between - two tasks on one `cdc_acm_dev_hdl_t` is what
+ * aborted the device for Dirk DK7CVD (2026-06-29). The copy does not close
+ * that race (the handle can still be closed under us), it only stops the NULL.
+ *
+ * ⚠ NO SITE INSPECTS A SPECIFIC ERROR from the write - checked across all 65
+ * before the conversion - so returning ESP_ERR_INVALID_STATE for a missing
+ * device flips no caller's logic. Sites that test `!= ESP_OK`, `== ESP_OK`, or
+ * ignore the result all behave as before.
+ *
+ * ⛔ THREE WRITES ARE DELIBERATELY NOT ROUTED THROUGH THIS, and each says so
+ * at the site: the two terminal-probe writes (a separate handle on the QMX's
+ * port 2, not the CAT port) and cat_usb_shutdown()'s last "TA0;RX;" (it holds
+ * its own copy taken before it clears s_cdc_dev, and that ordering IS the
+ * discipline - reading the global there would undo it). */
+static esp_err_t cat_tx(const void *data, size_t len, uint32_t timeout_ms)
+{
+    cdc_acm_dev_hdl_t dev = s_cdc_dev;
+    if (!dev) return ESP_ERR_INVALID_STATE;
+    return cdc_acm_host_data_tx_blocking(dev, (const uint8_t *)data, len, timeout_ms);
+}
 
 bool cat_is_ready(void)
 {
@@ -324,6 +369,43 @@ static volatile bool s_force_rx_pending = false;
 static volatile uint32_t s_pending_af_gain_p1 = 0;
 // Set when someone wants the radio's current AF gain read back (drawer open).
 static volatile bool s_af_gain_query_pending = false;
+/* T139 sidetone (CW monitor) level, both halves of it. +1 encoded like the AF
+ * gain: 0 has to mean "nothing pending" while a genuine request of 0 (silent
+ * monitor) still goes through. The abs/rel pending flag is a tri-state because
+ * both of its real values are meaningful. */
+static volatile uint32_t s_pending_sidetone_vol_p1 = 0;
+static volatile int      s_pending_sidetone_abs    = -1;   /* -1 = nothing pending */
+static volatile bool     s_sidetone_query_pending  = false;
+static volatile int      s_sidetone_vol = -1;              /* -1 = never read */
+static volatile int      s_sidetone_abs = -1;              /* -1 unknown, 0 rel, 1 abs */
+/* Top of the range as the RADIO reported it during MM discovery. 0 = not
+ * known, which the drawer reads as "offer no control" - the operation manual
+ * documents the default (70) and no range, so there is nothing to hard-code
+ * that would not be an invention. */
+static volatile uint16_t s_sidetone_vol_max = 0;
+/* T144 (Michael KZ4LY / Gyula HA3HZ): Semi QSK mode + its paired delay.
+ * MM path and list discovered LIVE on bench1 2026-11-04 via the cat_raw dev
+ * endpoint - not guessed: MMCW|CW Keyer|Semi QSK (type 5 List, list type
+ * 18) and MMCW|CW Keyer|Custom Semi QSK (type 3 Number, 0-999). ML18;
+ * answered "OFF|Auto|Contest|Custom dits|Custom decidits|Custom ms",
+ * matching the 1_04_001 manual's own wording exactly, so CW_QSK_MODES
+ * below is hardcoded rather than re-discovered every boot - same choice
+ * the WSPR/SSB/CW bandwidth lists elsewhere in this project already make
+ * for a firmware-fixed list. A write of "Auto" was read back as "Auto" on
+ * the bench and took effect with no MU; needed (unlike sidetone/PA
+ * voltage/CW profile) - send it anyway; relying on this radio's "MM
+ * Effect" setting staying Instant on every unit would be the same bet
+ * that cost a whole session on the PA-voltage guard.
+ * CW_QSK_MODE_COUNT lives in cat.h - shared with callers that build a
+ * selector from cat_cw_qsk_modes(). */
+static const char *const s_qsk_modes[CW_QSK_MODE_COUNT] = {
+    "OFF", "Auto", "Contest", "Custom dits", "Custom decidits", "Custom ms",
+};
+static char              s_pending_qsk_mode[20] = "";  /* "" = nothing pending */
+static volatile int      s_pending_qsk_delay     = -1;  /* -1 = nothing pending */
+static volatile bool     s_qsk_query_pending     = false;
+static char              s_qsk_mode[20]          = "";  /* "" = never read */
+static volatile int      s_qsk_delay             = -1;  /* -1 = never read */
 /* +1 encoded for the same reason as the AF gain above: 0 has to mean
  * "nothing pending" while a genuine request of 0 WPM (straight key)
  * still goes through. */
@@ -558,6 +640,15 @@ void cat_user_pause_set(bool paused)
         s_rf_gain_query_pending = false;
         s_pending_keyer_p1      = 0;
         s_keyer_query_pending   = false;
+        /* T139: and the sidetone pair, which matters more than most here - the
+         * operator pauses us precisely to use the radio's own CW menu, and
+         * these two live in it. Flushing a queued write minutes later would
+         * overwrite what they just set by hand. The READ-BACKS are dropped
+         * too, and the stored values below are left alone on purpose: they are
+         * last known, which is what the surfaces label them as. */
+        s_pending_sidetone_vol_p1 = 0;
+        s_pending_sidetone_abs    = -1;
+        s_sidetone_query_pending  = false;
         ESP_LOGI(TAG, "CAT paused by operator - radio released (no polling)");
     } else {
         // Coming back: the radio may have been through its own menu, which can
@@ -565,6 +656,10 @@ void cat_user_pause_set(bool paused)
         // the handshake before trusting the spectrum again - the poll task does
         // it on its next cycle, since it owns the pipe.
         s_pending_iq_reassert = true;
+        /* T139: re-read the sidetone pair. The pause exists so the operator
+         * can work the radio's own CW menu, which is where both of these
+         * live, so assuming they are unchanged is exactly the wrong bet. */
+        s_sidetone_query_pending = true;
         ESP_LOGI(TAG, "CAT resumed by operator - re-checking IQ mode");
     }
 }
@@ -595,6 +690,34 @@ void cat_query_af_gain(void)
     s_af_gain_query_pending = true;
 }
 
+/* ---- T139: the CW sidetone (monitor) level -------------------------------
+ * See cat.h for why this is MM and not a two-letter command, why nothing is
+ * cached in NVS, and why the write is deferred to a slider RELEASE. */
+void cat_request_sidetone_vol(uint16_t v)
+{
+    uint16_t top = s_sidetone_vol_max;
+    /* No discovered range means no write. Clamping against a number invented
+     * here would send the radio a value its own menu may refuse, and the
+     * refusal arrives as a bare ?; that tells the operator nothing. */
+    if (!top) return;
+    if (v > top) v = top;
+    s_pending_sidetone_vol_p1 = (uint32_t)v + 1;
+}
+
+void cat_request_sidetone_absolute(bool absolute)
+{
+    s_pending_sidetone_abs = absolute ? 1 : 0;
+}
+
+void cat_query_sidetone(void)
+{
+    s_sidetone_query_pending = true;
+}
+
+int cat_get_sidetone_vol(void)      { return s_sidetone_vol; }
+int cat_get_sidetone_absolute(void) { return s_sidetone_abs; }
+uint16_t cat_sidetone_vol_max(void) { return s_sidetone_vol_max; }
+
 int cat_get_cw_offset_hz(void) { return s_cw_offset_hz; }
 bool cat_qmx_gps_source_internal(void) { return s_qmx_gps_source_internal; }
 bool cat_qmx_gps_source_known(void)    { return s_qmx_gps_source_known; }
@@ -617,6 +740,50 @@ bool cat_qmx_fw_at_least(int major, int minor, int patch)
 // 1_04+) is transmitting. See cat_tune_poll_set_active() in cat.h.
 static volatile bool s_tune_poll_active = false;
 void cat_tune_poll_set_active(bool active) { s_tune_poll_active = active; }
+
+// ---- CW keyer / decoder surface (CW page, v1.4) ----------------------------
+// KY send text is staged here by the LVGL thread and drained by the poll task
+// (same pattern as s_pending_ssb_bw). The buffer holds ONE pending message:
+// the QMX's own 80-char circular KY buffer does the real queuing, so a second
+// tap before the first drained just replaces an un-sent staging copy.
+// KY message format. The QMX has TWO separate KY implementations selected by
+// its own "KY TS480" System Config item: the default QRP Labs / Elecraft-like
+// free-length form ("KY <text>;") and the Kenwood TS480 form (a FIXED
+// 24-character space-padded message). On the bench QMX+ (fw 1_04_004) the
+// free-length form is accepted but never keys - TB's t-field, the only honest
+// "is it keying" observable, stays 0, while the radio's own front-panel
+// message send does move it (see docs/cw-page-design.md). The TS480 path is a
+// different code path inside the radio and is the cheapest remaining thing to
+// try. Set true ONLY together with "KY TS480 = YES" on the radio - the two
+// must agree.
+//
+// If TS480 turns out to be the working path, this is also where the ABORT
+// answer lives: in that mode a message of ALL SPACES stops sending.
+#define CAT_KY_TS480_LEN 24
+static volatile bool    s_ky_ts480_compat = false;  // EXPERIMENT 2026-08-04
+static char             s_pending_cw_send[96];
+static portMUX_TYPE     s_cw_send_mux = portMUX_INITIALIZER_UNLOCKED;
+/* s_keyer_wpm is declared once near the top - the branch had its own copy,
+ * removed with the rest of its keyer pipeline (merge 2026-10-19). */
+static volatile int     s_cw_tx_remaining = -1;       // TB t-field, -1 unknown
+static volatile bool    s_cw_poll_active = false;     // TB; poll while CW page shown
+
+void cat_request_cw_send(const char *text)
+{
+    if (!text || !text[0]) return;
+    portENTER_CRITICAL(&s_cw_send_mux);
+    strncpy(s_pending_cw_send, text, sizeof(s_pending_cw_send) - 1);
+    s_pending_cw_send[sizeof(s_pending_cw_send) - 1] = '\0';
+    portEXIT_CRITICAL(&s_cw_send_mux);
+}
+
+int  cat_get_cw_tx_remaining(void) { return s_cw_tx_remaining; }
+
+void cat_cw_poll_set_active(bool active)
+{
+    s_cw_poll_active = active;
+    if (!active) s_cw_tx_remaining = -1;   // stale TX-progress must not linger
+}
 esp_err_t cat_send_raw_cmd(const char *fmt, ...)
 {
     if (!s_cdc_dev) return ESP_ERR_INVALID_STATE;
@@ -634,7 +801,65 @@ esp_err_t cat_send_raw_cmd(const char *fmt, ...)
      * 2026-08-29: a burst at a hand-set 7.5 V announced PA=15.0 V. A label that
      * can be stale is worse than one that admits it does not know. */
     if (strstr(buf, "Max. PA voltage")) s_pa_voltage_x10 = -1;
-    return cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)buf, len, 200);
+    return cat_tx(buf, len, 200);
+}
+
+/* ⛔ THE ONE DOOR FOR CAT TEXT FROM OUTSIDE THE FIRMWARE - T64.
+ *
+ * `/api/cmd {"action":"cat_raw","cmd":"TX;"}` keyed the radio in every release
+ * up to v1.20.3: cat_send_raw_cmd() has no guard, and the action has no gate,
+ * so any browser that could reach the web UI could transmit on any frequency.
+ * The band guard's six other sites are found by grepping our source for the
+ * literal "TX;" (tools/check_tx_guard.py), and a command that arrives at
+ * RUNTIME is invisible to that - the checker passed the build that shipped it.
+ * Proven reachable on the released build 2026-10-22 with a harmless `FA;`.
+ *
+ * So the fix is not another call site, it is a DOOR: one place that runtime
+ * text has to pass, which classifies it and consults the guard with the RF that
+ * would actually be emitted. The checker now refuses any direct
+ * cat_send_raw_cmd() under main/net/, which is what keeps the next pass-through
+ * (T63) honest.
+ */
+esp_err_t cat_send_external_cmd(const char *cmd, char *err, size_t err_len)
+{
+    if (err && err_len) err[0] = '\0';
+    if (!cmd || !cmd[0]) return ESP_ERR_INVALID_ARG;
+    if (!s_cdc_dev) return ESP_ERR_INVALID_STATE;
+
+    cat_keying_t k;
+    cat_keying_classify(cmd, &k);
+    if (k.keys) {
+        /* ⛔ The dial is the only thing we know about what this will emit, so
+         * not knowing it is a refusal here. The internal paths are documented
+         * to pass in that case - a guard that blocks every burst on a flaky
+         * link is worse than one gap - but a raw command is never the only way
+         * to get a signal out, so refusing costs the operator nothing. */
+        uint32_t dial = cat_get_frequency();
+        if (dial == 0) {
+            ESP_LOGW("cat", "external cmd REFUSED (%s keys, dial unknown): %s", k.verb, cmd);
+            if (err && err_len) {
+                snprintf(err, err_len,
+                         "%s would key the radio and the dial is not known yet", k.verb);
+            }
+            return ESP_ERR_NOT_ALLOWED;
+        }
+        /* dial + audio is what goes on the air, which is the whole lesson of
+         * the 60 m fault. With no TA in the text the carrier is at the dial. */
+        uint32_t lo = dial, hi = dial;
+        if (k.audio_known) {
+            lo = dial + k.audio_hz;
+            hi = lo;
+        }
+        char why[96];
+        if (!tx_band_guard_allows(lo, hi, "raw CAT", why, sizeof(why))) {
+            ESP_LOGW("cat", "external cmd REFUSED (%s): %s - %s", k.verb, cmd, why);
+            if (err && err_len) snprintf(err, err_len, "%s", why);
+            return ESP_ERR_NOT_ALLOWED;
+        }
+        ESP_LOGW("cat", "external cmd KEYS (%s) and the guard allowed it at %lu Hz: %s",
+                 k.verb, (unsigned long)lo, cmd);
+    }
+    return cat_send_raw_cmd("%s", cmd);
 }
 
 esp_err_t cat_query_power_swr(float *power_w, float *swr)
@@ -644,7 +869,7 @@ esp_err_t cat_query_power_swr(float *power_w, float *swr)
     s_pc_resp_len = 0;
     s_sw_resp_len = 0;
 
-    esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"PC;SW;", 6, 200);
+    esp_err_t err = cat_tx("PC;SW;", 6, 200);
     if (err != ESP_OK) return err;
 
     for (int wi = 0; wi < 20 && (s_pc_resp_len == 0 || s_sw_resp_len == 0); wi++) {
@@ -686,7 +911,7 @@ esp_err_t cat_pwr_swr_async_send(void)
     if (!s_cdc_dev) return ESP_ERR_INVALID_STATE;
     s_pc_resp_len = 0;
     s_sw_resp_len = 0;
-    return cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"PC;SW;", 6, 50);
+    return cat_tx("PC;SW;", 6, 50);
 }
 
 // Parse whatever response has arrived since the last _send(). Returns ESP_OK
@@ -972,7 +1197,7 @@ static void diag_log_rx(const char *msg, size_t len)
     // Dedup routine poll responses (fixed short strings: FA…=14, MD…=4, FW…=7).
     // A response longer than its cache slot is treated as non-routine (e.g. a
     // garble) and always logged.
-    static char last_fa[16], last_md[8], last_fw[12];
+    static char last_fa[16], last_md[8], last_fw[12], last_tb[52];
     char  *slot    = NULL;
     size_t slot_sz = 0;
     // TB is polled several times a second in CW and is EMPTY most of the time.
@@ -992,6 +1217,10 @@ static void diag_log_rx(const char *msg, size_t len)
     if      (len >= 2 && msg[0] == 'F' && msg[1] == 'A') { slot = last_fa; slot_sz = sizeof(last_fa); }
     else if (len >= 2 && msg[0] == 'M' && msg[1] == 'D') { slot = last_md; slot_sz = sizeof(last_md); }
     else if (len >= 2 && msg[0] == 'F' && msg[1] == 'W') { slot = last_fw; slot_sz = sizeof(last_fw); }
+    // TB polls at 1 Hz while the CW page is up; the empty "TB000;" response is
+    // the steady state and would swamp the ring. Responses WITH decoded text
+    // differ each time and are high-value, so the dedup passes them through.
+    else if (len >= 2 && msg[0] == 'T' && msg[1] == 'B') { slot = last_tb; slot_sz = sizeof(last_tb); }
     if (slot && len < slot_sz) {
         if (strcmp(msg, slot) == 0) return;   // unchanged poll response — skip
         memcpy(slot, msg, len + 1);           // cache new value (len+1 <= slot_sz)
@@ -1008,7 +1237,31 @@ static void process_cat_message(const char *msg, size_t len)
     // characters. cw_decode_feed() re-validates the whole frame and drops
     // anything malformed rather than letting it into the text.
     if (len >= 6 && msg[0] == 'T' && msg[1] == 'B') {
-        cw_decode_feed(msg);
+        /* ⛔ BOTH CONSUMERS, FROM ONE PARSE. This branch used to call only
+         * cw_decode_feed() and then return, which made the SECOND TB branch
+         * further down - the one feeding cw_screen_feed_decoded() and setting
+         * s_cw_tx_remaining - unreachable: its condition is a strict subset of
+         * this one. So from the moment cw_decode.c was added the CW page's
+         * ticker, cw_qso's callsign capture, the station card, the copilot
+         * hints and the ESM ladder all received nothing, while the panadapter
+         * line and /api/status kept working - which is exactly how it
+         * presented on the bench (operator, 2026-09-11): decoded text in the
+         * API, the placeholder still on the CW page.
+         *
+         * cw_decode_parse_tb() is the portable, fully-validating parser
+         * (host-tested in test/cw_decode_harness.c) - so parse ONCE here and
+         * hand the payload to both, rather than having two parsers of the same
+         * frame that can disagree. */
+        char cw_buf[CW_DECODE_MAX_CHUNK + 1];
+        int  tx_pending = 0;
+        int  cw_n = cw_decode_parse_tb(msg, cw_buf, sizeof(cw_buf), &tx_pending);
+        if (cw_n >= 0) {
+            s_cw_tx_remaining = tx_pending;
+            cw_decode_feed(msg);                          /* line model + web */
+            if (cw_n > 0) cw_screen_feed_decoded(cw_buf, cw_n);  /* CW page */
+        } else {
+            ESP_LOGW(TAG, "Bad TB response (len=%u)", (unsigned)len);
+        }
         return;
     }
     if (len == 14 && msg[0] == 'F' && msg[1] == 'A') {
@@ -1149,6 +1402,25 @@ static void process_cat_message(const char *msg, size_t len)
         s_gp_resp[len] = '\0';
         return;
     }
+    // TB response: "TBtnns...;" - t = KY chars remaining (0-9, 0 = receive
+    // mode), nn = decoded-char count, s = that many decoded characters from
+    // the QMX's own CW decoder (buffer is emptied by the read). A decoded ';'
+    // would split the tokenizer early and land here with a short len - warn
+    // and drop rather than feed a truncated fragment (no ';' in the standard
+    // CW charset, so this is theoretical).
+    /* (The second TB branch that used to live here is gone: it was unreachable
+     * behind the one at the top of this function, which returns for every TB
+     * response. Its two jobs - s_cw_tx_remaining and cw_screen_feed_decoded()
+     * - are done up there now, off the same single parse.) */
+
+    /* ⛔ THE BRANCH'S KS PARSER IS DELETED HERE - MERGE 2026-10-19, and this
+     * one was dangerous rather than merely redundant. It returned for every KS
+     * reply, so main's parser further down never ran - and main's is the one
+     * that accepts 0..999 and reads 0 as straight-key mode (Ralph DL1HR's
+     * keyer work). Keeping both would have silently reverted that on this
+     * branch while the code for it sat right there, unreachable. Exactly the
+     * shadowed-duplicate shape the TB note above records. */
+
     // TM response: "TMhhmmss;" - 9 chars, real-time-clock time-of-day.
     if (len == 9 && msg[0] == 'T' && msg[1] == 'M') {
         s_tm_resp_us  = esp_timer_get_time();   // stamp arrival for GPS-tick phase lock
@@ -1440,6 +1712,9 @@ int cat_probe_terminal(void)
     s_termprobe_len = 0;
     ESP_LOGW(TAG, "terminal probe: sending CR to port 2");
     const uint8_t cr = '\r';
+    /* ⛔ NOT cat_tx(): `h` is a SEPARATE handle this function opened on the
+     * QMX's port 2, and cat_tx() writes to the CAT port. Routing it would send
+     * the probe down the wrong interface. */
     cdc_acm_host_data_tx_blocking(h, &cr, 1, 200);
     vTaskDelay(pdMS_TO_TICKS(1500));
 
@@ -1460,7 +1735,7 @@ int cat_probe_terminal(void)
     }
     // Leave the session as we found it: Ctrl-Q backs out of any nested app.
     const uint8_t ctrl_q = 0x11;
-    cdc_acm_host_data_tx_blocking(h, &ctrl_q, 1, 200);
+    cdc_acm_host_data_tx_blocking(h, &ctrl_q, 1, 200);   /* ⛔ port 2, as above */
     vTaskDelay(pdMS_TO_TICKS(200));
     cdc_acm_host_close(h);
     return n;
@@ -2010,8 +2285,7 @@ static void cw_filters_read(void)
         char q[40];
         int  n = snprintf(q, sizeof(q), "MMCW|Choose filters|%d;", i);
         s_mm_resp_len = 0;
-        if (n <= 0 || cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)q,
-                                                    (size_t)n, 200) != ESP_OK) {
+        if (n <= 0 || cat_tx(q, (size_t)n, 200) != ESP_OK) {
             ESP_LOGW(TAG, "CW filters: write failed at index %d - offering all widths", i);
             s_cw_filter_mask = 0;
             return;
@@ -2042,8 +2316,208 @@ static void cw_filters_read(void)
     s_cw_filter_mask = mask;
 }
 
-/* Defined further down, beside the link-up sequence that also uses it. */
+/* ---- T139: read the sidetone pair off the radio ---------------------------
+ *
+ * One MM read each, both clean (only MM *writes* spray a menu redraw back at
+ * us). Called from the same places as cw_filters_read() plus on demand when a
+ * surface opens, because unlike the filter mask these two are things the
+ * operator may change on the radio's own CW menu mid-session.
+ *
+ * Paths are the operation manual's own spelling, CW menu: "Sidetone volume"
+ * and "Sidetone abs/rel". By NAME and not by index: the manual recommends it,
+ * and unlike "Choose filters" these row names are words, so there is no
+ * name-looks-like-an-index trap here (#350). */
+#define MM_SIDETONE_VOL  "MMCW|Sidetone volume"
+#define MM_SIDETONE_ABS  "MMCW|Sidetone abs/rel"
+
+/* Wait for an MM answer to land in s_mm_resp. Returns false on silence or on a
+ * bare "?;" refusal. Callers clear s_mm_resp_len before transmitting. */
+static bool mm_answer_wait(int tenths)
+{
+    for (int i = 0; i < tenths && s_mm_resp_len == 0; i++) vTaskDelay(pdMS_TO_TICKS(10));
+    if (s_mm_resp_len < 3 || strncmp(s_mm_resp, "MM", 2) != 0) return false;
+    if (strncmp(s_mm_resp, "MM?", 3) == 0) return false;
+    return true;
+}
+
+/* Discovery: ask the radio what KIND of parameter the sidetone volume is, and
+ * derive the slider's top from that instead of hard-coding one.
+ *
+ * MMCW|Sidetone volume?;  ->  MM<type>|<len>|Sidetone volume;
+ *
+ * type 4 is Byte, which the CAT manual defines as 0-255. type 3 is Number with
+ * <len> giving the character length of the value field, so len 2 means 0-99.
+ * Anything else is not a number and we must not offer a slider for it. */
+static void sidetone_discover(void)
+{
+    s_mm_resp_len = 0;
+    const char *q = MM_SIDETONE_VOL "?;";
+    if (cat_tx(q, strlen(q), 200) != ESP_OK || !mm_answer_wait(30)) {
+        /* Older firmware, or a radio that does not have this menu item. Not
+         * worth alarming about - the surfaces simply do not offer the control,
+         * which is the honest outcome. */
+        ESP_LOGI(TAG, "sidetone: no discovery answer - the monitor-level control "
+                      "will not be offered");
+        s_sidetone_vol_max = 0;
+        return;
+    }
+    /* "MM4|0|Sidetone volume;" - type, then the length field, then the name. */
+    int type = atoi(s_mm_resp + 2);
+    const char *bar = strchr(s_mm_resp + 2, '|');
+    int len = bar ? atoi(bar + 1) : 0;
+
+    uint16_t top = 0;
+    if (type == 4) {
+        top = 255;                       /* Byte, per the CAT manual */
+    } else if (type == 3 && len >= 1 && len <= 3) {
+        top = 1;
+        for (int i = 0; i < len; i++) top = (uint16_t)(top * 10);
+        top = (uint16_t)(top - 1);       /* len 2 -> 99 */
+    } else {
+        ESP_LOGW(TAG, "sidetone: discovery says type %d len %d ('%s') - not a "
+                      "number this can offer a slider for", type, len, s_mm_resp);
+        s_sidetone_vol_max = 0;
+        return;
+    }
+    s_sidetone_vol_max = top;
+    ESP_LOGI(TAG, "sidetone: volume is MM type %d, range 0-%u (from the radio, "
+                  "not assumed)", type, (unsigned)top);
+}
+
+/* Read both current values. Leaves a getter at -1 if the radio did not answer,
+ * which the surfaces show as "reading..." rather than inventing a number. */
+static void sidetone_read(void)
+{
+    s_mm_resp_len = 0;
+    const char *qv = MM_SIDETONE_VOL ";";
+    if (cat_tx(qv, strlen(qv), 200) == ESP_OK && mm_answer_wait(30)) {
+        int v = atoi(s_mm_resp + 2);
+        if (v >= 0 && (s_sidetone_vol_max == 0 || v <= (int)s_sidetone_vol_max))
+            s_sidetone_vol = v;
+    }
+    vTaskDelay(pdMS_TO_TICKS(40));
+
+    s_mm_resp_len = 0;
+    const char *qa = MM_SIDETONE_ABS ";";
+    if (cat_tx(qa, strlen(qa), 200) == ESP_OK && mm_answer_wait(30)) {
+        /* The radio answers with the list VALUE, and the CAT manual's own
+         * example shows it upper-cased ("MMIAMBIC A;") where the menu prints
+         * mixed case - so match on the first letter, case-insensitively,
+         * rather than on an exact spelling we have not measured. */
+        char c = s_mm_resp[2];
+        if (c == 'A' || c == 'a')      s_sidetone_abs = 1;
+        else if (c == 'R' || c == 'r') s_sidetone_abs = 0;
+        else ESP_LOGW(TAG, "sidetone: abs/rel answered '%s', which is neither", s_mm_resp);
+    }
+}
+
+/* Defined further down, beside the link-up sequence that also uses it -
+ * needed here too, by qsk_apply_pending() below. */
 static bool iq_mode_handshake(int max_attempts);
+
+#define MM_QSK_MODE  "MMCW|CW Keyer|Semi QSK"
+#define MM_QSK_DELAY "MMCW|CW Keyer|Custom Semi QSK"
+
+/* T144: read both halves. The mode answer is a full word ("OFF", "Auto",
+ * "Custom dits"...), unlike sidetone abs/rel's single-letter match - matched
+ * against the known list exactly, case-sensitively, since that is what the
+ * radio was measured to answer with and an unrecognised reply is worth
+ * seeing rather than silently coercing to the nearest guess. */
+static void qsk_read(void)
+{
+    s_mm_resp_len = 0;
+    const char *qm = MM_QSK_MODE ";";
+    if (cat_tx(qm, strlen(qm), 200) == ESP_OK && mm_answer_wait(30)) {
+        const char *v = s_mm_resp + 2;
+        bool matched = false;
+        for (int i = 0; i < CW_QSK_MODE_COUNT; i++) {
+            if (strcmp(v, s_qsk_modes[i]) == 0) {
+                strncpy(s_qsk_mode, v, sizeof(s_qsk_mode) - 1);
+                s_qsk_mode[sizeof(s_qsk_mode) - 1] = '\0';
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) ESP_LOGW(TAG, "Semi QSK answered '%s', not one of the known modes", v);
+    }
+    vTaskDelay(pdMS_TO_TICKS(40));
+
+    s_mm_resp_len = 0;
+    const char *qd = MM_QSK_DELAY ";";
+    if (cat_tx(qd, strlen(qd), 200) == ESP_OK && mm_answer_wait(30)) {
+        int v = atoi(s_mm_resp + 2);
+        if (v >= 0 && v <= 999) s_qsk_delay = v;
+    }
+}
+
+/* T144 drain, on the poll task - same shape as sidetone_apply_pending():
+ * both halves in one pass, one MU; reload, then read back and say whether
+ * it actually landed. Returns true if it used the pipe this cycle. */
+static bool qsk_apply_pending(void)
+{
+    char mode_rq[sizeof(s_pending_qsk_mode)];
+    strncpy(mode_rq, s_pending_qsk_mode, sizeof(mode_rq) - 1);
+    mode_rq[sizeof(mode_rq) - 1] = '\0';
+    int delay_rq = s_pending_qsk_delay;
+    if (!mode_rq[0] && delay_rq < 0) return false;
+    s_pending_qsk_mode[0] = '\0';   /* claim both before the slow part */
+    s_pending_qsk_delay   = -1;
+
+    char cmd[56];
+    if (mode_rq[0]) {
+        int n = snprintf(cmd, sizeof(cmd), MM_QSK_MODE "=%s;", mode_rq);
+        if (n > 0) cat_tx(cmd, (size_t)n, 200);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    if (delay_rq >= 0) {
+        int n = snprintf(cmd, sizeof(cmd), MM_QSK_DELAY "=%d;", delay_rq);
+        if (n > 0) cat_tx(cmd, (size_t)n, 200);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+
+    /* Measured NOT strictly needed for Semi QSK on bench1 (readback matched
+     * with no MU; sent) - sent anyway rather than betting every unit's "MM
+     * Effect" setting stays Instant, which is exactly the assumption that
+     * cost a session on the PA-voltage guard (see its own comment above). */
+    cat_tx("MU;", 3, 200);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    iq_mode_handshake(4);
+
+    qsk_read();
+
+    bool mode_ok  = !mode_rq[0] || strcmp(s_qsk_mode, mode_rq) == 0;
+    bool delay_ok = delay_rq < 0 || s_qsk_delay == delay_rq;
+    if (mode_ok && delay_ok) {
+        ESP_LOGI(TAG, "Semi QSK: radio now reports %s, delay %d ms",
+                 s_qsk_mode[0] ? s_qsk_mode : "(unknown)", s_qsk_delay);
+    } else {
+        ESP_LOGW(TAG, "Semi QSK: only PARTLY applied - asked %s / %d ms, radio "
+                      "reports %s / %d ms. Try again; if it repeats, set it on "
+                      "the radio's own CW menu.",
+                 mode_rq[0] ? mode_rq : "(unchanged)", delay_rq,
+                 s_qsk_mode[0] ? s_qsk_mode : "(unknown)", s_qsk_delay);
+    }
+    return true;
+}
+
+void cat_request_cw_qsk_mode(const char *mode)
+{
+    if (!mode) return;
+    strncpy(s_pending_qsk_mode, mode, sizeof(s_pending_qsk_mode) - 1);
+    s_pending_qsk_mode[sizeof(s_pending_qsk_mode) - 1] = '\0';
+}
+
+void cat_request_cw_qsk_delay(int ms)
+{
+    if (ms < 0) ms = 0;
+    if (ms > 999) ms = 999;
+    s_pending_qsk_delay = ms;
+}
+
+void cat_query_cw_qsk(void) { s_qsk_query_pending = true; }
+const char *cat_get_cw_qsk_mode(void) { return s_qsk_mode; }
+int cat_get_cw_qsk_delay(void) { return s_qsk_delay; }
+const char *const *cat_cw_qsk_modes(void) { return s_qsk_modes; }
 
 bool cat_apply_cw_profile(uint16_t centre_hz, uint8_t mask)
 {
@@ -2079,13 +2553,12 @@ static bool cw_center_write_confirmed(uint16_t centre_hz)
         char cmd[40];
         int n = snprintf(cmd, sizeof(cmd), "MMCW|CW center=%u;", (unsigned)centre_hz);
         if (n > 0)
-            cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd, (size_t)n, 200);
+            cat_tx(cmd, (size_t)n, 200);
         vTaskDelay(pdMS_TO_TICKS(200));      /* let the menu redraw finish */
 
         s_mm_resp_len = 0;
         const char *q = "MMCW|CW center;";
-        if (cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)q,
-                                          strlen(q), 200) != ESP_OK) continue;
+        if (cat_tx(q, strlen(q), 200) != ESP_OK) continue;
         for (int wi = 0; wi < 30 && s_mm_resp_len == 0; wi++) vTaskDelay(pdMS_TO_TICKS(10));
         if (s_mm_resp_len >= 4 && strncmp(s_mm_resp, "MM", 2) == 0 &&
             atoi(s_mm_resp + 2) == (int)centre_hz) {
@@ -2128,7 +2601,7 @@ static bool cw_profile_apply_pending(void)
         int n = snprintf(cmd, sizeof(cmd), "MMCW|Choose filters|%d=%s;",
                          i, (mask & (1u << i)) ? "ENABLED" : "DISABLED");
         if (n > 0)
-            cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd, (size_t)n, 200);
+            cat_tx(cmd, (size_t)n, 200);
         /* 120 ms, not 40: an MM write sprays a menu redraw back at us and the
          * next command must not arrive into it. 40 ms was measured refusing the
          * write that followed the eighth row. */
@@ -2143,7 +2616,7 @@ static bool cw_profile_apply_pending(void)
      * on the WSPR PA guard, where the read-back agreed and the radio still ran
      * at full power. */
     const char *mu = "MU;";
-    cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)mu, 3, 200);
+    cat_tx(mu, 3, 200);
     vTaskDelay(pdMS_TO_TICKS(250));
 
     /* ⛔ AND MU; DROPS IQ MODE. Q9 is session state, so the reload leaves the
@@ -2169,6 +2642,76 @@ static bool cw_profile_apply_pending(void)
     return true;
 }
 
+/* ---- T139: drain of the sidetone writes, on the poll task ----------------
+ *
+ * Both halves in ONE pass, then ONE reload. They are nearly always set
+ * together (switch to Absolute, then pick a level), and MU; costs a flat
+ * spectrum while the IQ handshake runs - so paying that once for two writes
+ * rather than twice is the whole reason this is a combined drain and not two.
+ *
+ * ⛔ READ BACK, DO NOT TRUST THE WRITE. The exact same MM write inside the CW
+ * profile burst was refused with a bare ?; while the writes around it landed,
+ * and the apply still logged success because it had only checked that the
+ * bytes went out (2026-09-07, cw_center_write_confirmed). The confirming read
+ * here is the point; the write is not.
+ *
+ * Returns true if it used the pipe this cycle. */
+static bool sidetone_apply_pending(void)
+{
+    uint32_t vol_p1 = s_pending_sidetone_vol_p1;
+    int      abs_rq = s_pending_sidetone_abs;
+    if (!vol_p1 && abs_rq < 0) return false;
+    s_pending_sidetone_vol_p1 = 0;        /* claim both before the slow part */
+    s_pending_sidetone_abs    = -1;
+
+    char cmd[48];
+    if (abs_rq >= 0) {
+        int n = snprintf(cmd, sizeof(cmd), MM_SIDETONE_ABS "=%s;",
+                         abs_rq ? "Absolute" : "Relative");
+        if (n > 0) cat_tx(cmd, (size_t)n, 200);
+        /* 120 ms, not 40: an MM write sprays a menu redraw back down the port
+         * and the next command must not arrive into it - 40 ms was measured
+         * refusing the write that followed (cw_profile_apply_pending). */
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    if (vol_p1) {
+        int n = snprintf(cmd, sizeof(cmd), MM_SIDETONE_VOL "=%u;",
+                         (unsigned)(vol_p1 - 1));
+        if (n > 0) cat_tx(cmd, (size_t)n, 200);
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+
+    /* ⛔ WITHOUT THIS THE RADIO HAS STORED IT AND APPLIED NOTHING. "MM Effect"
+     * defaults to on demand, which cost a whole bench session on the WSPR PA
+     * guard where every read-back agreed and the radio still ran at full
+     * power. */
+    cat_tx("MU;", 3, 200);
+    vTaskDelay(pdMS_TO_TICKS(250));
+    /* ⛔ AND MU; DROPS IQ MODE - Q9 is session state, so the reload leaves the
+     * radio streaming ordinary audio and the spectrum goes flat. */
+    iq_mode_handshake(4);
+
+    int want_vol = vol_p1 ? (int)(vol_p1 - 1) : -1;
+    sidetone_read();
+
+    bool vol_ok = (want_vol < 0) || (s_sidetone_vol == want_vol);
+    bool abs_ok = (abs_rq  < 0)  || (s_sidetone_abs == abs_rq);
+    if (vol_ok && abs_ok) {
+        ESP_LOGI(TAG, "sidetone: radio now reports volume %d, %s", s_sidetone_vol,
+                 s_sidetone_abs == 1 ? "Absolute" :
+                 s_sidetone_abs == 0 ? "Relative" : "abs/rel unknown");
+    } else {
+        ESP_LOGW(TAG, "sidetone: only PARTLY applied - asked volume %d / %s, radio "
+                      "reports %d / %s. Try again; if it repeats, set it on the "
+                      "radio's own CW menu.",
+                 want_vol, abs_rq < 0 ? "(unchanged)" : abs_rq ? "Absolute" : "Relative",
+                 s_sidetone_vol,
+                 s_sidetone_abs == 1 ? "Absolute" :
+                 s_sidetone_abs == 0 ? "Relative" : "unknown");
+    }
+    return true;
+}
+
 static bool cw_offset_refresh(void)
 {
     /* MMCW|CW offset; is the QMX's menu; the KX3's pitch lives in its own
@@ -2181,7 +2724,7 @@ static bool cw_offset_refresh(void)
 
     const char *q = "MMCW|CW offset;";
     s_mm_resp_len = 0;
-    if (cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)q, strlen(q), 200) != ESP_OK) {
+    if (cat_tx(q, strlen(q), 200) != ESP_OK) {
         return true;   // transient; the poll's own error handling owns the link
     }
     for (int wi = 0; wi < 10 && s_mm_resp_len == 0; wi++) vTaskDelay(pdMS_TO_TICKS(10));
@@ -2252,11 +2795,11 @@ static bool cw_split_maintain(void)
         if (base != 0) {
             char fb[20];
             int n = snprintf(fb, sizeof fb, "FB%011lu;", (unsigned long)base);
-            efb = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)fb, (size_t)n, 200);
+            efb = cat_tx(fb, (size_t)n, 200);
             vTaskDelay(pdMS_TO_TICKS(30));
         }
         // Now stand down: back to simplex, transmitting where we listen.
-        esp_err_t e = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"SP0;", 4, 200);
+        esp_err_t e = cat_tx("SP0;", 4, 200);
         // ⚠ AND PUT THE VFO MODE BACK, which SP0; does NOT do. The QMX has a single
         // three-state VFO Mode - A / B / Split - and the CAT manual is explicit that
         // it is FR/FT that select it: "0, 1, 2 correspond to VFO A, VFO B or Split
@@ -2267,7 +2810,7 @@ static bool cw_split_maintain(void)
         // been "fixed" twice: B matched A, split read off, and the display was still
         // A/B. FR0; is what actually returns the radio to plain VFO A.
         vTaskDelay(pdMS_TO_TICKS(30));
-        esp_err_t efr = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"FR0;", 4, 200);
+        esp_err_t efr = cat_tx("FR0;", 4, 200);
         // The manual says FR and FT both select the same three-state VFO Mode, so send
         // BOTH - and then ASK, because FR0; alone demonstrably did not clear the A/B
         // display and I am not going to guess a fourth time. The answers arrive as
@@ -2275,16 +2818,16 @@ static bool cw_split_maintain(void)
         // for "FA"), which is enough to tell whether the mode really is 0 and the
         // display is driven by something else, or the write is simply not landing.
         vTaskDelay(pdMS_TO_TICKS(30));
-        cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"FT0;", 4, 200);
+        cat_tx("FT0;", 4, 200);
         vTaskDelay(pdMS_TO_TICKS(30));
-        cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"FR;", 3, 200);
+        cat_tx("FR;", 3, 200);
         vTaskDelay(pdMS_TO_TICKS(30));
-        cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"FT;", 3, 200);
+        cat_tx("FT;", 3, 200);
         // Ask the radio to confirm simplex, judged on a later cycle above.
         vTaskDelay(pdMS_TO_TICKS(30));
         s_split_readback = -1;
         s_split_verify_pending = true;
-        cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"SP;", 3, 200);
+        cat_tx("SP;", 3, 200);
         s_split_engaged = false;
         s_split_warned = false;
         ESP_LOGI(TAG, "CW TX offset off - VFO B -> %lu (%s), split off (%s), VFO mode A (%s)",
@@ -2313,20 +2856,20 @@ static bool cw_split_maintain(void)
     if (tx < 0) tx = 0;
     char cmd[20];
     int n = snprintf(cmd, sizeof cmd, "FB%011lld;", (long long)tx);
-    esp_err_t e1 = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd, (size_t)n, 200);
+    esp_err_t e1 = cat_tx(cmd, (size_t)n, 200);
     vTaskDelay(pdMS_TO_TICKS(30));
     // SP1 is re-sent with every FB, not just on the first one: it is one short
     // command, and it is the difference between "the offset is applied" and
     // "we quietly transmitted on top of the station" if the radio dropped split
     // while we were not looking.
-    esp_err_t e2 = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"SP1;", 4, 200);
+    esp_err_t e2 = cat_tx("SP1;", 4, 200);
     // Ask what actually happened. The answer lands asynchronously in
     // s_split_readback and is judged on a later cycle, so this costs one short
     // write and no waiting.
     vTaskDelay(pdMS_TO_TICKS(30));
     s_split_readback = -1;
     s_split_warned = false;
-    cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"SP;", 3, 200);
+    cat_tx("SP;", 3, 200);
     s_split_engaged = true;
     s_split_base_hz = base;
     s_split_last_us = now;
@@ -2359,8 +2902,7 @@ static bool iq_mode_handshake(int max_attempts)
     s_iq_mode_confirmed = false;
     for (int attempt = 1; attempt <= max_attempts; attempt++) {
         const char *iq_on = "Q9 1;";
-        esp_err_t terr = cdc_acm_host_data_tx_blocking(
-            s_cdc_dev, (const uint8_t *)iq_on, 5, 200);
+        esp_err_t terr = cat_tx(iq_on, 5, 200);
         if (terr == ESP_OK) {
             ESP_LOGI(TAG, "QMX IQ mode enabled (Q9 1;) attempt %d/%d",
                      attempt, max_attempts);
@@ -2382,8 +2924,7 @@ static bool iq_mode_handshake(int max_attempts)
         vTaskDelay(pdMS_TO_TICKS(150));
         s_q9_resp_len = 0;
         const char *iq_q = "Q9;";
-        esp_err_t qerr = cdc_acm_host_data_tx_blocking(
-            s_cdc_dev, (const uint8_t *)iq_q, strlen(iq_q), 200);
+        esp_err_t qerr = cat_tx(iq_q, strlen(iq_q), 200);
         if (qerr == ESP_OK) {
             for (int wi = 0; wi < 20 && s_q9_resp_len == 0; wi++) {
                 vTaskDelay(pdMS_TO_TICKS(20));
@@ -2569,7 +3110,7 @@ static void poll_task(void *arg)
             s_pending_mode_digit = 0;
             char cmd[8];
             cmd[0] = 'M'; cmd[1] = 'D'; cmd[2] = md; cmd[3] = ';'; cmd[4] = 0;
-            esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd, 4, 200);
+            esp_err_t err = cat_tx(cmd, 4, 200);
             ESP_LOGI(TAG, "mode -> MD%c; (%s)", md, err == ESP_OK ? "ok" : "fail");
             vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
             continue;
@@ -2577,7 +3118,7 @@ static void poll_task(void *arg)
         if (s_af_gain_query_pending) {
             s_af_gain_query_pending = false;
             static const char q[] = "AG;";
-            esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)q, 3, 200);
+            esp_err_t err = cat_tx(q, 3, 200);
             ESP_LOGI(TAG, "AF gain query AG; (%s)", err == ESP_OK ? "sent" : "fail");
             vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
             continue;
@@ -2592,8 +3133,7 @@ static void poll_task(void *arg)
             // is in 0.25 dB steps, range 0-799 per the manual.
             char cmd[16];
             int n = snprintf(cmd, sizeof cmd, "AG0%03u;", ag);
-            esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd,
-                                                          (size_t)n, 200);
+            esp_err_t err = cat_tx(cmd, (size_t)n, 200);
             ESP_LOGI(TAG, "AF gain -> %s (%.2f dB) (%s)", cmd, ag * 0.25,
                      err == ESP_OK ? "ok" : "fail");
             if (err == ESP_OK) s_af_gain_query_pending = true;   // see the RF gain branch
@@ -2603,7 +3143,7 @@ static void poll_task(void *arg)
         if (s_keyer_query_pending) {
             s_keyer_query_pending = false;
             static const char q[] = "KS;";
-            esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)q, 3, 200);
+            esp_err_t err = cat_tx(q, 3, 200);
             ESP_LOGI(TAG, "Keyer speed query KS; (%s)", err == ESP_OK ? "sent" : "fail");
             vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
             continue;
@@ -2616,8 +3156,7 @@ static void poll_task(void *arg)
              * same shape its AG/RG commands use. */
             char cmd[16];
             int n = snprintf(cmd, sizeof cmd, "KS%03u;", ks);
-            esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd,
-                                                          (size_t)n, 200);
+            esp_err_t err = cat_tx(cmd, (size_t)n, 200);
             ESP_LOGI(TAG, "Keyer speed -> %s (%s)", cmd, err == ESP_OK ? "ok" : "fail");
             /* ⛔ ALWAYS READ BACK. A successful CDC write only proves the
              * bytes reached the radio - the lesson Q9/IQ mode taught the hard
@@ -2630,7 +3169,7 @@ static void poll_task(void *arg)
         if (s_rf_gain_query_pending) {
             s_rf_gain_query_pending = false;
             static const char q[] = "RG;";
-            esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)q, 3, 200);
+            esp_err_t err = cat_tx(q, 3, 200);
             ESP_LOGI(TAG, "RF gain query RG; (%s)", err == ESP_OK ? "sent" : "fail");
             vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
             continue;
@@ -2642,21 +3181,19 @@ static void poll_task(void *arg)
             // covers hz == 0 on its own, which is how RIT gets switched off.
             char cmd[24];
             int n = snprintf(cmd, sizeof cmd, "RC;");
-            esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd,
-                                                          (size_t)n, 200);
+            esp_err_t err = cat_tx(cmd, (size_t)n, 200);
             if (err == ESP_OK && hz != 0) {
                 vTaskDelay(pdMS_TO_TICKS(20));
                 unsigned mag = (unsigned)(hz < 0 ? -hz : hz);
                 n = snprintf(cmd, sizeof cmd, "%s%03u;", hz > 0 ? "RU" : "RD", mag);
-                err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd,
-                                                    (size_t)n, 200);
+                err = cat_tx(cmd, (size_t)n, 200);
                 vTaskDelay(pdMS_TO_TICKS(20));
                 n = snprintf(cmd, sizeof cmd, "RT1;");
-                cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd, (size_t)n, 200);
+                cat_tx(cmd, (size_t)n, 200);
             } else if (err == ESP_OK) {
                 vTaskDelay(pdMS_TO_TICKS(20));
                 n = snprintf(cmd, sizeof cmd, "RT0;");
-                cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd, (size_t)n, 200);
+                cat_tx(cmd, (size_t)n, 200);
             }
             if (err == ESP_OK) s_rit_hz = hz;
             ESP_LOGI(TAG, "RIT -> %+d Hz (%s)", hz, err == ESP_OK ? "ok" : "fail");
@@ -2674,8 +3211,7 @@ static void poll_task(void *arg)
             // re-reads on open rather than replaying a stored number).
             char cmd[16];
             int n = snprintf(cmd, sizeof cmd, "RG%03u;", rg);
-            esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd,
-                                                          (size_t)n, 200);
+            esp_err_t err = cat_tx(cmd, (size_t)n, 200);
             ESP_LOGI(TAG, "RF gain -> %s (%s)", cmd, err == ESP_OK ? "ok" : "fail");
             // Confirm it from HERE, after the value has gone out. Queued from the
             // requesting side it would be served first (this loop checks the query
@@ -2695,7 +3231,7 @@ static void poll_task(void *arg)
             s_split_query_pending = false;
             if (!s_split_engaged) {
                 s_split_readback = -1;
-                cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"SP;", 3, 200);
+                cat_tx("SP;", 3, 200);
                 vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
                 continue;
             }
@@ -2704,8 +3240,7 @@ static void poll_task(void *arg)
             s_pa_query_pending = false;
             const char *q = "MMProtection|Max. PA voltage;";
             s_pa_awaiting_reply = true;
-            if (cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)q,
-                                              strlen(q), 200) != ESP_OK) {
+            if (cat_tx(q, strlen(q), 200) != ESP_OK) {
                 s_pa_awaiting_reply = false;   /* nothing is coming */
             }
             vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
@@ -2717,7 +3252,7 @@ static void poll_task(void *arg)
             char mm[48];
             int n = snprintf(mm, sizeof(mm), "MMProtection|Max. PA voltage=%u.%u;",
                              (unsigned)(pav / 10), (unsigned)(pav % 10));
-            esp_err_t e = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)mm, n, 200);
+            esp_err_t e = cat_tx(mm, n, 200);
             ESP_LOGW(TAG, "PA voltage -> %u.%u V (%s)", (unsigned)(pav / 10),
                      (unsigned)(pav % 10), e == ESP_OK ? "ok" : "fail");
             /* ⭐ AND NOW MAKE THE RADIO ACTUALLY USE IT.
@@ -2742,7 +3277,7 @@ static void poll_task(void *arg)
             if (e == ESP_OK) {
                 vTaskDelay(pdMS_TO_TICKS(120));
                 const char *mu = "MU;";
-                if (cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)mu, 3, 200) == ESP_OK) {
+                if (cat_tx(mu, 3, 200) == ESP_OK) {
                     ESP_LOGW(TAG, "PA voltage: MU; sent - config reloaded so the "
                                   "new limit takes effect (MM Effect may be 'On demand')");
                     vTaskDelay(pdMS_TO_TICKS(250));
@@ -2769,12 +3304,43 @@ static void poll_task(void *arg)
             // Write both to the same value: live applies AND there's nothing
             // for the FW; poll to revert to. Result sticks and persists.
             int n = snprintf(mm, sizeof(mm), "MMSSB|Filter RX=%lu;", (unsigned long)bw);
-            esp_err_t e1 = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)mm, n, 200);
+            esp_err_t e1 = cat_tx(mm, n, 200);
             vTaskDelay(pdMS_TO_TICKS(40));
             n = snprintf(mm, sizeof(mm), "MMSSB|Bandwidth=%lu;", (unsigned long)bw);
-            esp_err_t e2 = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)mm, n, 200);
+            esp_err_t e2 = cat_tx(mm, n, 200);
             ESP_LOGI(TAG, "SSB filter -> %lu Hz (RX=%s, BW=%s)", (unsigned long)bw,
                      e1 == ESP_OK ? "ok" : "fail", e2 == ESP_OK ? "ok" : "fail");
+            vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
+            continue;
+        }
+        /* T139 sidetone read-back, ahead of its own write for the same reason
+         * the AF gain query is: a surface has just opened and is showing
+         * "reading...". Discovery runs once per link, lazily - it is one extra
+         * round trip and only the first open pays it. */
+        if (s_sidetone_query_pending) {
+            s_sidetone_query_pending = false;
+            if (s_sidetone_vol_max == 0) sidetone_discover();
+            if (s_sidetone_vol_max != 0) sidetone_read();
+            vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
+            continue;
+        }
+        /* The write, which ends in MU; + the IQ handshake - so like the CW
+         * profile it goes ahead of the routine maintainers and nothing else
+         * should be half-done around it. */
+        if (sidetone_apply_pending()) {
+            vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
+            continue;
+        }
+        /* T144: same lazy-once-per-open discovery as sidetone above - no
+         * range to discover first (the list is fixed), so just read both
+         * halves straight away. */
+        if (s_qsk_query_pending) {
+            s_qsk_query_pending = false;
+            qsk_read();
+            vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
+            continue;
+        }
+        if (qsk_apply_pending()) {
             vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
             continue;
         }
@@ -2783,7 +3349,7 @@ static void poll_task(void *arg)
             s_pending_cw_passband = 0;
             char mm[32];
             int n = snprintf(mm, sizeof(mm), "MMCW|CW passband=%lu;", (unsigned long)cwbw);
-            esp_err_t e = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)mm, n, 200);
+            esp_err_t e = cat_tx(mm, n, 200);
             ESP_LOGI(TAG, "CW passband -> %lu Hz (%s)", (unsigned long)cwbw,
                      e == ESP_OK ? "ok" : "fail");
             vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
@@ -2797,6 +3363,112 @@ static void poll_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
             continue;
         }
+        // CW page: drain a staged KY message ("KY <text>;" - the radio does the
+        // keying), a keyer-speed set/query, and, while the page is visible,
+        // poll TB; at ~1 Hz for the QMX's decoded-CW buffer + KY TX progress.
+        {
+            char msg[96];
+            msg[0] = '\0';
+            portENTER_CRITICAL(&s_cw_send_mux);
+            if (s_pending_cw_send[0]) {
+                memcpy(msg, s_pending_cw_send, sizeof(msg));
+                msg[sizeof(msg) - 1] = '\0';
+                s_pending_cw_send[0] = '\0';
+            }
+            portEXIT_CRITICAL(&s_cw_send_mux);
+            char ky[112];
+            ky[0] = '\0';
+            if (msg[0]) {
+                if (s_ky_ts480_compat) {
+                    // TS480-compat FORMAT PROBE (2026-08-04). The manual says
+                    // "KY followed by a space, followed by the message" AND
+                    // "a fixed 24-character length" - ambiguous about whether
+                    // that space is part of the 24. Sending it as EXTRA (25
+                    // chars after KY) is rejected with ?; even on a
+                    // freshly-power-cycled radio with a guaranteed-empty
+                    // buffer, so try the two remaining readings back to back
+                    // and let the radio pick: whichever does NOT answer ?; is
+                    // the right frame. Safe to fire both - practice mode puts
+                    // nothing on air, and a rejected command is "canceled" by
+                    // the radio so it cannot pollute the buffer.
+                    //   V2: space IS the first of the 24  -> "KY" + " " + 23
+                    //   V3: no leading space at all       -> "KY" + 24
+                    // Only the first 23/24 chars are probed; chunking for
+                    // longer messages comes back once the frame is known.
+                    struct { const char *tag; bool lead_space; } variants[] = {
+                        { "V2 space-in-24", true },
+                        { "V3 no-space",    false },
+                    };
+                    for (int v = 0; v < 2; v++) {
+                        char field[CAT_KY_TS480_LEN + 1];
+                        memset(field, ' ', CAT_KY_TS480_LEN);
+                        field[CAT_KY_TS480_LEN] = '\0';
+                        size_t lead = variants[v].lead_space ? 1 : 0;
+                        size_t room = CAT_KY_TS480_LEN - lead;
+                        size_t n = strlen(msg);
+                        if (n > room) n = room;
+                        memcpy(field + lead, msg, n);
+                        snprintf(ky, sizeof(ky), "KY%s;", field);
+                        esp_err_t e = cdc_acm_host_data_tx_blocking(
+                            s_cdc_dev, (const uint8_t *)ky, strlen(ky), 200);
+                        ESP_LOGI(TAG, "CW send [TS480 %s len=%u] -> '%s' (%s)",
+                                 variants[v].tag, (unsigned)strlen(ky), ky,
+                                 e == ESP_OK ? "ok" : "fail");
+                        vTaskDelay(pdMS_TO_TICKS(800));
+                    }
+                    cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"KY;", 3, 200);
+                    vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
+                    continue;
+                }
+                snprintf(ky, sizeof(ky), "KY %s;", msg);
+            }
+            if (ky[0]) {
+                esp_err_t e = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)ky,
+                                                            strlen(ky), 200);
+                ESP_LOGI(TAG, "CW send -> %s (%s)", ky, e == ESP_OK ? "ok" : "fail");
+                // One KY; readback 300 ms after the send. Deliberately NOT a
+                // drain probe any more: the 2026-08-04 baseline experiment
+                // (poll KY; on an IDLE radio) showed an idle QMX answers
+                // KY0 - so KY0 is the IDLE state on this firmware, NOT
+                // "sending in progress" as the non-compat manual text
+                // implies. The only informative reading is the KY1 that the
+                // SET itself returns (the buffer accepted the characters).
+                // Keeping one cheap query documents that in the diag log;
+                // polling it repeatedly proved nothing and blocked the
+                // FA/MD/FW poll for its duration.
+                if (e == ESP_OK) {
+                    vTaskDelay(pdMS_TO_TICKS(300));
+                    cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"KY;", 3, 200);
+                }
+                vTaskDelay(pdMS_TO_TICKS(CAT_POLL_INTERVAL_MS));
+                continue;
+            }
+        }
+        /* ⛔ THE BRANCH'S SECOND KS PIPELINE IS DELETED HERE - MERGE 2026-10-19.
+         * feat/cw-page had its own keyer-speed state, setter and sender; main
+         * landed one for everyone (s_pending_keyer_p1, served earlier in this
+         * loop). Both survived the merge, so the speed would have been sent
+         * down two paths. Main's is kept - it is the one with the no-clamp
+         * reasoning - and this block, its two state variables and its three
+         * duplicate definitions are gone. Same rule as the TB; poll note
+         * below: when a merge moves logic, the original goes with it. */
+        /* ⛔ THE CW PAGE'S OWN 1 Hz TB; POLL IS DELETED HERE - MERGE, 2026-09-10.
+         *
+         * feat/cw-page polled TB; itself whenever the page was visible. v1.11.1
+         * then landed decoded CW for everyone, with its own TB; poll in the
+         * round-robin below at 2/s (TB_POLL_MIN_US), always on. Merging the two
+         * branches put BOTH on the link - and that is not merely redundant, it
+         * is wrong: CLAUDE.md records that the radio's decode buffer is 40
+         * characters and NOT circular ("simply discards any new incoming
+         * characters"), and a TB; read DRAINS it. Two independent readers
+         * therefore split the stream between them and neither sees whole text,
+         * with the loss silent.
+         *
+         * The round-robin poll is the superset - faster, unconditional, and it
+         * feeds cw_decode.c's single wrap-around line model that the Tab5 page
+         * and the browser both render. s_cw_poll_active is left in place: it
+         * still gates the page's other CW traffic, and nothing reads TB through
+         * it any more. */
         // Keep the CW transmit offset in step with wherever we are listening.
         // Cheap when there is nothing to do: it only writes when the frequency
         // moved, the mode changed, or the 30 s re-assert is due.
@@ -2879,8 +3551,7 @@ static void poll_task(void *arg)
                              CAT_POLL_INTERVAL_MS, (unsigned long)s_last_freq_hz, cat_get_mode_str());
                 }
             }
-            esp_err_t err = cdc_acm_host_data_tx_blocking(
-                s_cdc_dev, (const uint8_t *)cmd, cmd_len, 200);
+            esp_err_t err = cat_tx(cmd, cmd_len, 200);
             if (err != ESP_OK) {
                 // A CDC TX failure burst must NEVER permanently kill the poll
                 // task. Root-caused 2026-07-10 (serial-log proven): opening any
@@ -3042,8 +3713,7 @@ static void band_scan_restore(uint32_t pre_freq, char pre_mode_digit)
         snprintf(fa, sizeof(fa), "FA%011lu;", (unsigned long)plan.freq_hz);
         ESP_LOGW(TAG, "the band scan left the radio on %lu Hz - restoring %lu Hz",
                  (unsigned long)s_last_freq_hz, (unsigned long)plan.freq_hz);
-        if (cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)fa,
-                                          strlen(fa), 200) == ESP_OK) {
+        if (cat_tx(fa, strlen(fa), 200) == ESP_OK) {
             s_last_freq_hz = plan.freq_hz;
             ui_update_frequency(plan.freq_hz);
         } else {
@@ -3056,8 +3726,7 @@ static void band_scan_restore(uint32_t pre_freq, char pre_mode_digit)
         snprintf(md, sizeof(md), "MD%c;", plan.mode_digit);
         ESP_LOGW(TAG, "the band scan left the radio in mode '%c' - restoring '%c'",
                  s_last_mode_digit ? s_last_mode_digit : '?', plan.mode_digit);
-        if (cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)md,
-                                          strlen(md), 200) != ESP_OK)
+        if (cat_tx(md, strlen(md), 200) != ESP_OK)
             ESP_LOGW(TAG, "restore of mode '%c' could not be sent", plan.mode_digit);
     }
 }
@@ -3179,8 +3848,7 @@ static void link_task(void *arg)
              * are Kenwood CAT and both take TA0;RX; identically. */
             {
                 const char *rxcmd = "TA0;RX;";
-                esp_err_t rxerr = cdc_acm_host_data_tx_blocking(
-                    s_cdc_dev, (const uint8_t *)rxcmd, strlen(rxcmd), 200);
+                esp_err_t rxerr = cat_tx(rxcmd, strlen(rxcmd), 200);
                 if (rxerr == ESP_OK)
                     ESP_LOGI(TAG, "link-up: asserted receive (TA0;RX;) - a radio left "
                                   "keyed by a Tab5 restart is now in receive");
@@ -3207,6 +3875,16 @@ static void link_task(void *arg)
              * work. It runs on link_task, which owns the pipe before the poll
              * task starts, so it cannot interleave with FA/MD/FW. */
             cw_filters_read();
+            /* T139: the sidetone pair, same reasoning and the same task, but
+             * reset FIRST. These three describe THIS radio, and a reconnect
+             * can be a different one - leaving a discovered range or a last
+             * known level behind would have the drawer describing a radio that
+             * is no longer on the bus. */
+            s_sidetone_vol_max = 0;
+            s_sidetone_vol     = -1;
+            s_sidetone_abs     = -1;
+            sidetone_discover();
+            if (s_sidetone_vol_max != 0) sidetone_read();
             // Disable QMX VOX for this session (Q3 0;). The panadapter keys the
             // radio purely over CAT (TX;/TA;/RX;), never with transmit audio, so
             // VOX serves no purpose here. It is disabled defensively: with VOX on
@@ -3227,8 +3905,7 @@ static void link_task(void *arg)
                 const int VOX_MAX_ATTEMPTS = 3;
                 for (int attempt = 1; attempt <= VOX_MAX_ATTEMPTS; attempt++) {
                     const char *vox_off = "Q3 0;";
-                    esp_err_t terr = cdc_acm_host_data_tx_blocking(
-                        s_cdc_dev, (const uint8_t *)vox_off, 5, 200);
+                    esp_err_t terr = cat_tx(vox_off, 5, 200);
                     if (terr != ESP_OK) {
                         ESP_LOGW(TAG, "Failed to send VOX-off (Q3 0;) attempt %d/%d: 0x%x",
                                  attempt, VOX_MAX_ATTEMPTS, terr);
@@ -3240,8 +3917,7 @@ static void link_task(void *arg)
                     vTaskDelay(pdMS_TO_TICKS(150));
                     s_q3_resp_len = 0;
                     const char *vox_q = "Q3;";
-                    esp_err_t qerr = cdc_acm_host_data_tx_blocking(
-                        s_cdc_dev, (const uint8_t *)vox_q, strlen(vox_q), 200);
+                    esp_err_t qerr = cat_tx(vox_q, strlen(vox_q), 200);
                     if (qerr == ESP_OK) {
                         for (int w = 0; w < 20 && s_q3_resp_len == 0; w++) {
                             vTaskDelay(pdMS_TO_TICKS(20));
@@ -3281,8 +3957,7 @@ static void link_task(void *arg)
                 static const char *const warmup_cmds[] = { "FA;", "MD;", "FW;" };
                 for (size_t wi = 0; wi < sizeof(warmup_cmds) / sizeof(warmup_cmds[0]); wi++) {
                     const char *cmd = warmup_cmds[wi];
-                    esp_err_t werr = cdc_acm_host_data_tx_blocking(
-                        s_cdc_dev, (const uint8_t *)cmd, strlen(cmd), 200);
+                    esp_err_t werr = cat_tx(cmd, strlen(cmd), 200);
                     if (werr != ESP_OK) {
                         ESP_LOGW(TAG, "Warmup %s send failed: 0x%x", cmd, werr);
                         break;
@@ -3296,8 +3971,7 @@ static void link_task(void *arg)
             // differently (IQ output, TA TX, MMSSB filter tokens).
             {
                 const char *vn_q = "VN;";
-                esp_err_t verr = cdc_acm_host_data_tx_blocking(
-                    s_cdc_dev, (const uint8_t *)vn_q, strlen(vn_q), 200);
+                esp_err_t verr = cat_tx(vn_q, strlen(vn_q), 200);
                 if (verr == ESP_OK) {
                     vTaskDelay(pdMS_TO_TICKS(100));  // response handled in process_cat_message
                 } else {
@@ -3317,8 +3991,7 @@ static void link_task(void *arg)
              * - an unidentifiable radio keeps today's behaviour. */
             if (cat_qmx_fw_at_least(1, 4, 3)) {
                 const char *ui_q = "UI;";
-                esp_err_t uerr = cdc_acm_host_data_tx_blocking(
-                    s_cdc_dev, (const uint8_t *)ui_q, strlen(ui_q), 200);
+                esp_err_t uerr = cat_tx(ui_q, strlen(ui_q), 200);
                 if (uerr == ESP_OK) vTaskDelay(pdMS_TO_TICKS(100));  /* handled in process_cat_message */
                 else ESP_LOGW(TAG, "Failed to query unique id (UI): 0x%x", uerr);
             } else {
@@ -3329,8 +4002,7 @@ static void link_task(void *arg)
             // Read CW offset from QMX menu (session value, EEPROM-persisted on QMX side)
             {
                 const char *cw_q = "MMCW|CW offset;";
-                esp_err_t cerr = cdc_acm_host_data_tx_blocking(
-                    s_cdc_dev, (const uint8_t *)cw_q, strlen(cw_q), 200);
+                esp_err_t cerr = cat_tx(cw_q, strlen(cw_q), 200);
                 if (cerr == ESP_OK) {
                     vTaskDelay(pdMS_TO_TICKS(100));
                     // Response is in s_mm_resp — parse MMnnn;
@@ -3389,7 +4061,7 @@ static void link_task(void *arg)
              * undo a split we did not engage. */
             {
                 s_rx_vfo_mode = -1;
-                cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"FR;", 3, 200);
+                cat_tx("FR;", 3, 200);
                 for (int wi = 0; wi < 10 && s_rx_vfo_mode < 0; wi++) {
                     vTaskDelay(pdMS_TO_TICKS(20));
                 }
@@ -3402,10 +4074,10 @@ static void link_task(void *arg)
                     ESP_LOGW(TAG, "VFO mode: radio was receiving on %s - the Tab5 only "
                                   "reads and writes VFO A, so nothing it did would have "
                                   "been audible. Switching to VFO A.", was);
-                    cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"FR0;", 4, 200);
+                    cat_tx("FR0;", 4, 200);
                     vTaskDelay(pdMS_TO_TICKS(60));
                     s_rx_vfo_mode = -1;
-                    cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"FR;", 3, 200);
+                    cat_tx("FR;", 3, 200);
                     for (int wi = 0; wi < 10 && s_rx_vfo_mode < 0; wi++) {
                         vTaskDelay(pdMS_TO_TICKS(20));
                     }
@@ -3452,8 +4124,7 @@ static void link_task(void *arg)
                  * value. */
                 const char *gq = "MMSystem config|GPS & Ser. ports|GPS source;";
                 s_mm_resp_len = 0;
-                esp_err_t gerr = cdc_acm_host_data_tx_blocking(
-                    s_cdc_dev, (const uint8_t *)gq, strlen(gq), 200);
+                esp_err_t gerr = cat_tx(gq, strlen(gq), 200);
                 if (gerr == ESP_OK) {
                     for (int wi = 0; wi < 15 && s_mm_resp_len == 0; wi++) {
                         vTaskDelay(pdMS_TO_TICKS(20));
@@ -3523,8 +4194,7 @@ static void link_task(void *arg)
             char     pre_mode_digit = 0;
             {
                 const char *q = "FA;MD;";
-                if (cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)q,
-                                                  strlen(q), 200) == ESP_OK) {
+                if (cat_tx(q, strlen(q), 200) == ESP_OK) {
                     for (int wi = 0; wi < 25 && !s_last_freq_hz; wi++)
                         vTaskDelay(pdMS_TO_TICKS(20));
                     vTaskDelay(pdMS_TO_TICKS(60));   /* let MD land too */
@@ -3561,8 +4231,7 @@ static void link_task(void *arg)
                         snprintf(qname, sizeof(qname), "MMBand config.|Band name (m)[%d];", bi);
                         s_rx_len = 0;
                         s_mm_resp_len = 0;
-                        esp_err_t be = cdc_acm_host_data_tx_blocking(
-                            s_cdc_dev, (const uint8_t *)qname, strlen(qname), 200);
+                        esp_err_t be = cat_tx(qname, strlen(qname), 200);
                         if (be != ESP_OK) { transport_error = true; break; }
                         for (int wi = 0; wi < 20 && s_mm_resp_len == 0; wi++) {
                             vTaskDelay(pdMS_TO_TICKS(20));
@@ -3585,8 +4254,7 @@ static void link_task(void *arg)
                         // Query center frequency
                         char qfreq[56];
                         snprintf(qfreq, sizeof(qfreq), "MMBand config.|Frequency center[%d];", bi);
-                        be = cdc_acm_host_data_tx_blocking(
-                            s_cdc_dev, (const uint8_t *)qfreq, strlen(qfreq), 200);
+                        be = cat_tx(qfreq, strlen(qfreq), 200);
                         if (be != ESP_OK) { transport_error = true; break; }
                         for (int wi = 0; wi < 20 && s_mm_resp_len == 0; wi++) {
                             vTaskDelay(pdMS_TO_TICKS(20));
@@ -3694,11 +4362,60 @@ static void link_task(void *arg)
 
 
 
+/* The frequency the radio will actually hold for any value you ask for. The
+ * QMX's encoder steps 10 Hz, so every dial write is rounded to that grid - see
+ * the long note in cat_set_frequency(). Call this before comparing a readback
+ * against a target you computed, and before withdrawing a deferred write. */
+uint32_t cat_quantise_dial_hz(uint32_t freq_hz)
+{
+    return ((freq_hz + 5) / 10) * 10;
+}
+
 esp_err_t cat_set_frequency(uint32_t freq_hz)
 {
     if (s_cdc_dev == NULL) {
         return ESP_ERR_INVALID_STATE;  // QMX not connected
     }
+
+    /* ⛔⛔ EVERY DIAL WRITE IS QUANTISED TO 10 Hz, AND IT IS DONE HERE BECAUSE
+     * THERE ARE TWELVE CALLERS IN ui.c ALONE.
+     *
+     * The QMX accepts an arbitrary Hz over CAT but its own encoder steps 10 Hz,
+     * so a write of 7020003 leaves a units digit the operator CANNOT CLEAR from
+     * the radio - turning the knob moves in tens and carries the 3 along for
+     * ever. Samuel W7STF, 2026-10-26: "You seem to have done something to force
+     * the VFO to have some non-zero Hz component that can't be tuned out,
+     * unless one goes back to direct frequency entry ... Please quantize all
+     * tuning to the 10Hz capability of the QMX/+."
+     *
+     * The grid at the UI end was fixed in the same change (tune snap Off meant
+     * a 1 Hz grid, not 10), but a per-site fix cannot hold: twelve sites today,
+     * and the two that deliberately wrote un-rounded values - CW-Tune's
+     * interpolated peak and the mouse wheel - each had their own comment saying
+     * why rounding was wrong. It is not wrong, it is free: the radio rounds
+     * anyway, so the only thing an un-rounded write changes is that the dial
+     * keeps a digit nobody asked for. At most 5 Hz of the estimate is lost,
+     * which no ear resolves on a CW note.
+     *
+     * ⚠ RIT is NOT affected: it is its own command with its own resolution, and
+     * tap-to-RIT depends on that - see the note at the tap handler in ui.c.
+     *
+     * ⛔⛔ THE ROUNDING IS A SHARED FUNCTION, NOT AN EXPRESSION HERE, BECAUSE A
+     * CALLER THAT CANNOT NAME THE VALUE THE RADIO WILL HOLD IS BROKEN BY IT.
+     * It was one line here, and that silently broke every caller that writes a
+     * computed target and then waits for the readback to match: the write is
+     * rounded, the comparison is not, and the two can never agree.
+     *
+     * Steve KX7R on v1.22.0, 2026-10-29: "the frequency changes automatically
+     * by +0.03 Hz every ~3 seconds ... I reflashed V1.20.5 and there is no
+     * drift." Reproduced on the bench the same day with spur suppression on:
+     * spur_map's 25 Hz dither went out as +30, tune_and_confirm() waited the
+     * full 3 s for a frequency the radio could never report, and the restore
+     * then refused the dial as "someone else's tune" - so the radio WALKED UP
+     * THE BAND 30 Hz every ~7 s and never came back. Three sites in that one
+     * file compared against the un-rounded value; cat_cancel_pending_freq_if()
+     * was a fourth, because s_pending_freq_hz is stored rounded below. */
+    freq_hz = cat_quantise_dial_hz(freq_hz);
 
     /* ⛔ SOMETHING ELSE MAY OWN THE PIPE, AND THIS USED TO WRITE ANYWAY.
      *
@@ -3781,7 +4498,7 @@ esp_err_t cat_set_frequency(uint32_t freq_hz)
         ESP_LOGW(TAG, "cat_set_frequency: snprintf produced %d chars (expected 14)", n);
         return ESP_FAIL;
     }
-    esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd, 14, 200);
+    esp_err_t err = cat_tx(cmd, 14, 200);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "FA TX failed: 0x%x", err);
         return err;
@@ -3976,7 +4693,7 @@ esp_err_t cat_set_mode(const char *mode)
 
     char cmd[8];
     cmd[0] = 'M'; cmd[1] = 'D'; cmd[2] = digit; cmd[3] = ';'; cmd[4] = 0;
-    esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd, 4, 200);
+    esp_err_t err = cat_tx(cmd, 4, 200);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "MD TX failed: 0x%x", err);
         return err;
@@ -4001,7 +4718,7 @@ esp_err_t cat_set_passband_hz(uint32_t hz)
         ESP_LOGW(TAG, "cat_set_passband_hz: snprintf produced %d chars (expected 7)", n);
         return ESP_FAIL;
     }
-    esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)cmd, 7, 200);
+    esp_err_t err = cat_tx(cmd, 7, 200);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "FW TX failed: 0x%x", err);
         return err;
@@ -4042,7 +4759,7 @@ esp_err_t cat_query_qmx_time(int *out_hour, int *out_min, int *out_sec)
 
     cat_poll_hold(CAT_HOLD_TIME_SYNC);
     s_tm_resp_len = 0;
-    esp_err_t err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"TM;", 3, 200);
+    esp_err_t err = cat_tx("TM;", 3, 200);
     if (err == ESP_OK) {
         for (int i = 0; i < 10 && s_tm_resp_len == 0; i++) {
             vTaskDelay(pdMS_TO_TICKS(20));
@@ -4225,7 +4942,7 @@ esp_err_t cat_gps_gp_sync(int *out_y, int *out_mo, int *out_d,
 
     while (esp_timer_get_time() - start < 1300000) {
         s_gp_resp_len = 0;
-        if (cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"GP;", 3, 100) != ESP_OK)
+        if (cat_tx("GP;", 3, 100) != ESP_OK)
             break;
         polls++;
         for (int i = 0; i < 25 && s_gp_resp_len == 0; i++) vTaskDelay(pdMS_TO_TICKS(2));
@@ -4339,8 +5056,7 @@ esp_err_t cat_gps_gp_probe(int secs, int gap_ms, bool use_tm, cat_gp_probe_t *ou
     while (esp_timer_get_time() - start < (int64_t)secs * 1000000LL) {
         if (gap_ms > 0) vTaskDelay(pdMS_TO_TICKS(gap_ms));
         if (use_tm) s_tm_resp_len = 0; else s_gp_resp_len = 0;
-        if (cdc_acm_host_data_tx_blocking(s_cdc_dev,
-                (const uint8_t *)(use_tm ? "TM;" : "GP;"), 3, 100) != ESP_OK)
+        if (cat_tx((use_tm ? "TM;" : "GP;"), 3, 100) != ESP_OK)
             break;
         out->polls++;
         for (int i = 0; i < 25 && (use_tm ? s_tm_resp_len : s_gp_resp_len) == 0; i++)
@@ -4479,8 +5195,7 @@ esp_err_t cat_ta_latency_probe(int count, int interval_ms, bool logged,
         if (logged) {
             err = cat_send_raw_cmd("%s", buf);
         } else {
-            err = cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)buf,
-                                                strlen(buf), 200);
+            err = cat_tx(buf, strlen(buf), 200);
         }
         int64_t b = esp_timer_get_time();
 
@@ -4550,7 +5265,7 @@ esp_err_t cat_gps_tick_sync(int *out_hour, int *out_min, int *out_sec, int64_t *
 
     while (esp_timer_get_time() - start < 1300000) {   // ~1.3 s cap: spans any 1 s boundary
         s_tm_resp_len = 0;
-        if (cdc_acm_host_data_tx_blocking(s_cdc_dev, (const uint8_t *)"TM;", 3, 100) != ESP_OK)
+        if (cat_tx("TM;", 3, 100) != ESP_OK)
             break;
         // Wait briefly for the async RX handler to stamp + fill the response.
         for (int i = 0; i < 25 && s_tm_resp_len == 0; i++) vTaskDelay(pdMS_TO_TICKS(2));
@@ -4645,6 +5360,11 @@ void cat_usb_shutdown(void)
     // that way - the one outcome worse than a wedged USB port.
     ESP_LOGI(TAG, "shutdown: returning the radio to RX");
     const char *rx = "TA0;RX;";
+    /* ⛔ NOT cat_tx(). `dev` is this function's own copy, and the ordering
+     * below - write, THEN clear s_cdc_dev, THEN wait for poll_task - is the
+     * discipline the comment above describes. cat_tx() reads the global, so
+     * routing this would make the last RX command depend on the very handle
+     * this function is in the middle of retiring. */
     cdc_acm_host_data_tx_blocking(dev, (const uint8_t *)rx, strlen(rx), 200);
 
     s_cdc_dev = NULL;

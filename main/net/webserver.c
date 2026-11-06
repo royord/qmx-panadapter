@@ -25,10 +25,12 @@
 #include "ui/qmx_term_view.h" // the dev "term_view" action
 #include "ui/gps_status_view.h" // the dev "gps_view" action
 #include "ft8_screen_view.h"  // ft8_screen_view_is_active
+#include "ui_mode.h"          // ui_mode_get (CW page reports screen:"cw")
 #include "js8_chat.h"      // the JS8 conversation store, reported in /api/status
 #include "js8_submode.h"   // the submode table and the one refusal rule
+#include "js8_alt.h"       // T132 alternate-submode decode (RX only)
 #include "ui/js8_page.h"   // the conversation grid, composed for /api/js8
-#include "ft8_tx.h"
+#include "ft8_tx.h"        // ft8_tx_get_status (web TX-status banner)
 #include "js8_ftx.h"
 #include "js8_target.h"           // who the operator is working in JS8
 #include "wspr_tx.h"          // the dev "wspr_tx_test" action
@@ -47,6 +49,9 @@
 #include "ui/spot_map_view.h" // the /api/cmd "spotmap" dev action
 #include "screenshot/screenshot.h"  // screenshot_capture_rgb565
 #include "diag_log.h"         // diag_log_size / diag_log_snapshot
+#include "ui/activation_modal.h" // activation_stop - ONE stop for Tab5 and web
+#include "ui/power_cal_modal.h"  // power_cal_list_watts - the SAME calibrated
+                                 // ladder the Tab5 slider walks (out_power)
 #include "adif/adif_log.h"    // adif_log_count / adif_log_file_path / adif_log_clear
 #include "adif/adif_check.h"  // #263 "check my log" - completeness pass
 #include "util/dma_owners.h"
@@ -72,6 +77,7 @@
 #include "hid_cursor.h"
 #include "iq_balance.h"        // iq_balance_set_enabled - /api/settings
 #include "rx_audio.h"          // live AGC/clip tuning - /api/cmd "rxaudio"
+#include "webradio.h"          // /api/cmd "webradio_play" - a stream without the directory
 #include "util/mic_probe.h"    // /api/cmd "mic_probe" - GitHub #17
 #include "spur_map.h"          // spur_map_set_enabled - /api/settings
 #include "mem_channels.h"      // memory channels - /api/memory
@@ -111,6 +117,7 @@ extern uint32_t qmx_lv_event_chain_bad;
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include "tx_band_guard.h"   // T48: refuse to key outside the region's allocation
 
 static const char *TAG = "webserver";
 
@@ -242,6 +249,13 @@ static void add_ft8_tx_status(cJSON *root)
     // source of truth waiting to drift from the Tab5's own button.
     cJSON_AddNumberToObject(f, "cq_parity", ft8_screen_view_get_cq_parity());
 
+    /* ⛔ THE SAME WARNING THE TAB5 TOASTS (Randy N4OPI, 2026-10-27). The
+     * "no decodes for over N min" notice reached the glass only, so a
+     * browser operator watched an empty list with nothing to explain it.
+     * Empty while the receiver is decoding, so the page leaves its line
+     * alone rather than printing a blank one. */
+    cJSON_AddStringToObject(f, "stuck_note", ft8_rx_stuck_note());
+
     /* ⭐ THE FREE-TEXT RUN, because it is the one transmission that lasts
      * MINUTES rather than one slot. A browser operator who cannot see how far
      * through it is, and cannot tell whether their send was accepted, has no
@@ -286,6 +300,32 @@ static void add_ft8_tx_status(cJSON *root)
         cJSON_AddNumberToObject(f, "js8_submode", settings_get_js8_submode());
         cJSON_AddStringToObject(f, "js8_submode_name",
                                 ftx_protocol_label(ft8_op_mode_protocol()));
+        /* T132: the ALTERNATE submode decoded on a duty cycle as well as the
+         * primary, 255 = off. Readable for the same reason the primary is -
+         * the drawer and this page both write it, and a control that cannot
+         * read its own state is a second source of truth. */
+        {
+            uint8_t alt = settings_get_js8_alt_submode();
+            cJSON_AddNumberToObject(f, "js8_alt_submode", alt);
+            cJSON_AddStringToObject(f, "js8_alt_submode_name",
+                                    alt == 255 ? "off"
+                                    : ftx_protocol_label(js8_alt_proto_for_submode(alt)));
+        }
+        /* A station that sent the directed command SNR? and has had no answer
+         * (Gyula HA3HZ). Served, not inferred from the conversation text: the
+         * command is a frame field, and a browser matching on the words would
+         * also fire on somebody quoting it in free text. */
+        {
+            char rq[FT8_CALL_MAX_LEN];
+            int  rq_age = 0;
+            if (js8_request_get(rq, sizeof(rq), NULL, &rq_age)) {
+                cJSON *o = cJSON_AddObjectToObject(f, "js8_snr_req");
+                if (o) {
+                    cJSON_AddStringToObject(o, "call", rq);
+                    cJSON_AddNumberToObject(o, "age_s", rq_age);
+                }
+            }
+        }
     }
 
     /* ⭐ THE BROWSER MUST BE ABLE TO SEE THE PAUSE, NOT JUST SET IT - the same
@@ -353,10 +393,14 @@ static void add_ft8_tx_status(cJSON *root)
 
         /* Which JS8 pane the screen is showing. Here so a question about the
          * screen can be answered from the API instead of by interrupting the
-         * operator - 2026-10-09, chasing an internal-heap regression. */
-        cJSON_AddStringToObject(f, "tab",
-                                ft8_screen_view_js8_tab_is_conversation()
-                                    ? "conversation" : "stations");
+         * operator - 2026-10-09, chasing an internal-heap regression.
+         *
+         * ⛔ ALWAYS "all" SINCE T14. The screen stopped having a chosen tab:
+         * stations, the conversation and the type box are all up together.
+         * The field is kept because it is in the published API and a reader
+         * that expects it should see an honest value, not a missing key or a
+         * stale "conversation" that was never a reading. */
+        cJSON_AddStringToObject(f, "tab", "all");
 
         /* The newest few conversation entries - what the JS8 screen's
          * Conversation pane is showing.
@@ -398,6 +442,14 @@ static void add_ft8_tx_status(cJSON *root)
                     cJSON_AddNumberToObject(o, "frames", cm.frames);
                     cJSON_AddBoolToObject(o,   "active", cm.active);
                     cJSON_AddBoolToObject(o,   "truncated", cm.truncated);
+                    /* ⛔ WHICH SPEED HEARD IT (T132). With the duty-cycled
+                     * alternate decode on, a row no longer implies the
+                     * primary submode, and a station heard on an alternate
+                     * CANNOT be worked from here - our TX is on the primary.
+                     * Emitted always, so a client can tell "not known" from
+                     * "field missing in an old build". */
+                    cJSON_AddStringToObject(o, "submode",
+                                            ftx_protocol_label((ftx_protocol_t)cm.proto));
                     cJSON_AddItemToArray(carr, o);
                 }
             }
@@ -502,6 +554,27 @@ static void add_ft8_tx_status(cJSON *root)
     }
     cJSON_AddStringToObject(f, "st",   st);
     cJSON_AddStringToObject(f, "text", b);
+    /* The finished contact that has not been acknowledged yet (Don WB0LQW).
+     * A FIELD, not a new `st` value: the contact genuinely is done and logged,
+     * and re-labelling the state would have changed what every other reader of
+     * `st` believes - the TX pill, the slot-row highlight and the override row
+     * all switch on it. This only says "there is still something to re-send",
+     * which is exactly what the override row needs to stay up for. */
+    {
+        char fw_call[FT8_CALL_MAX_LEN] = {0};
+        int  fw_sent = 0, fw_max = 0;
+        if (ft8_qso_final_watch(fw_call, sizeof(fw_call), &fw_sent, &fw_max)) {
+            cJSON *fw = cJSON_AddObjectToObject(f, "final_watch");
+            if (fw) {
+                char fw_extra[16] = {0};
+                ft8_qso_final_extra(fw_extra, sizeof(fw_extra));
+                cJSON_AddStringToObject(fw, "call",  fw_call);
+                cJSON_AddStringToObject(fw, "extra", fw_extra);
+                cJSON_AddNumberToObject(fw, "sent",  fw_sent);
+                cJSON_AddNumberToObject(fw, "max",   fw_max);
+            }
+        }
+    }
     if (tx_st == FT8_TX_ARMED) cJSON_AddNumberToObject(f, "armed_secs", secs_until);
 
     // Power and SWR from the last burst (Randy N4OPI, top of his list for
@@ -589,6 +662,18 @@ static bool web_tune_start(void)
     // Never while the operator has released the radio: Tune keys a carrier, and
     // the mode write it needs would go into a menu they are standing in front of.
     if (cat_user_pause_active()) return false;
+    /* ⛔ BAND GUARD (T48), and the browser path needs it at least as much as
+     * the Tab5's: nobody is standing in front of the radio. Tune keys a
+     * carrier on the DIAL in MD8 - no audio offset. */
+    {
+        char gerr[160];
+        uint32_t d = cat_get_frequency();
+        if (!tx_band_guard_allows(d, d, "Antenna Tune", gerr, sizeof gerr)) {
+            ui_toast_ms(gerr, 15000);
+            ESP_LOGE(TAG, "web tune REFUSED: %s", gerr);
+            return false;
+        }
+    }
     const char *cur = cat_get_mode_str();
     snprintf(s_web_tune_prior, sizeof(s_web_tune_prior), "%s",
              (cur && cur[0] && strcmp(cur, "TUNE") != 0) ? cur : "USB");
@@ -677,25 +762,61 @@ static esp_err_t status_handler(httpd_req_t *req)
                  * copies of "where does the next character go" drift. */
                 cJSON_AddNumberToObject(c, "col", cw_decode_line_col());
                 cJSON_AddNumberToObject(c, "wpm", cw_decode_wpm());
+                /* ⭐ WHICH CELLS WERE OUR OWN KEYING (Sam W7STF, T06). Sent as
+                 * a '0'/'1' string the same length as "line", so the browser
+                 * can colour it per cell without knowing anything about TB's
+                 * t-field - same reason "col" is sent rather than re-derived.
+                 * A string, not a bitmask: it costs a few hundred bytes on a
+                 * poll that already carries the line itself, and a mask would
+                 * need endianness and bit order agreeing in two places. */
+                uint8_t txm[CW_GRID_CELLS];
+                size_t  txn = cw_decode_line_tx(txm, sizeof(txm));
+                char    txs[CW_GRID_CELLS + 1];
+                for (size_t i = 0; i < txn; i++) txs[i] = txm[i] ? '1' : '0';
+                txs[txn] = '\0';
+                cJSON_AddStringToObject(c, "tx", txs);
                 /* ⭐ THE GRID SHAPE, SENT. The browser had COLS = 72 and two
                  * hardcoded row elements, so CW_LINE_ROWS 2 -> 4 would have
                  * left it drawing half the line with no error anywhere - the
                  * same silent truncation the comment above records from the
                  * evening the two-line pane shipped, in the other direction.
                  * One definition, and the page draws what it is told. */
-                cJSON_AddNumberToObject(c, "rows", CW_LINE_ROWS);
-                cJSON_AddNumberToObject(c, "cols", CW_LINE_COLS);
+                /* ⚠ cw_decode_rows(), NOT CW_LINE_ROWS. Since 2026-10-17 the
+                 * constant is only the maximum and the count in use is a
+                 * setting (Bryan N0LUF). Sending the constant would have the
+                 * page draw four rows while the decoder wrapped over two -
+                 * two of them permanently blank. */
+                cJSON_AddNumberToObject(c, "rows", cw_decode_rows());
+                cJSON_AddNumberToObject(c, "cols", cw_decode_cols());
                 cJSON_AddItemToObject(root, "cw", c);
             }
         }
     }
 
+    /* @ST THE TWO FIELDS THE NEW TOP-BAR CONTROLS RUN ON (Ralph DL1HR).
+     *
+     * keyer_wpm is the CACHED read-back, and the cache is the whole point:
+     * @NO DO NOT CALL cat_query_keyer_wpm() HERE. This handler runs on every
+     * status poll, and hanging the query off a per-poll path is exactly the
+     * mistake made when the keyer control was first built - a KS query every
+     * 200 ms, for ever. The value is refreshed on the CAT link-up edge and
+     * again after every write, which is all a 1 Hz pill needs.
+     *
+     * -1 until the radio has ever answered; the page shows "--" for that and
+     * must not render it as a speed.
+     *
+     * rit_parked_hz is 0 unless an offset is standing by, and it is what lets
+     * the web say "Restore +120" rather than offering a button whose effect
+     * the operator has to remember. */
+    cJSON_AddNumberToObject(root, "keyer_wpm",    cat_get_keyer_wpm());
+    cJSON_AddNumberToObject(root, "rit_parked_hz", ui_rit_parked_hz());
     cJSON_AddStringToObject(root, "band",         ui_get_band_str());
     /* Three pages now. Asked of ui_mode rather than of the FT8 view, so a new
      * page cannot be reported as "panadapter" just because FT8 is not up. */
     cJSON_AddStringToObject(root, "screen",
         ui_mode_get() == UI_MODE_FT8  ? "ft8"  :
-        ui_mode_get() == UI_MODE_WSPR ? "wspr" : "panadapter");
+        ui_mode_get() == UI_MODE_WSPR ? "wspr" :
+        ui_mode_get() == UI_MODE_CW   ? "cw"   : "panadapter");
     /* ⚠ ALSO IN /api/settings, AND BOTH ARE NEEDED. The web UI shows or hides
      * the whole WSPR card from THIS field, on the 1 Hz status poll - it never
      * reads /api/settings. Adding it only there (which is what shipped first)
@@ -703,6 +824,10 @@ static esp_err_t status_handler(httpd_req_t *req)
      * host test could see it: the bug is which endpoint serves the field, not
      * what the field contains. */
     cJSON_AddBoolToObject(root, "wspr_en", wspr_feature_enabled());
+    /* So the browser can grey its own "Switch to CW" rather than offering a
+     * door that answers 403 - the refusal below is the authority, this is
+     * only the menu agreeing with it in advance. */
+    cJSON_AddBoolToObject(root, "cw_en", settings_get_cw_page_en());
     // #218: firmware version + whether a newer release exists. The update check
     // has run since v1.1 but announced itself ONLY inside the on-device Reader,
     // so anyone who never opened the manual was never told - which is how people
@@ -759,6 +884,19 @@ static esp_err_t status_handler(httpd_req_t *req)
         cJSON_AddNumberToObject(ws, "closes",    ws_close);
         cJSON_AddNumberToObject(ws, "partial",   ws_part);
     }
+    /* The waterfall rate, so the BROWSER can honour 0 = off.
+     * It lives here rather than in a cached copy of /api/settings
+     * because the page already polls this once a second, which means
+     * there is one source of truth and no stale client-side value if
+     * the setting is changed from the Tab5 drawer instead. */
+    cJSON_AddNumberToObject(root, "wf_rows_per_s",
+                            (double)settings_get_wf_rows_per_s());
+    /* The peak-hold window, here for exactly the reason above: the BROWSER
+     * runs its own copy of the hold, and a value cached from /api/settings
+     * would go stale the moment the setting is changed on the Tab5. */
+    cJSON_AddNumberToObject(root, "peak_hold_s",
+                            (double)settings_get_spec_peak_s());
+    cJSON_AddBoolToObject(root, "server_mode", ui_get_server_mode());
     // TX/QSO banner data, only while the FT8/FT4 screen is live (the FT8
     // engine doesn't run otherwise, so its status would be stale text).
     if (ft8_screen_view_is_active())
@@ -970,6 +1108,25 @@ static esp_err_t status_handler(httpd_req_t *req)
                     cJSON_AddItemToArray(arr, o);
                 }
             }
+            /* ⛔ THE ACTIVATION PROGRAMMES COME FROM THE DEVICE TOO. The page
+             * used to carry its own two-entry list and a `type === 2 ? SOTA :
+             * POTA` test, so a WWFF or IOTA session would have been labelled
+             * POTA in the browser while the Tab5 showed the truth - the same
+             * Tab5/web parity class as T82, T83 and T107. One table, in
+             * settings.c, served here. */
+            {
+                cJSON *acts = cJSON_AddArrayToObject(root, "act_types");
+                for (uint8_t t = 1; t < settings_activation_type_count(); t++) {
+                    const char *sig = settings_activation_sig_name_for(t);
+                    if (!sig) continue;
+                    cJSON *o = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(o, "id",   (double)t);
+                    cJSON_AddStringToObject(o, "sig",  sig);
+                    const char *hint = settings_activation_ref_hint(t);
+                    cJSON_AddStringToObject(o, "hint", hint ? hint : "");
+                    cJSON_AddItemToArray(acts, o);
+                }
+            }
         }
     }
 
@@ -980,6 +1137,13 @@ static esp_err_t status_handler(httpd_req_t *req)
      * empty list. See cat.c for why zero is a real state and not just a guard. */
     cJSON_AddNumberToObject(root, "cw_filter_mask", (double)cat_cw_filter_mask());
     cJSON_AddNumberToObject(root, "cw_pitch_hz", (double)ui_get_cw_pitch_hz());
+    /* The tune-snap grid, in /api/status and not only in the settings form.
+     * The browser hardcoded 250 Hz for SSB in tuneSnapHz() and never read
+     * the setting at all, so "Tune snap" moved the Tab5 and did nothing in
+     * the browser - the operator found it with the mouse wheel. A setting
+     * the device obeys and the page ignores is the web/Tab5 parity class
+     * this file already carries several notes about. */
+    cJSON_AddNumberToObject(root, "tune_snap_hz", (double)settings_get_tune_snap_hz());
     cJSON_AddNumberToObject(root, "if_cal_hz",   (double)ui_get_if_cal_hz());
     // RIT offset in Hz, 0 = off. Radio state, so the browser and the Tab5 pill show
     // the same number and the browser can draw the marker in the same place.
@@ -999,6 +1163,13 @@ static esp_err_t status_handler(httpd_req_t *req)
         char aref[24] = "";
         settings_get_activation_ref(aref, sizeof aref);
         cJSON_AddNumberToObject(act, "type", (double)at);
+        /* The name, not just the id: the browser must never translate one
+         * itself (see act_types above). Empty when nothing is running. */
+        {
+            const char *sig = settings_activation_sig_name_for(at);
+            cJSON_AddStringToObject(act, "sig", sig ? sig : "");
+        }
+        cJSON_AddNumberToObject(act, "need", (double)settings_activation_target());
         cJSON_AddStringToObject(act, "ref", aref);
         if (at != 0 && aref[0]) {
             static const int64_t ACT_COUNT_TTL_US = 10 * 1000 * 1000;
@@ -1077,6 +1248,11 @@ static esp_err_t status_handler(httpd_req_t *req)
         cJSON_AddBoolToObject(root, "cloudlog_set", cfg.cloudlog_url[0] != '\0' && cfg.cloudlog_key[0] != '\0');
         cJSON_AddBoolToObject(root, "lotw_ready", lotw_cert_present() && cfg.lotw_dxcc[0] != '\0');
         cJSON_AddBoolToObject(root, "gpio_busy", gpio_relay_busy());
+    /* ⛔ Settings could not be opened: NOTHING the operator changes will be
+     * kept, on either surface. Served so the browser can say so too - the
+     * Tab5 toast at boot is invisible from another room, which is the split
+     * this project keeps relearning. Sergei AA1SL, issue #21. */
+    if (!settings_persist_ok()) cJSON_AddBoolToObject(root, "no_persist", true);
         // The power-cycle sequence runs on its own timers, well outside the
         // 1 Hz cadence of this poll, so the web UI cannot watch a "busy" flag
         // like the plain Pulse button does - it has to be told what the
@@ -1112,6 +1288,7 @@ static esp_err_t status_handler(httpd_req_t *req)
             cJSON_AddNumberToObject(relay, "pin", rpin);
             cJSON_AddNumberToObject(relay, "level", rlevel ? 1 : 0);
             cJSON_AddNumberToObject(relay, "ms", rms);
+            cJSON_AddBoolToObject(relay, "solo", settings_get_gpio_relay_solo());
             cJSON_AddItemToObject(root, "relay", relay);
         }
         /* PORT.A: two facts that must never be conflated. "mode" is what the
@@ -1524,6 +1701,37 @@ static bool wspr_owns_the_dial(httpd_req_t *req, cJSON *root, const char *what)
     return true;
 }
 
+/* A required numeric argument, or a refusal the caller can see.
+ *
+ * T67: {"action":"set_freq"} with no "hz" answered {"ok":true} and did
+ * nothing. Every site of this class read the key with
+ *
+ *     cJSON *item = cJSON_GetObjectItem(root, "hz");
+ *     if (cJSON_IsNumber(item)) { ...act... }
+ *
+ * with no else, and cmd_handler's tail sends {"ok":true} unconditionally - so
+ * a caller that mistyped the key, or sent "7038600" as a string, got a success
+ * indistinguishable from a tune. Six sites had it, not only set_freq:
+ * set_freq, view_center, set_band, set_bw, set_zoom and set_rit. Swept
+ * together, because fixing only the reported one leaves the other five to be
+ * reported again.
+ *
+ * Answers 400 itself; the caller must free root and return ESP_FAIL. Actions
+ * whose argument is genuinely OPTIONAL keep their ternary default and are
+ * deliberately NOT routed through here. */
+static bool cmd_num_arg(httpd_req_t *req, cJSON *root, const char *key, double *out)
+{
+    cJSON *item = cJSON_GetObjectItem(root, key);
+    if (cJSON_IsNumber(item)) {
+        *out = item->valuedouble;
+        return true;
+    }
+    char msg[64];
+    snprintf(msg, sizeof(msg), "%s required (number)", key);
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, msg);
+    return false;
+}
+
 static esp_err_t cmd_handler(httpd_req_t *req)
 {
     char buf[256];
@@ -1543,9 +1751,10 @@ static esp_err_t cmd_handler(httpd_req_t *req)
     const char *action = cJSON_GetStringValue(cJSON_GetObjectItem(root, "action"));
 
     if (action && strcmp(action, "set_freq") == 0) {
-        cJSON *item = cJSON_GetObjectItem(root, "hz");
-        if (cJSON_IsNumber(item)) {
-            uint32_t hz = (uint32_t)item->valuedouble;
+        double argv;
+        if (!cmd_num_arg(req, root, "hz", &argv)) { cJSON_Delete(root); return ESP_FAIL; }
+        {
+            uint32_t hz = (uint32_t)argv;
             /* FORCED, because every caller of this action is a COMMIT.
              *
              * It used to be the rate-limited cat_set_frequency(), whose return
@@ -1597,21 +1806,41 @@ static esp_err_t cmd_handler(httpd_req_t *req)
              * the CAT write. The web path simply never did. */
             ui_update_frequency(hz);
         }
+    } else if (action && strcmp(action, "set_pan") == 0) {
+        /* ⛔ NOT view_center. That one is the band-plan knob and is ALLOWED to
+         * retune; this moves the window inside what the radio already hears and
+         * must leave the dial alone. The browser's right-drag used view_center
+         * first and the operator caught it immediately: "the Freq changes! This
+         * should of course stay put during dragging." */
+        double argv;
+        if (!cmd_num_arg(req, root, "hz", &argv)) { cJSON_Delete(root); return ESP_FAIL; }
+        if (!ui_pan_is_available()) {
+            cJSON_Delete(root);
+            /* Name the condition rather than answering a bare "no" - with the
+             * still view off the spectrum follows the dial and there is no
+             * independent window to move. Same rule as T82's refusals. */
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_set_status(req, "409 Conflict");
+            return httpd_resp_sendstr(req,
+                "{\"ok\":false,\"error\":\"still view is off - the spectrum follows the dial, so there is no view to pan\"}");
+        }
+        /* QUEUED, never applied here - see ui_request_pan_hz(). */
+        ui_request_pan_hz((int64_t)argv);
     } else if (action && strcmp(action, "view_center") == 0) {
         /* The band-plan knob, from the browser. Deliberately NOT set_freq: the
          * gesture moves the WINDOW and must be allowed to leave the dial alone,
          * which a frequency write cannot express. Same entry point the Tab5's
          * own strip uses, so the two screens cannot drift. */
-        cJSON *item = cJSON_GetObjectItem(root, "hz");
-        if (cJSON_IsNumber(item)) {
-            /* QUEUED, never applied here - see ui_request_bandplan_view(). */
-            ui_request_bandplan_view((int64_t)item->valuedouble);
-        }
+        double argv;
+        if (!cmd_num_arg(req, root, "hz", &argv)) { cJSON_Delete(root); return ESP_FAIL; }
+        /* QUEUED, never applied here - see ui_request_bandplan_view(). */
+        ui_request_bandplan_view((int64_t)argv);
     } else if (action && strcmp(action, "set_band") == 0) {
         if (wspr_owns_the_dial(req, root, "Band")) return ESP_OK;
-        cJSON *item = cJSON_GetObjectItem(root, "hz");
-        if (cJSON_IsNumber(item)) {
-            uint32_t center_hz = (uint32_t)item->valuedouble;
+        double argv;
+        if (!cmd_num_arg(req, root, "hz", &argv)) { cJSON_Delete(root); return ESP_FAIL; }
+        {
+            uint32_t center_hz = (uint32_t)argv;
             uint32_t target    = ui_band_last_hz(center_hz);
             // Same rule as the Tab5's own band buttons: a band change stands
             // auto-answer down, because the antenna is probably not tuned for
@@ -1655,11 +1884,193 @@ static esp_err_t cmd_handler(httpd_req_t *req)
          * v0.18.6, fixed there the same way and recorded in ui.c:2058 as "the
          * radio stayed in the previous mode. cat_request_mode is retried". */
         if (mode) cat_request_mode(mode);
+    } else if (action && strcmp(action, "server_mode") == 0) {
+        /* T19. {"action":"server_mode","on":true} - stop drawing, keep the
+         * WebSocket fed. Omit "on" to toggle. RAM only; see ui.h. */
+        cJSON *jo = cJSON_GetObjectItem(root, "on");
+        ui_set_server_mode(cJSON_IsBool(jo) ? cJSON_IsTrue(jo)
+                                            : !ui_get_server_mode());
+        cJSON_Delete(root);
+        char body[48];
+        snprintf(body, sizeof(body), "{\"ok\":true,\"server_mode\":%s}",
+                 ui_get_server_mode() ? "true" : "false");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, body);
+        return ESP_OK;
+    } else if (action && strcmp(action, "cw_tune") == 0) {
+        /* CW-Tune (A4 step 2): put the dial on the CW signal nearest to it.
+         * One shot per call - see the note in ui.h for why nothing here runs
+         * on its own. RX only; it cannot key the radio.
+         *
+         * ⭐ ONE ACTION, TWO ESTIMATORS, EXACTLY AS THE TAB5 GESTURE DOES IT.
+         * The Tab5's long press on the BW label (bw_label_long_cb) means "put
+         * the dial on the signal": a zero-beat in CW, T90's filter-edge snap
+         * in USB/LSB. This endpoint only ever ran the CW half, so a web
+         * operator in SSB got "not in CW/CW-R" and the SSB estimator had no
+         * remote caller at all. Ralph DL1HR asked for the gesture on the web;
+         * half of it would have been the wrong thing to give him.
+         *
+         * ⛔ THE DISPATCH IS THE CW ESTIMATOR'S OWN REFUSAL, not a mode read
+         * here - the same rule bw_label_long_cb records. Reading the mode in
+         * this file would be a third model that can disagree with both.
+         *
+         * ⚠ The SSB half is ASYNCHRONOUS: ui_sb_tune_start() opens a 4 s vote
+         * window and sb_tune_tick() moves the dial (or not) when it closes.
+         * LISTENING is therefore a success, not an error - the page says so
+         * and the dial speaks for itself. CW's own LISTENING (up to 8 s) is
+         * the same thing for the same reason. */
+        int32_t moved = 0;
+        ui_cw_tune_t r = ui_cw_tune_to_peak(&moved);
+        cJSON_Delete(root);
+        char body[160];
+        if (r == UI_CW_TUNE_OK)
+            snprintf(body, sizeof(body),
+                     "{\"ok\":true,\"mode\":\"cw\",\"moved_hz\":%d}", (int)moved);
+        else if (r == UI_CW_TUNE_LISTENING)
+            snprintf(body, sizeof(body),
+                     "{\"ok\":true,\"mode\":\"cw\",\"listening\":true,"
+                     "\"note\":\"listening for up to 8 s\"}");
+        else if (r != UI_CW_TUNE_NOT_CW)
+            snprintf(body, sizeof(body),
+                     "{\"ok\":false,\"mode\":\"cw\",\"error\":\"%s\"}",
+                     ui_cw_tune_reason(r));
+        else {
+            ui_sb_tune_t sb = ui_sb_tune_start();
+            if (sb == UI_SB_TUNE_LISTENING)
+                snprintf(body, sizeof(body),
+                         "{\"ok\":true,\"mode\":\"ssb\",\"listening\":true,"
+                         "\"note\":\"listening for 4 s\"}");
+            else if (sb == UI_SB_TUNE_OK)
+                snprintf(body, sizeof(body), "{\"ok\":true,\"mode\":\"ssb\"}");
+            else
+                snprintf(body, sizeof(body),
+                         "{\"ok\":false,\"mode\":\"ssb\",\"error\":\"%s\"}",
+                         ui_sb_tune_reason(sb));
+        }
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, body);
+        return ESP_OK;
+    } else if (action && strcmp(action, "rit_park") == 0) {
+        /* Park an engaged RIT offset, or put the parked one back - the Tab5's
+         * long press on the RIT pill, which a browser has no way to perform.
+         * Roy KI0ER's round robin: one station off frequency, the offset
+         * wanted and unwanted as the turn passes round, and clearing it is a
+         * different intention that loses the value.
+         *
+         * ⛔ ONE implementation, in ui.c. This used to live only inside the
+         * LVGL callback; it was moved out rather than copied, so the parked
+         * value is one static int that both surfaces move. A second copy here
+         * would park on the web and restore nothing on the glass. */
+        int hz = 0;
+        ui_rit_park_t r = ui_rit_park_toggle(&hz);
+        cJSON_Delete(root);
+        char body[96];
+        if (r == UI_RIT_NOTHING)
+            snprintf(body, sizeof(body),
+                     "{\"ok\":false,\"error\":\"No RIT offset to restore\"}");
+        else
+            snprintf(body, sizeof(body), "{\"ok\":true,\"%s\":true,\"hz\":%d}",
+                     (r == UI_RIT_PARKED) ? "parked" : "restored", hz);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, body);
+        return ESP_OK;
+    } else if (action && strcmp(action, "out_power") == 0) {
+        /* ⭐ OUTPUT POWER ON THE WEB (Ralph DL1HR's gap class). The Tab5 has
+         * had a per-band Output power slider since 2026-09-15; the browser had
+         * nothing at any layer - not an action, not a setting, not a status
+         * field.
+         *
+         * ⛔ IT IS A LADDER, NOT A NUMBER, and that is why it is an action
+         * rather than a settings key. The achievable levels come from THIS
+         * band’s power calibration sweep (power_cal_list_watts), and each watt
+         * figure is paired with the lowest PA voltage that produced it. A
+         * browser allowed to post a bare wattage would be asking for a power
+         * the PA may never have made - the "nearby-voltage guess"
+         * power_cal_modal.c already refuses to give. So: no argument lists the
+         * ladder, and a watts_x100 that is not ON the ladder is refused by
+         * name rather than rounded to a neighbour.
+         *
+         * ⛔ AND IT MUST NOT WRITE THE PA MID-BURST OR UNDER WSPR. Both guards
+         * are the Tab5’s, for the reasons written at its slider:
+         * wspr_rx_owns_pa() (NOT wspr_rx_running() - John W5JSS, 2026-10-18,
+         * whose receiver failed to start while the page still owned the
+         * register), and a TX in progress. The per-band TARGET is still stored
+         * when the radio is busy; only the voltage write waits. */
+        const char *band = adif_log_band_for_freq(cat_get_frequency());
+        uint16_t w_x100[PWRCAL_STEPS], v_x10[PWRCAL_STEPS];
+        int n = (band && band[0])
+                ? power_cal_list_watts(band, w_x100, v_x10, PWRCAL_STEPS) : 0;
+
+        cJSON *jw = cJSON_GetObjectItem(root, "watts_x100");
+        if (!cJSON_IsNumber(jw)) {
+            /* No argument: report the ladder and where we are on it. */
+            cJSON_Delete(root);
+            cJSON *out = cJSON_CreateObject();
+            cJSON_AddBoolToObject(out, "ok", true);
+            cJSON_AddStringToObject(out, "band", (band && band[0]) ? band : "");
+            cJSON_AddBoolToObject(out, "calibrated", n > 0);
+            cJSON *arr = cJSON_AddArrayToObject(out, "watts_x100");
+            for (int i = 0; i < n; i++)
+                cJSON_AddItemToArray(arr, cJSON_CreateNumber(w_x100[i]));
+            uint16_t cur = 0;
+            if (band && band[0] && settings_get_pwr_target_watts(band, &cur))
+                cJSON_AddNumberToObject(out, "target_x100", cur);
+            cJSON_AddBoolToObject(out, "busy",
+                                  ft8_tx_get_status(NULL, 0, NULL) != FT8_TX_IDLE ||
+                                  wspr_tx_get_status(NULL, 0, NULL) != WSPR_TX_IDLE);
+            cJSON_AddBoolToObject(out, "wspr_owns_pa", wspr_rx_owns_pa());
+            char *txt = cJSON_PrintUnformatted(out);
+            cJSON_Delete(out);
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, txt ? txt : "{\"ok\":false}");
+            if (txt) free(txt);
+            return ESP_OK;
+        }
+
+        uint16_t want = (uint16_t)jw->valuedouble;
+        cJSON_Delete(root);
+        char body[176];
+        int idx = -1;
+        for (int i = 0; i < n; i++) if (w_x100[i] == want) { idx = i; break; }
+        if (n == 0)
+            snprintf(body, sizeof(body),
+                     "{\"ok\":false,\"error\":\"%s is not power-calibrated\"}",
+                     (band && band[0]) ? band : "this band");
+        else if (idx < 0)
+            snprintf(body, sizeof(body),
+                     "{\"ok\":false,\"error\":\"%u.%02u W is not a calibrated level on %s\"}",
+                     (unsigned)(want / 100), (unsigned)(want % 100), band);
+        else {
+            settings_set_pwr_target_watts(band, w_x100[idx]);
+            bool busy = ft8_tx_get_status(NULL, 0, NULL) != FT8_TX_IDLE ||
+                        wspr_tx_get_status(NULL, 0, NULL) != WSPR_TX_IDLE;
+            bool wspr = wspr_rx_owns_pa();
+            if (!busy && !wspr) {
+                cat_request_pa_voltage_x10(v_x10[idx]);
+                snprintf(body, sizeof(body),
+                         "{\"ok\":true,\"watts_x100\":%u,\"pa_v_x10\":%u}",
+                         (unsigned)w_x100[idx], (unsigned)v_x10[idx]);
+            } else {
+                /* Stored, not applied - and said so, because a control that
+                 * silently does half of what it says is the worse failure. */
+                snprintf(body, sizeof(body),
+                         "{\"ok\":true,\"watts_x100\":%u,\"deferred\":true,"
+                         "\"note\":\"stored; the PA is %s\"}",
+                         (unsigned)w_x100[idx], wspr ? "held by WSPR" : "transmitting");
+            }
+            ESP_LOGI(TAG, "web: output power on %s -> %u.%02u W%s", band,
+                     (unsigned)(w_x100[idx] / 100), (unsigned)(w_x100[idx] % 100),
+                     (!busy && !wspr) ? "" : " (stored, not applied)");
+        }
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, body);
+        return ESP_OK;
     } else if (action && strcmp(action, "set_bw") == 0) {
         if (wspr_owns_the_dial(req, root, "BW")) return ESP_OK;
-        cJSON *item = cJSON_GetObjectItem(root, "hz");
-        if (cJSON_IsNumber(item)) {
-            uint32_t bw = (uint32_t)item->valuedouble;
+        double argv;
+        if (!cmd_num_arg(req, root, "hz", &argv)) { cJSON_Delete(root); return ESP_FAIL; }
+        {
+            uint32_t bw = (uint32_t)argv;
             /* ⛔ AM IS OUR FILTER, NOT THE RADIO'S - nothing is written
              * to the QMX here. Its AM bandwidth is fixed and is not in
              * the I/Q path at all. Decided on the DEVICE rather than by
@@ -1703,12 +2114,11 @@ static esp_err_t cmd_handler(httpd_req_t *req)
         ESP_LOGI(TAG, "web: still display -> %s", v ? "on" : "off");
     } else if (action && strcmp(action, "set_zoom") == 0) {
         if (wspr_owns_the_dial(req, root, "Zoom")) return ESP_OK;
-        cJSON *item = cJSON_GetObjectItem(root, "zoom");
-        if (cJSON_IsNumber(item)) {
-            if (display_lock(50)) {
-                ui_set_zoom((float)item->valuedouble, 0);
-                display_unlock();
-            }
+        double argv;
+        if (!cmd_num_arg(req, root, "zoom", &argv)) { cJSON_Delete(root); return ESP_FAIL; }
+        if (display_lock(50)) {
+            ui_set_zoom((float)argv, 0);
+            display_unlock();
         }
     } else if (action && strcmp(action, "set_rit") == 0) {
         // RIT offset in Hz; 0 clears it and switches RIT off at the radio. Same
@@ -1718,13 +2128,81 @@ static esp_err_t cmd_handler(httpd_req_t *req)
         //
         // No "arm" here on purpose: arming is a property of the input surface, and
         // the browser owns its own. cat_request_rit_hz() clamps to CAT_RIT_MAX_HZ.
-        cJSON *item = cJSON_GetObjectItem(root, "hz");
-        if (cJSON_IsNumber(item)) {
-            cat_request_rit_hz((int)item->valuedouble);
-            ESP_LOGI(TAG, "web: RIT -> %+d Hz", (int)item->valuedouble);
+        double argv;
+        if (!cmd_num_arg(req, root, "hz", &argv)) { cJSON_Delete(root); return ESP_FAIL; }
+        cat_request_rit_hz((int)argv);
+        ESP_LOGI(TAG, "web: RIT -> %+d Hz", (int)argv);
+    } else if (action && strcmp(action, "log_qso") == 0) {
+        /* ⭐ MANUAL CW/SSB LOGGING FROM THE BROWSER (T108 parity). The Tab5 got
+         * this first; Randy N4OPI works from the web, and a feature that exists
+         * on one surface only is the gap class this project keeps re-finding.
+         *
+         * ⛔ THE SAME THREE FIELDS AND NO MORE. Everything else - date, time,
+         * frequency, band, mode, our callsign, our grid, the activation - is
+         * read from the device here exactly as manual_log_modal.c reads it, so
+         * a QSO logged from the browser is indistinguishable from one logged on
+         * the glass. The browser is NOT allowed to supply them: a page with a
+         * stale frequency would write a record on the wrong band. */
+        const char *call = cJSON_GetStringValue(cJSON_GetObjectItem(root, "call"));
+        const char *rs   = cJSON_GetStringValue(cJSON_GetObjectItem(root, "rst_sent"));
+        const char *rr   = cJSON_GetStringValue(cJSON_GetObjectItem(root, "rst_rcvd"));
+        char ucall[32] = "";
+        if (call) {
+            size_t n = 0;
+            while (*call == ' ') call++;
+            while (*call && n + 1 < sizeof(ucall)) {
+                char c = *call++;
+                ucall[n++] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+            }
+            while (n > 0 && ucall[n - 1] == ' ') n--;
+            ucall[n] = '\0';
+        }
+        const char *mode = cat_get_mode_str();
+        const char *err = NULL;
+        if (!ucall[0])            err = "Enter a callsign";
+        else if (!mode || !mode[0]) err = "No CAT - the radio must be connected to log";
+
+        if (!err) {
+            qmx_settings_t cfg;
+            settings_load_all(&cfg);
+            adif_qso_t qso = {
+                .their_call = ucall,
+                .my_call    = cfg.my_callsign,
+                .my_grid    = cfg.my_grid,
+                .freq_hz    = ui_get_dial_freq_hz(),
+                .mode       = mode,
+                .rst_sent   = (rs && rs[0]) ? rs : NULL,
+                .rst_rcvd   = (rr && rr[0]) ? rr : NULL,
+                .qso_time   = time(NULL),
+            };
+            adif_log_record(&qso);
+            ESP_LOGI(TAG, "web: logged %s %s at %lu Hz", ucall, mode,
+                     (unsigned long)qso.freq_hz);
+        }
+        cJSON_Delete(root);
+        httpd_resp_set_type(req, "application/json");
+        if (err) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            char msg[96];
+            snprintf(msg, sizeof msg, "{\"ok\":false,\"error\":\"%s\"}", err);
+            return httpd_resp_sendstr(req, msg);
+        }
+        /* Answer with what the activation count now is, so the page can say
+         * "7/10" without a second round trip. */
+        {
+            char ref[24];
+            int n = 0, need = settings_activation_target();
+            if (settings_get_activation_ref(ref, sizeof(ref)))
+                n = adif_log_count_activation(ref);
+            char msg[160];
+            snprintf(msg, sizeof msg,
+                     "{\"ok\":true,\"call\":\"%s\",\"act_qsos\":%d,\"act_need\":%d,\"total\":%d}",
+                     ucall, n, need, adif_log_count());
+            return httpd_resp_sendstr(req, msg);
         }
     } else if (action && strcmp(action, "set_activation") == 0) {
-        // Start or stop a POTA/SOTA activation. type 0 stops; 1 = POTA, 2 = SOTA
+        // Start or stop an activation. type 0 stops; 1..N-1 are the programmes
+        // in settings.c's k_act[] (POTA, SOTA, WWFF, IOTA, GMA, WCA, WWBOTA)
         // with a reference. Mirrors activation_modal.c's go button, including its
         // refusals: a reference is required to start, and settings_set_activation()
         // is the thing that decides whether one is usable (it trims), so the answer
@@ -1734,15 +2212,24 @@ static esp_err_t cmd_handler(httpd_req_t *req)
         int t = cJSON_IsNumber(jt) ? (int)jt->valuedouble : -1;
         const char *err = NULL;
         if (t == 0) {
-            settings_set_activation(0, NULL);
-            ESP_LOGI(TAG, "web: activation stopped");
-        } else if (t == 1 || t == 2) {
+            /* ⛔ activation_stop(), NOT settings_set_activation(0): the
+             * per-activation ADIF export lived in the Tab5 button handler,
+             * so stopping from here silently skipped the file. One stop,
+             * both surfaces. */
+            char note[160];
+            activation_stop(note, sizeof(note));
+            ESP_LOGI(TAG, "web: %s", note);
+        } else if (t > 0 && t < (int)settings_activation_type_count()) {
+            /* ⛔ ANY PROGRAMME IN THE TABLE. This was `t == 1 || t == 2`,
+             * so the five added in T115 were answered "Unknown activation
+             * type" from a picker that offered them. */
             if (!ref || !ref[0]) {
                 err = "Enter the park or summit reference first";
             } else {
                 settings_set_activation((uint8_t)t, ref);
                 if (settings_get_activation_type() == 0) err = "That reference is not usable";
-                else ESP_LOGI(TAG, "web: activation started: %s %s", t == 1 ? "POTA" : "SOTA", ref);
+                else ESP_LOGI(TAG, "web: activation started: %s %s",
+                              settings_activation_sig_name_for((uint8_t)t), ref);
             }
         } else {
             err = "Unknown activation type";
@@ -1851,26 +2338,114 @@ static esp_err_t cmd_handler(httpd_req_t *req)
         // Deferred to the LVGL task (see ui_request_base_mode) - the switch
         // spawns/stops ft8_task and moves widgets.
         const char *scr = cJSON_GetStringValue(cJSON_GetObjectItem(root, "screen"));
+        /* T75: the SUB-MODE is part of the door, and an unknown name is refused.
+         *
+         * Two defects, both measured on 2026-10-23 while v1.20.5's Phase 5.5 was
+         * run from the desk:
+         *
+         *  - "ft4" and "js8" were not names this action knew, and the final
+         *    `else` sent every unknown name to the PANADAPTER. Asking for FT4
+         *    therefore left the panadapter showing and answered {"ok":true} -
+         *    the T67 shape, in the one action whose whole job is to be louder
+         *    than a typo.
+         *  - set_ft8_mode alone cannot do it either: it only leaves
+         *    s_web_preset_hz for the FT8 screen's 1 Hz timer, which applies the
+         *    frequency and sub-mode with the FT8 page still hidden and
+         *    ft8_task not spawned. The dial moves, nothing decodes.
+         *
+         * So "ft4"/"js8" now raise the FT8 page AND ask for the sub-mode, which
+         * is one call and makes Phase 5.5 steps 20d/20e runnable without the
+         * operator. */
         if (scr) {
             /* Three pages now, so the bool form cannot express it. */
-            if      (!strcmp(scr, "ft8"))  ui_request_base_mode_m(UI_MODE_FT8);
+            /* ⛔ FT8 MUST ASK FOR THE SUB-MODE TOO (Randy N4OPI, 2026-10-27).
+             * Raising the page alone leaves the sub-mode at whatever it was,
+             * so "Switch to FT8" from the panadapter landed you in FT4 or JS8
+             * if that is where you were last - his words, "picking FT8 takes
+             * you to whatever FT/JS mode you were previously in". The ft4 and
+             * js8 branches below have always done both; this one did not, and
+             * the asymmetry is the bug. T75 added the sub-mode to those two
+             * and left the default case looking like it needed nothing. */
+            if      (!strcmp(scr, "ft8")) {
+                ui_request_base_mode_m(UI_MODE_FT8);
+                ft8_screen_view_request_preset(0, FT8_OP_MODE_FT8);
+            }
+            else if (!strcmp(scr, "ft4")) {
+                ui_request_base_mode_m(UI_MODE_FT8);
+                /* 0 = keep the dial, which the drain then moves to the FT4
+                 * calling frequency for the protocol asked for. */
+                ft8_screen_view_request_preset(0, FT8_OP_MODE_FT4);
+            }
+            else if (!strcmp(scr, "js8")) {
+                /* Refused here as well as in ft8_op_mode_set(), exactly as
+                 * set_ft8_mode does, so an unbuilt protocol never answers
+                 * {"ok":true}. */
+                if (!ftx_protocol_is_implemented(FTX_PROTOCOL_JS8)) {
+                    cJSON_Delete(root);
+                    httpd_resp_set_type(req, "application/json");
+                    httpd_resp_sendstr(req,
+                        "{\"ok\":false,\"error\":\"JS8 is not implemented in this build\"}");
+                    return ESP_OK;
+                }
+                ui_request_base_mode_m(UI_MODE_FT8);
+                ft8_screen_view_request_preset(0, FT8_OP_MODE_JS8);
+            }
             else if (!strcmp(scr, "wspr")) {
                 /* Refused, and SAID SO. /api/cmd answers an action it does not
                  * know with "unknown action" and HTTP 200, and CLAUDE.md
                  * records a whole evening lost to a silent no-op read as a
                  * result - so a gate that declines has to be louder than the
                  * typo it resembles. */
-                if (!wspr_feature_enabled()) {
-                    httpd_resp_set_type(req, "application/json");
-                    httpd_resp_sendstr(req,
-                        "{\"ok\":false,\"error\":\"wspr disabled\","
-                        "\"hint\":\"send the wspr_enable action first\"}");
-                    cJSON_Delete(root);
-                    return ESP_OK;
-                }
+                /* NO LONGER REFUSED. Asking for the WSPR page IS asking
+                 * for WSPR: ui_set_base_mode() turns wspr_en on when the page
+                 * is selected, in the one place both surfaces go through, so
+                 * the browser and the Tab5 cannot end up on different pages.
+                 * The modes are mutually exclusive - choosing one stops the
+                 * others - and a separate unlock in front of that only makes
+                 * a menu entry that does nothing. */
                 ui_request_base_mode_m(UI_MODE_WSPR);
             }
-            else                            ui_request_base_mode_m(UI_MODE_PANADAPTER);
+            else if (!strcmp(scr, "cw")) {
+                /* ⛔ REFUSED ON THE CHANNEL THE CALLER USED. ui_set_base_mode()
+                 * already turns this away, but it does it by returning - and a
+                 * silent return here would answer {"ok":true} while nothing
+                 * moved, which is the T67 shape this action exists to avoid.
+                 *
+                 * NOT self-enabling, unlike the "wspr" branch above: WSPR is a
+                 * finished page whose flag is vestigial, the CW page is not.
+                 * It keys the radio over CAT KY with no way to abort a message
+                 * in flight, so asking for the page is not consent to that. */
+                if (!settings_get_cw_page_en()) {
+                    cJSON_Delete(root);
+                    httpd_resp_set_type(req, "application/json");
+                    httpd_resp_set_status(req, "403 Forbidden");
+                    httpd_resp_sendstr(req,
+                        "{\"ok\":false,\"error\":\"the CW page is off - "
+                        "enable it with {\\\"action\\\":\\\"cw_enable\\\",\\\"on\\\":true}\"}");
+                    return ESP_OK;
+                }
+                ui_request_base_mode_m(UI_MODE_CW);
+            }
+            else if (!strcmp(scr, "pan") || !strcmp(scr, "panadapter")) {
+                ui_request_base_mode_m(UI_MODE_PANADAPTER);
+            }
+            else {
+                /* Was: anything unknown -> the panadapter. A mistyped name is
+                 * then indistinguishable from "go to the panadapter". */
+                cJSON_Delete(root);
+                httpd_resp_set_type(req, "application/json");
+                httpd_resp_set_status(req, "400 Bad Request");
+                httpd_resp_sendstr(req,
+                    "{\"ok\":false,\"error\":\"screen must be pan, cw, ft8, ft4, js8 or wspr\"}");
+                return ESP_OK;
+            }
+        } else {
+            cJSON_Delete(root);
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_sendstr(req,
+                "{\"ok\":false,\"error\":\"screen required (pan, cw, ft8, ft4, js8 or wspr)\"}");
+            return ESP_OK;
         }
     } else if (action && strcmp(action, "reply") == 0) {
         // Reply to a decoded station from the browser - Phase 6 of web parity,
@@ -1893,8 +2468,38 @@ static esp_err_t cmd_handler(httpd_req_t *req)
         if (call && call[0]) {
             if (ftx_protocol_is_js8(ft8_op_mode_protocol())) {
                 js8_target_set(call);
+            } else if (!ft8_screen_view_is_active()) {
+                /* ⛔ T94: REFUSE HERE, NOT THROUGH /api/status.
+                 *
+                 * The deferred path writes "Not in FT8 mode" into web_r, and
+                 * web_r is emitted only inside the ft8 block, which
+                 * add_ft8_tx_status() only adds when the FT8 screen IS active -
+                 * so the one refusal that exists to say "you are not in FT8"
+                 * was suppressed by the very condition that produced it
+                 * (measured on v1.20.5-66-ga919752a: {"ok":true}, the device
+                 * log carries it, /api/status carries no ft8 block at all).
+                 * The browser's two reads of web_r sit inside
+                 * `screen === "ft8"` as well, so emitting it would not have
+                 * been enough either.
+                 *
+                 * A POST answer needs neither half: the click is a
+                 * request/response, the condition is known here and now, and
+                 * ft8RowClicked() already owns the line that says what came of
+                 * it. Same class as T82, where the browser threw every
+                 * /api/term refusal away. */
+                cJSON_Delete(root);
+                httpd_resp_set_type(req, "application/json");
+                httpd_resp_sendstr(req,
+                    "{\"ok\":false,\"err\":\"Not in FT8 mode\"}");
+                return ESP_OK;
             } else {
-                ft8_screen_view_request_reply(call);
+                /* "retarget": true is the browser's DOUBLE click - it may
+                 * abandon a live exchange to take this station instead
+                 * (Randy N4OPI). A single click still sends the ordinary
+                 * pick, which keeps refusing while busy. */
+                cJSON *rt = cJSON_GetObjectItem(root, "retarget");
+                if (cJSON_IsTrue(rt)) ft8_screen_view_request_reply_retarget(call);
+                else                  ft8_screen_view_request_reply(call);
             }
         }
     } else if (action && strcmp(action, "js8_select") == 0) {
@@ -1910,6 +2515,21 @@ static esp_err_t cmd_handler(httpd_req_t *req)
         ft8_screen_view_request_js8_macro(0);
     } else if (action && strcmp(action, "js8_grid") == 0) {
         ft8_screen_view_request_js8_macro(1);
+    } else if (action && strcmp(action, "js8_cmd") == 0) {
+        /* {"action":"js8_cmd","cmd":"GRID?"} - the macro sheet's directives,
+         * the same twelve the Tab5 shows and by the same worker.
+         *
+         * ⛔ NOT VALIDATED HERE. js8_cmd_from_text() is the authority on
+         * what has a directed form; a list in this file would be a second
+         * copy of it and the two would drift. An unknown word comes back as
+         * the encoder's own refusal, which is what the page should show. */
+        const char *cmd = cJSON_GetStringValue(cJSON_GetObjectItem(root, "cmd"));
+        if (!cmd || !cmd[0]) {
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"cmd required\"}");
+            return ESP_OK;
+        }
+        ft8_screen_view_request_js8_directive(cmd);
     } else if (action && strcmp(action, "js8_flush") == 0) {
         /* The browser's Flush. Ryan KK6DZB, 2026-10-14: "No flush button in
          * the webUI?" - the Tab5's JS8 tab bar has had one all along. It
@@ -1964,6 +2584,49 @@ static esp_err_t cmd_handler(httpd_req_t *req)
             httpd_resp_sendstr(req, out);
         }
         return ESP_OK;
+    } else if (action && strcmp(action, "js8_alt_submode") == 0) {
+        /* {"action":"js8_alt_submode","submode":255|1|2|4} - T132. The
+         * ALTERNATE JS8 submode decoded as well as the primary, on a duty
+         * cycle, out of the audio the primary slot already captured. 255 is
+         * off and is the default.
+         *
+         * ⛔ IT IS RECEIVE ONLY, and that is the whole safety property. An
+         * alternate decode never reaches ft8_qso_advance(), the robot or TX
+         * arming: the station is operating on the PRIMARY submode, and a Fast
+         * decode advancing a Normal exchange could key the radio against the
+         * wrong state. So unlike "js8_submode" above there is nothing to
+         * refuse here - changing it does not touch the physical layer we
+         * transmit on, and it is safe mid-QSO.
+         *
+         * ⚠ Fast, Turbo and Slow have never been exchanged with a real
+         * JS8Call station; only our own encoder and decoder agree. This makes
+         * them visible, it does not make them proven.
+         *
+         * Clamped in settings.c, not here, for the same reason the primary is:
+         * NVS and an imported config file are writers this handler never
+         * sees. A submode that cannot fit in the primary slot - Slow under a
+         * 15 s primary - is accepted and then simply never selected, by
+         * arithmetic in js8_alt_select(); the reply says so. */
+        cJSON *sm = cJSON_GetObjectItem(root, "submode");
+        int want = cJSON_IsNumber(sm) ? sm->valueint : 255;
+        cJSON_Delete(root);
+        httpd_resp_set_type(req, "application/json");
+        settings_set_js8_alt_submode((uint8_t)want);
+        {
+            uint8_t got = settings_get_js8_alt_submode();
+            ftx_protocol_t prim = ft8_op_mode_protocol();
+            bool fits = (got != 255) &&
+                        js8_alt_fits(prim, js8_alt_proto_for_submode(got));
+            char out[192];
+            snprintf(out, sizeof(out),
+                     "{\"ok\":true,\"submode\":%u,\"name\":\"%s\",\"fits\":%s}",
+                     (unsigned)got,
+                     got == 255 ? "off"
+                                : ftx_protocol_label(js8_alt_proto_for_submode(got)),
+                     fits ? "true" : "false");
+            httpd_resp_sendstr(req, out);
+        }
+        return ESP_OK;
     } else if (action && strcmp(action, "qso_override") == 0) {
         // Mid-QSO override from the browser (#205, Randy N4OPI). Same deferral as
         // "reply": the QSO machine belongs to the LVGL task, and the outcome comes
@@ -1977,12 +2640,23 @@ static esp_err_t cmd_handler(httpd_req_t *req)
             else if (!strcmp(w, "73"))     what = 3;
             else if (!strcmp(w, "cancel")) what = 4;
             else if (!strcmp(w, "pause"))  what = 5;   /* Randy N4OPI: he works remote */
+            else if (!strcmp(w, "skip"))   what = 6;   /* Randy N4OPI: give up on THIS caller, keep answering */
         }
         if (!what) {
             cJSON_Delete(root);
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                "what must be resend, rr73, 73, cancel or pause");
+                "what must be resend, rr73, 73, cancel, pause or skip");
             return ESP_FAIL;
+        }
+        /* The same T94 refusal as "reply" above, for the same reason: the
+         * deferred handler's "Not in FT8 mode" goes into web_r, which nothing
+         * off the FT8 screen can read. */
+        if (!ft8_screen_view_is_active()) {
+            cJSON_Delete(root);
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req,
+                "{\"ok\":false,\"err\":\"Not in FT8 mode\"}");
+            return ESP_OK;
         }
         ft8_screen_view_request_override(what);
     } else if (action && strcmp(action, "sd_eject") == 0) {
@@ -2073,14 +2747,10 @@ static esp_err_t cmd_handler(httpd_req_t *req)
          *   {"action":"band_scan_restore_test","hz":14097000,"mode":"6"}
          *
          * No TX. Touches VFO A and the mode, nothing else. */
-        cJSON *hz_item = cJSON_GetObjectItem(root, "hz");
         const char *md = cJSON_GetStringValue(cJSON_GetObjectItem(root, "mode"));
-        if (!cJSON_IsNumber(hz_item)) {
-            cJSON_Delete(root);
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "hz required");
-            return ESP_FAIL;
-        }
-        cat_band_scan_restore_test((uint32_t)hz_item->valuedouble, md ? md[0] : 0);
+        double argv;
+        if (!cmd_num_arg(req, root, "hz", &argv)) { cJSON_Delete(root); return ESP_FAIL; }
+        cat_band_scan_restore_test((uint32_t)argv, md ? md[0] : 0);
     } else if (action && strcmp(action, "trip_swr") == 0) {
         /* Hidden dev action, same family as gp_probe and ta_probe: RAISE the
          * station SWR latch, so the refusal path can be exercised without a
@@ -2132,7 +2802,36 @@ static esp_err_t cmd_handler(httpd_req_t *req)
     } else if (action && strcmp(action, "greylist_clear") == 0) {
         // Un-skip everyone - band conditions change, and a station that timed
         // out an hour ago may be perfectly workable now.
-        ft8_greylist_clear_all();
+        //
+        // ⭐ An optional "call" clears just that one. Added with the Skip
+        // button (T43): skipping is now a deliberate operator action, so
+        // undoing one of three hand-skipped stations should not cost the other
+        // two. The Tab5 has had a per-call clear since the grey-list existed
+        // (grey_modal_show); the browser only had clear-all.
+        const char *gcall = cJSON_GetStringValue(cJSON_GetObjectItem(root, "call"));
+        if (gcall && gcall[0]) ft8_greylist_clear(gcall);
+        else                   ft8_greylist_clear_all();
+    } else if (action && strcmp(action, "mute") == 0) {
+        /* Instant speaker mute (Samuel W7STF). {"action":"mute","on":true},
+         * or omit "on" to toggle - a single button needs one call, not two.
+         * Answers with the state it ended in, so a button can never show the
+         * opposite of what the speaker is doing. */
+        cJSON *jm = cJSON_GetObjectItem(root, "on");
+        rx_audio_set_muted(cJSON_IsBool(jm) ? cJSON_IsTrue(jm)
+                                            : !rx_audio_is_muted());
+        cJSON_Delete(root);
+        char body[48];
+        snprintf(body, sizeof(body), "{\"ok\":true,\"muted\":%s}",
+                 rx_audio_is_muted() ? "true" : "false");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, body);
+        return ESP_OK;
+    } else if (action && strcmp(action, "skip_clear") == 0) {
+        /* Clear the HAND-SKIP list only, leaving timeout entries in place -
+         * the Clear button beside Randy's list. Deliberately not
+         * greylist_clear with no call, which would also un-skip every station
+         * the software had set aside for not hearing us. */
+        ft8_greylist_clear_skipped();
     } else if (action && strcmp(action, "help") == 0) {
         // Open the Tab5's own manual at a page (and optionally a heading), the
         // same call the context-help buttons make. Sending someone to the right
@@ -2632,6 +3331,24 @@ static esp_err_t cmd_handler(httpd_req_t *req)
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, body);
         return ESP_OK;
+    } else if (action && strcmp(action, "cw_clear") == 0) {
+        /* Wipe the decoded-CW window (Bryan N0LUF, 2026-10-16: "it might be
+         * cool for a click inside the decoder area of the screen to clear the
+         * buffer... With so many lines of wrapping text it sometimes gets a
+         * bit too busy and hard to quickly find where the cyan and green
+         * boundary of fresh decode is").
+         *
+         * ⛔ Clears the DECODER, not a copy in the page, so the Tab5's own
+         * strip clears with it. Two surfaces drawing one line is the whole
+         * point of cw_decode.c owning it; a browser-side wipe would have made
+         * them disagree until the next pass.
+         *
+         * It does NOT touch the microSD transcript - what was received is
+         * still on the card. Only the window is wiped. */
+        cw_decode_clear();
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":true}");
+        return ESP_OK;
     } else if (action && strcmp(action, "web_audio") == 0) {
         /* Start/stop demodulated audio on the WebSocket (Sam W7STF).
          *   {"action":"web_audio","on":true}
@@ -2701,6 +3418,18 @@ static esp_err_t cmd_handler(httpd_req_t *req)
         cJSON_AddNumberToObject(resp, "pan_overlap",  rx_audio_get_pan_overlap());
         cJSON_AddNumberToObject(resp, "pan_width",    rx_audio_get_pan_width());
         cJSON_AddNumberToObject(resp, "clips_since_last_read", (double)clips);
+        /* T21 - the resampler increment as ppm from nominal, which is what
+           sets playback pitch. min/max span the time since the LAST call,
+           so polling every few seconds still catches a wander between
+           polls instead of aliasing past it. */
+        cJSON_AddNumberToObject(resp, "resample_ppm",     (double)diag.resample_ppm);
+        cJSON_AddNumberToObject(resp, "resample_ppm_min", (double)diag.resample_ppm_min);
+        cJSON_AddNumberToObject(resp, "resample_ppm_max", (double)diag.resample_ppm_max);
+        cJSON_AddNumberToObject(resp, "resample_railed",  (double)diag.resample_railed);
+        /* T80: a railed loop that RECOVERED looks identical to one that never
+         * railed unless the re-lock says so. These two are how that is told. */
+        cJSON_AddNumberToObject(resp, "rate_win_refused", (double)diag.rate_win_refused);
+        cJSON_AddNumberToObject(resp, "rate_relocked",    (double)diag.rate_relocked);
         // frame_us_* excludes the I2S write on purpose - compare against
         // ~21333 (DSP_FFT_SIZE/DSP_SAMPLE_RATE_HZ) to see if the math itself
         // is keeping up. read_timeouts>0 means the forward ring is starved -
@@ -2742,6 +3471,45 @@ static esp_err_t cmd_handler(httpd_req_t *req)
             "again when done. Read the four per-channel RMS lines in the serial "
             "log. The QMX will need a power cycle.\"}");
         mic_probe_request();      /* does not return */
+        return ESP_OK;
+    } else if (action && strcmp(action, "webradio_play") == 0) {
+        /* ⭐ DEV: play a URL WITHOUT THE DIRECTORY.
+         *
+         * The decode measurement needs a stream, and until now the only way
+         * to start one was to tap a station on the glass - so a transient
+         * radio-browser.info failure blocked a bench measurement that has
+         * nothing to do with the directory. That happened on field
+         * 2026-11-01 ("Directory unreachable", a TLS reset, while the same
+         * host answered the PC in 128 ms). It also means a stream can be
+         * repeated EXACTLY, which comparing two decoder arms needs.
+         *
+         * {"action":"webradio_play","url":"http://...","name":"..."}
+         * {"action":"webradio_stop"}
+         *
+         * No guard beyond a URL: this touches no transmit path, only the
+         * speaker, and it is already reachable from the drawer. */
+        const cJSON *ju = cJSON_GetObjectItem(root, "url");
+        const cJSON *jn = cJSON_GetObjectItem(root, "name");
+        if (!cJSON_IsString(ju) || !ju->valuestring[0]) {
+            cJSON_Delete(root);
+            httpd_resp_set_status(req, "400 Bad Request");
+            httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"url is required\"}");
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "webradio: play '%s' over /api/cmd", ju->valuestring);
+        bool ok = webradio_play(ju->valuestring,
+                                cJSON_IsString(jn) ? jn->valuestring : "dev");
+        cJSON_Delete(root);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, ok ? "{\"ok\":true,\"note\":\"see the webradio loop: lines\"}"
+                                   : "{\"ok\":false,\"err\":\"could not start\"}");
+        return ESP_OK;
+    } else if (action && strcmp(action, "webradio_stop") == 0) {
+        ESP_LOGW(TAG, "webradio: stop over /api/cmd");
+        webradio_stop();
+        cJSON_Delete(root);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":true}");
         return ESP_OK;
     } else if (action && strcmp(action, "cpu_owners") == 0) {
         // TEMP INSTRUMENT (#284) - dev only. Names the task eating a core.
@@ -2834,8 +3602,29 @@ static esp_err_t cmd_handler(httpd_req_t *req)
             httpd_resp_sendstr(req, "{\"error\":\"needs cmd\"}");
             return ESP_OK;
         }
-        esp_err_t e = cat_send_raw_cmd("%s", c);
+        /* ⛔ T64: THIS USED TO CALL cat_send_raw_cmd() AND IT COULD KEY THE
+         * RADIO. {"cmd":"TX;"} transmitted on whatever frequency the dial
+         * happened to be on, with no band guard and no authentication, in
+         * every release up to v1.20.3 - and check_tx_guard.py passed the build
+         * because it greps our source for the literal "TX;", which a command
+         * arriving over HTTP never is. Discovery is still the point of this
+         * action; keying never was. cat_send_external_cmd() is the guarded
+         * door, and the checker now refuses a direct raw send from this file. */
+        char why[96];
+        esp_err_t e = cat_send_external_cmd(c, why, sizeof(why));
         cJSON_Delete(root);
+        if (e == ESP_ERR_NOT_ALLOWED) {
+            cJSON *rj = cJSON_CreateObject();
+            cJSON_AddBoolToObject(rj, "ok", false);
+            cJSON_AddStringToObject(rj, "error", why[0] ? why : "refused by the band guard");
+            char *rs = cJSON_PrintUnformatted(rj);
+            cJSON_Delete(rj);
+            httpd_resp_set_status(req, "403 Forbidden");
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_sendstr(req, rs ? rs : "{\"ok\":false}");
+            if (rs) free(rs);
+            return ESP_OK;
+        }
         char out[64];
         snprintf(out, sizeof(out), "{\"ok\":%s}", e == ESP_OK ? "true" : "false");
         httpd_resp_set_type(req, "application/json");
@@ -2973,6 +3762,53 @@ static esp_err_t cmd_handler(httpd_req_t *req)
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, body);
         return ESP_OK;
+    } else if (action && strcmp(action, "spectest") == 0) {
+        /* Dev action: replace the spectrum CONTENT with a peak gliding at a
+         * known constant rate, leaving every stage after it untouched. It
+         * separates "the data is uneven" from "the picture is uneven" - see
+         * the long comment at render_set_synthetic() in render.h for why no
+         * further counter on the transport could do that.
+         * {"action":"spectest","mode":1} on, {"mode":0} off. */
+        cJSON *jm = cJSON_GetObjectItem(root, "mode");
+        if (cJSON_IsNumber(jm)) render_set_synthetic(jm->valueint);
+        cJSON_Delete(root);
+        char body[64];
+        snprintf(body, sizeof(body), "{\"ok\":true,\"spectest\":%d}",
+                 render_get_synthetic());
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, body);
+        return ESP_OK;
+    } else if (action && strcmp(action, "framesync") == 0) {
+        /* Isolate the one lever: push a spectrum per display frame (on) or on
+         * the old 100 ms timer (off). Frame sync is what the operator chose
+         * to keep, so OFF is only a diagnostic - it exists to attribute a
+         * future regression to this lever rather than to the three around it.
+         * {"action":"framesync","on":false} */
+        cJSON *jfs = cJSON_GetObjectItem(root, "on");
+        if (cJSON_IsBool(jfs)) render_set_frame_sync(cJSON_IsTrue(jfs));
+        cJSON_Delete(root);
+        char body[64];
+        snprintf(body, sizeof(body), "{\"ok\":true,\"framesync\":%s}",
+                 render_get_frame_sync() ? "true" : "false");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, body);
+        return ESP_OK;
+    } else if (action && strcmp(action, "wfbatch") == 0) {
+        /* Dev action: how many waterfall rows accumulate before the VIEW
+         * moves. Moving it costs the whole 474 kpx carpet whether it moves
+         * 1 px or N, so this caps the carpet redraw rate without dropping a
+         * single row of history. n=1 is the old behaviour exactly, n=0 is
+         * auto (sized from rows/s). A/B needs no reflash.
+         * {"action":"wfbatch","n":1} */
+        cJSON *jn = cJSON_GetObjectItem(root, "n");
+        if (cJSON_IsNumber(jn)) ui_wf_set_shift_batch(jn->valueint);
+        cJSON_Delete(root);
+        char body[64];
+        snprintf(body, sizeof(body), "{\"ok\":true,\"wfbatch\":%d}",
+                 ui_wf_get_shift_batch());
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, body);
+        return ESP_OK;
     } else if (action && strcmp(action, "wspr_guards") == 0) {
         /* Dev action: choose which false-decode guard ACTS. Both are measured
          * regardless, so this exists to compare them on real signals without
@@ -3104,6 +3940,22 @@ static esp_err_t cmd_handler(httpd_req_t *req)
          * reach, which is a trap rather than a setting. */
         cJSON *on = cJSON_GetObjectItem(root, "on");
         bool want = on ? (cJSON_IsTrue(on) || on->valueint) : true;
+        /* ⛔ SAY SO. This route wrote NVS and logged nothing, and on
+         * 2026-10-20 that cost an evening: WSPR had vanished from the swipe
+         * cycle, and the only trace of why was a dirty bit inside one of
+         * 83,870 `settings: flushed` lines in a 685 MB capture. Finding it
+         * meant knowing that DIRTY_WSPR_EN is bit 105 and decoding the
+         * bitmap by hand.
+         *
+         * It matters beyond this bench. The switch is reachable only over the
+         * API, so when a user reports "I cannot get to the WSPR page" their
+         * diagnostic log is the evidence - and it said nothing either. The
+         * hidden tap-unlock in ota_modal.c has always logged; this, the route
+         * people actually use, did not.
+         *
+         * WARN, not INFO: it removes a whole page from the swipe cycle. */
+        ESP_LOGW(TAG, "WSPR master switch -> %s (over /api/cmd)",
+                 want ? "ENABLED" : "DISABLED - the page leaves the swipe cycle");
         settings_set_wspr_en(want);
         if (!want && ui_mode_get() == UI_MODE_WSPR) {
             wspr_rx_stop();
@@ -3111,6 +3963,37 @@ static esp_err_t cmd_handler(httpd_req_t *req)
         }
         char buf[96];
         snprintf(buf, sizeof(buf), "{\"ok\":true,\"wspr_en\":%s}",
+                 want ? "true" : "false");
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, buf);
+        cJSON_Delete(root);
+        return ESP_OK;
+    } else if (action && strcmp(action, "cw_enable") == 0) {
+        /* The CW page's master switch. Same shape as wspr_enable above and
+         * logged for the same measured reason - a route that writes NVS and
+         * says nothing leaves a user's "I cannot get to the CW page" report
+         * with no evidence in it.
+         *
+         * {"action":"cw_enable","on":true}   - and it persists in NVS.
+         *
+         * ⚠ The page is UNFINISHED, and that is why this switch exists rather
+         * than being vestigial like wspr_en: CAT KY has no abort, so a sent
+         * message runs to the end of the radio's 80-character buffer. Default
+         * OFF ships the firmware without offering that to anyone who did not
+         * go looking for it.
+         *
+         * Turning it OFF while the page is up also leaves it, or the operator
+         * is standing on a page whose door has just been removed. */
+        cJSON *on = cJSON_GetObjectItem(root, "on");
+        bool want = on ? (cJSON_IsTrue(on) || on->valueint) : true;
+        ESP_LOGW(TAG, "CW page master switch -> %s (over /api/cmd)",
+                 want ? "ENABLED" : "DISABLED - the page loses its drawer door");
+        settings_set_cw_page_en(want);
+        if (!want && ui_mode_get() == UI_MODE_CW) {
+            ui_request_base_mode_m(UI_MODE_PANADAPTER);
+        }
+        char buf[96];
+        snprintf(buf, sizeof(buf), "{\"ok\":true,\"cw_en\":%s}",
                  want ? "true" : "false");
         httpd_resp_set_type(req, "application/json");
         httpd_resp_sendstr(req, buf);
@@ -5233,7 +6116,10 @@ static esp_err_t js8_get_handler(httpd_req_t *req)
         /* AGE is measured against the CALLER's clock - js8_page.c has none,
          * and the glass passes the same system time. */
         int64_t now_utc = (int64_t)time(NULL);
-        int used = js8_page_render(sc->msgs, have, now_utc, sc->lines, sc->row_msg);
+        /* The same grid the glass draws, including the submode mark in
+         * column 1 - one renderer, both surfaces. See js8_page.h. */
+        int used = js8_page_render(sc->msgs, have, now_utc,
+                                   sc->lines, sc->row_msg);
 
         cJSON_AddNumberToObject(root, "used", used);
         cJSON_AddNumberToObject(root, "count", have);
@@ -5277,6 +6163,15 @@ static esp_err_t js8_get_handler(httpd_req_t *req)
         cJSON *bands = cJSON_AddArrayToObject(root, "bands");
         for (int i = 0; bands && i < have; i++)
             cJSON_AddItemToArray(bands, cJSON_CreateString(sc->msgs[i].band));
+
+        /* The submode each message was heard on, indexed the same way. The
+         * rendered `lines` carry the one-character mark in column 1, which is
+         * what the operator reads; this is the full name, for a client that
+         * wants to filter rather than parse a text grid. T132. */
+        cJSON *subs = cJSON_AddArrayToObject(root, "submodes");
+        for (int i = 0; subs && i < have; i++)
+            cJSON_AddItemToArray(subs, cJSON_CreateString(
+                ftx_protocol_label((ftx_protocol_t)sc->msgs[i].proto)));
 
         heap_caps_free(sc);
     }
@@ -5515,18 +6410,33 @@ static esp_err_t memory_post_handler(httpd_req_t *req)
     const char *l = cJSON_GetStringValue(cJSON_GetObjectItem(root, "label"));
     if (l) snprintf(s.label, sizeof(s.label), "%s", l);
 
-    // The Tab5 refuses to store an out-of-band memory (ui_validate_band_freq_hz);
-    // the browser must not be a way around that - a channel that cannot legally
-    // be tuned is worse than no channel.
-    if (!s.freq_hz || !ui_validate_band_freq_hz(s.freq_hz, NULL, NULL)) {
+    /* ⛔ T68: THE REASON THIS USED TO GIVE WAS FACTUALLY WRONG. It read "a
+     * channel that cannot legally be tuned is worse than no channel" - but
+     * RECEIVE IS UNRESTRICTED, and a memory is a receive target. Gyula HA3HZ
+     * could not store an AM listening frequency on either surface.
+     * Out-of-band TRANSMISSION is refused by T48's band guard at the key-down,
+     * where the RF actually emitted is known. See mem_freq_picker_cb().
+     *
+     * A missing frequency is still a refusal: that is no channel at all, not
+     * a receive-only one. */
+    if (!s.freq_hz) {
         cJSON_Delete(root);
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "frequency is not inside an amateur band");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "no frequency");
         return ESP_FAIL;
     }
+    bool rx_only = !ui_validate_band_freq_hz(s.freq_hz, NULL, NULL);
     s.occupied = 1;
     mem_channels_set(idx, &s);
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");
+    /* Tell the browser the same thing the Tab5 toasts, so neither surface
+     * leaves it to be discovered at the moment of transmitting. */
+    if (rx_only) {
+        return httpd_resp_send(req,
+            "{\"ok\":true,\"rx_only\":true,\"note\":\"outside the ham bands - "
+            "stored for receive; transmitting there is refused\"}",
+            HTTPD_RESP_USE_STRLEN);
+    }
     return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
 }
 
@@ -5557,6 +6467,7 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
 
     cJSON_AddStringToObject(root, "my_callsign", c.my_callsign);
     cJSON_AddStringToObject(root, "my_grid",     c.my_grid);
+    cJSON_AddStringToObject(root, "my_state",    c.my_state);
 
     cJSON *cq = cJSON_AddObjectToObject(root, "cq");
     cJSON *msgs = cJSON_AddArrayToObject(cq, "msg");
@@ -5582,6 +6493,8 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     cJSON_AddBoolToObject(f, "excl_plain_cq",      c.ft8_filters.excl_plain_cq);
     cJSON_AddBoolToObject(f, "incl_cq_only",       c.ft8_filters.incl_cq_only);
     cJSON_AddBoolToObject(f, "cq_show_others",     c.ft8_filters.cq_show_others);
+    cJSON_AddBoolToObject(f, "hide_worked_before", c.ft8_filters.hide_worked_before);
+    cJSON_AddBoolToObject(f, "robot_skip_directed_cq", c.ft8_filters.robot_skip_directed_cq);
     cJSON_AddBoolToObject(f, "skip_tx1",           c.ft8_filters.skip_tx1);
     cJSON_AddBoolToObject(f, "auto_pileup",        c.ft8_filters.auto_pileup);
     cJSON_AddBoolToObject(f, "cq_manual_pick",     c.ft8_filters.cq_manual_pick);
@@ -5592,6 +6505,12 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "rbn_en",            c.rbn_en);
     cJSON_AddBoolToObject(root, "spotmap_en",        c.spotmap_en);
     cJSON_AddBoolToObject(root, "cluster_en",        c.cluster_en);
+    /* T27/T09: the settings POST has accepted these two since #221, but the
+     * GET never returned them, so the web page had no value to show and no
+     * control could be built. Audio source and its gain were Tab5-only for
+     * that reason alone - the write path was already there. */
+    cJSON_AddStringToObject(root, "rx_source",       rx_source_str(c.rx_source));
+    cJSON_AddNumberToObject(root, "line_in_gain_db", c.line_in_gain_db);
     cJSON_AddBoolToObject(root, "sota_en",           c.sota_en);
     cJSON_AddBoolToObject(root, "wspr_en",           c.wspr_en);
     cJSON_AddBoolToObject(root, "wspr_net_en",       c.wspr_net_en);
@@ -5612,6 +6531,21 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
      * whatever it was when the link came up. */
     cat_query_keyer_wpm();
     cJSON_AddNumberToObject(root, "keyer_wpm",       (double)cat_get_keyer_wpm());
+    /* T139 CW monitor (Michael KZ4LY). Live from the radio for the same reason
+     * as the keyer speed, and NOT persisted here: both values live in the
+     * QMX's own EEPROM, and a copy on this side would be a second answer to
+     * "what is the monitor level" - which is the half of his report that was
+     * about not knowing who owned the value.
+     *
+     * cw_mon_max is the range the RADIO reported during MM discovery, and 0
+     * means it never answered. The page must render 0 as "no control", never
+     * as a 0-100 slider: the operation manual documents the default and no
+     * range, so any scale invented on this side would be a fiction shown as
+     * the radio's. cw_mon_vol is -1 and cw_mon_abs is -1 until it answers. */
+    cat_query_sidetone();
+    cJSON_AddNumberToObject(root, "cw_mon_vol",      (double)cat_get_sidetone_vol());
+    cJSON_AddNumberToObject(root, "cw_mon_abs",      (double)cat_get_sidetone_absolute());
+    cJSON_AddNumberToObject(root, "cw_mon_max",      (double)cat_sidetone_vol_max());
     /* CW PROFILES (#359, Uwe DL8UG). Four slots of {name, centre, filter mask}.
      * An empty slot is centre 0 and is sent as such, so the page renders it as
      * empty rather than inventing a default the operator never chose.
@@ -5648,6 +6582,7 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
         }
     }
     cJSON_AddNumberToObject(root, "if_cal_hz",       (double)ui_get_if_cal_hz());
+    cJSON_AddNumberToObject(root, "sb_lowcut_hz",   (double)settings_get_sb_lowcut_hz());
     cJSON_AddBoolToObject  (root, "charge_limit_en",  c.charge_limit_en);
     cJSON_AddNumberToObject(root, "charge_limit_pct", (double)c.charge_limit_pct);
     cJSON_AddBoolToObject(root, "psk_rx_en",         c.psk_rx_en);
@@ -5673,12 +6608,31 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
                                     settings_get_rxaud_am_half_bw_h100() * 200);
             cJSON_AddNumberToObject(ra, "agc_release_ms", settings_get_rxaud_agc_release_ms());
             cJSON_AddBoolToObject  (ra, "agc_off",        settings_get_rxaud_agc_off());
+            /* ⛔ THE ENABLE AND THE VOLUME WERE TAB5-ONLY until 2026-10-17.
+               Every knob around them was reachable - gain, pan, AGC, AM
+               bandwidth - but not the switch that decides whether any of it
+               runs, nor the volume. Found by ticking the box and still
+               reading frame_count=0 with no way to set it back from here.
+               ⛔ "en" IS THE STORED FLAG, and the comment here used to claim
+               it was the live path. It is not: rx_audio_is_enabled() returns
+               s_enabled, so a POST of {"rxaudio":{"en":true}} reads back
+               en:true while the codec is still closed and frame_count stays 0
+               (measured 2026-10-22, T66). The codec is opened at boot or not
+               at all - see rx_audio_restart_pending() in rx_audio.h - and the
+               Tab5 toasts that restart while the browser had no way to see
+               it. So the stored flag keeps its name and the pending restart
+               gets its own field. */
+            cJSON_AddBoolToObject  (ra, "en",              rx_audio_is_enabled());
+            cJSON_AddBoolToObject  (ra, "restart_pending", rx_audio_restart_pending());
+            cJSON_AddNumberToObject(ra, "vol",            rx_audio_get_volume());
+            cJSON_AddNumberToObject(ra, "cw_peak_hz",     rx_audio_get_cw_peak_hz());
             cJSON_AddBoolToObject  (ra, "hp_mute_en",     settings_get_hp_mute_en());
             cJSON_AddItemToObject(root, "rxaudio", ra);
         }
     }
     cJSON_AddBoolToObject(root, "pskreporter_en",    c.pskreporter_en);
     cJSON_AddBoolToObject(root, "greylist_en",       c.greylist_en);
+    cJSON_AddBoolToObject(root, "tx_band_guard_off", c.tx_band_guard_off);
     // #221 API AUDIT, read side: these were WRITE-ONLY - settable but not
     // readable, so a script could change them and never confirm what it had
     // done, and could not restore what it found. An API that only writes is
@@ -5696,9 +6650,15 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "ft8_op_mode",
                             c.ft8_op_mode == 1 ? "ft4" : "ft8");
     cJSON_AddNumberToObject(root, "ft8_freq_hz",      (double)c.ft8_freq_hz);
+    cJSON_AddNumberToObject(root, "ft4_freq_hz",      (double)c.ft4_freq_hz);   // T89
+    cJSON_AddNumberToObject(root, "js8_freq_hz",      (double)c.js8_freq_hz);   // T89
     cJSON_AddNumberToObject(root, "hound_mode",      c.hound_mode);
     cJSON_AddBoolToObject(root, "sim_mode_en",       c.sim_mode_en);
     cJSON_AddNumberToObject(root, "wspr_dial_hz",  c.wspr_dial_hz);
+    /* PORT.A: drive only the selected relay pin, leaving the other hi-Z.
+     * A preference about the station's wiring, so it lives here and not in
+     * the gpio_pulse action, whose pin/level/ms describe ONE pulse. */
+    cJSON_AddBoolToObject(root, "relay_solo_pin", c.gpio_relay_solo);
     cJSON_AddBoolToObject(root,   "wspr_tx_en",    c.wspr_tx_en);
     cJSON_AddBoolToObject(root,   "wspr_pa_reduce", c.wspr_pa_reduce);
     /* Tenths of a volt, 0 when nothing is outstanding. Exposed so "is the
@@ -5745,6 +6705,12 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "fd_class",     c.fd_class);
     cJSON_AddStringToObject(root, "fd_section",   c.fd_section);
     cJSON_AddBoolToObject(root, "cw_decode_en", c.cw_decode_en);
+    /* T113. No Today/All filter exists in the browser's log view, so this is
+     * read/write for config export and restore rather than for a web control -
+     * the alternative is a stored preference the API cannot see, which is
+     * exactly the Tab5-only class T27 is a sweep for. */
+    cJSON_AddBoolToObject(root, "log_view_all", c.log_view_all);
+    cJSON_AddNumberToObject(root, "cw_decode_rows", (double)c.cw_decode_rows);
     cJSON_AddBoolToObject(root, "distance_in_miles", c.distance_in_miles);
     cJSON_AddNumberToObject(root, "freq_sep_style", (double)c.freq_sep_style);
     cJSON_AddBoolToObject(root, "rit_pill_show",     c.rit_pill_show);
@@ -5781,12 +6747,21 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     /* Added 2026-09-18: it was a Tab5-drawer setting only, while every other
        waterfall control on the same drawer row was already here. */
     cJSON_AddNumberToObject(d, "wf_rows_per_s",  c.wf_rows_per_s);
+    cJSON_AddNumberToObject(d, "peak_hold_s",    c.spec_peak_s);
     cJSON_AddNumberToObject(d, "colormap",       c.colormap_idx);
     cJSON_AddNumberToObject(d, "brightness",     c.brightness_pct);
     cJSON_AddNumberToObject(d, "sleep_min",      c.display_sleep_min);
     cJSON_AddNumberToObject(d, "db_min",         c.db_min);
     cJSON_AddNumberToObject(d, "db_max",         c.db_max);
+    /* TWO NAMES FOR ONE STORED VALUE, and the difference is the point.
+     * `ema_pct` is the EMA COEFFICIENT x 100 - what it has always been, so
+     * every config file and script written before 2026-10-24 still means what
+     * it meant. `smooth_pct` is the same number inverted, which is what an
+     * operator means by smoothing: higher is smoother. The settings form shows
+     * smooth_pct; the raw one stays accepted and reported. See the block above
+     * smoothing_label() in ui.c for why the surface was inverted. */
     cJSON_AddNumberToObject(d, "ema_pct",        (int)(c.ema_alpha * 100.0f + 0.5f));
+    cJSON_AddNumberToObject(d, "smooth_pct", 100 - (int)(c.ema_alpha * 100.0f + 0.5f));
     cJSON_AddBoolToObject  (d, "flip",           c.display_flip);
 
     // SSID yes, password never: it would put the operator's WiFi key in every
@@ -5882,14 +6857,58 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
     const char *s;
     cJSON *it;
 
-    if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(root, "my_callsign")))) settings_set_my_callsign(s);
-    if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(root, "my_grid"))))     settings_set_my_grid(s);
+    /* ⛔ WHAT COULD NOT BE DONE IS A WARNING, NOT A FAILED SAVE.
+     *
+     * Randy N4OPI, 2026-10-19: "I am now unable to save settings in the
+     * Settings page on the WebUI unless there is a QMX connected... Instead of
+     * 'Saving..Saved' it reports 'Save Failed (HTTP 400)'." His log names the
+     * field four times:
+     *
+     *     W (132998) httpd_txrx: httpd_resp_send_err: 400 Bad Request -
+     *                            keyer speed: no CAT link to the radio
+     *
+     * The page posts EVERY field it has rendered on every Save, touched or
+     * not, so an unreachable radio made the keyer-speed pass-through fail a
+     * save of the callsign. And the line after each 400 in his log is
+     * `settings: flushed` - so part of the save had already landed while the
+     * page said it had failed, which is the worse half of the defect.
+     *
+     * The rule this now follows: a 400 means NOTHING was stored, so every
+     * refusal that is a property of the PAYLOAD is checked here, before a
+     * single setting is applied. Anything the device simply cannot deliver
+     * right now - the radio is not plugged in - is applied as far as it goes
+     * and reported in `warnings`, with the save succeeding. */
+    char warn[3][112];
+    int  n_warn = 0;
+    #define SET_WARN(...) do { \
+        if (n_warn < (int)(sizeof(warn) / sizeof(warn[0]))) \
+            snprintf(warn[n_warn++], sizeof(warn[0]), __VA_ARGS__); \
+    } while (0)
+
+    /* Payload validation, before anything is applied. An unknown rx_source is
+     * a malformed request and nothing about the rest of the body should be
+     * stored because of it. This check USED to sit at the apply site further
+     * down, where it rejected after the callsign had already been written. */
+    if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(root, "rx_source")))) {
+        if (strcasecmp(s, rx_source_str(rx_source_parse(s))) != 0) {
+            cJSON_Delete(root);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
+                "rx_source: unknown or not implemented in this build "
+                "(qmx_usb and line_in are the working sources)");
+            return ESP_FAIL;
+        }
+    }
 
     /* PORT.A mode. This is the sequencer, not a plain store: it hands the pins
      * between the relay and the Unit GPS UART, and it can REFUSE (a pulse in
      * flight, or the UART failing to start). A refusal is a 400 carrying the
      * reason, because the page has already drawn what the operator asked for
-     * and only a real answer tells it to go back. */
+     * and only a real answer tells it to go back.
+     *
+     * ⚠ FIRST, ahead of the callsign and grid it used to follow. It is the one
+     * remaining refusal that can only be discovered by attempting it, so it has
+     * to be attempted before anything else is written - otherwise its 400 still
+     * means "some of your save landed". */
     if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(root, "port_a_mode")))) {
         if (!settings_set_port_a_mode(port_a_mode_parse(s))) {
             cJSON_Delete(root);
@@ -5898,6 +6917,10 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
     }
+
+    if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(root, "my_callsign")))) settings_set_my_callsign(s);
+    if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(root, "my_grid"))))     settings_set_my_grid(s);
+    if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(root, "my_state"))))    settings_set_my_state(s);
 
     /* RX input source. Unlike port_a_mode this switches NOTHING live: the
      * source is latched at boot (rx_source_t), so the store always succeeds
@@ -5920,25 +6943,57 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
             int wpm = it->valueint;
             if (wpm < 0)   wpm = 0;
             if (wpm > 999) wpm = 999;   /* the 3-digit CAT field, nothing more */
-            if (!cat_is_ready()) {
-                cJSON_Delete(root);
-                httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                    "keyer speed: no CAT link to the radio");
-                return ESP_FAIL;
-            }
-            cat_request_keyer_wpm((uint16_t)wpm);
+            /* ⛔ A WARNING, NOT A 400 - Randy N4OPI's report. The radio not
+             * being plugged in says nothing about the rest of the save, and
+             * this field is not even stored here: the QMX owns it, so there
+             * is nothing to keep for later and nothing else depends on it.
+             * Failing the request made every other setting on the page
+             * unsavable without a radio. */
+            if (!cat_is_ready())
+                SET_WARN("CW keyer speed was not sent - no CAT link to the radio");
+            else
+                cat_request_keyer_wpm((uint16_t)wpm);
         }
     }
 
+    {
+        /* T139 CW monitor -> the radio, over CAT, never stored here.
+         *
+         * Both halves accepted in one POST and drained together, which is also
+         * how the Tab5 sends them: an MM write needs MU; to take effect and
+         * MU; drops IQ mode, so two separate writes would flatten the spectrum
+         * twice for one change of mind.
+         *
+         * ⛔ A WARNING, NOT A 400, for the same reason as the keyer speed
+         * above (Randy N4OPI): no CAT link says nothing about the rest of the
+         * save, and there is nothing stored on this side to keep for later.
+         *
+         * An out-of-range level is clamped by cat_request_sidetone_vol()
+         * against the range the RADIO reported, not against one named here. */
+        cJSON *itv = cJSON_GetObjectItem(root, "cw_mon_vol");
+        cJSON *ita = cJSON_GetObjectItem(root, "cw_mon_abs");
+        bool want_v = cJSON_IsNumber(itv) && itv->valueint >= 0;
+        bool want_a = cJSON_IsNumber(ita) && ita->valueint >= 0;
+        if (want_v || want_a) {
+            if (!cat_is_ready()) {
+                SET_WARN("CW monitor was not sent - no CAT link to the radio");
+            } else if (want_v && cat_sidetone_vol_max() == 0) {
+                SET_WARN("CW monitor level was not sent - this radio has not "
+                         "reported the setting over CAT");
+                if (want_a) cat_request_sidetone_absolute(ita->valueint != 0);
+            } else {
+                if (want_a) cat_request_sidetone_absolute(ita->valueint != 0);
+                if (want_v) cat_request_sidetone_vol((uint16_t)itv->valueint);
+            }
+        }
+    }
+
+    /* The unknown-value refusal for this field is NOT here any more - it is in
+     * the validation pre-pass at the top, where a 400 still means nothing was
+     * stored. Deleted rather than left behind: a duplicate that only
+     * misbehaves in a third case outlives everyone's memory of why. */
     if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(root, "rx_source")))) {
         uint8_t want = rx_source_parse(s);
-        if (strcasecmp(s, rx_source_str(want)) != 0) {
-            cJSON_Delete(root);
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                "rx_source: unknown or not implemented in this build "
-                "(qmx_usb and line_in are the working sources)");
-            return ESP_FAIL;
-        }
         if (settings_set_rx_source(want))
             ESP_LOGW(TAG, "rx_source -> %s over HTTP (restart required)",
                      rx_source_str(want));
@@ -5971,6 +7026,12 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
     }
     if (cJSON_IsBool(it = cJSON_GetObjectItem(root, "cw_decode_en")))
         settings_set_cw_decode_en(cJSON_IsTrue(it));
+    if (cJSON_IsBool(it = cJSON_GetObjectItem(root, "log_view_all")))
+        settings_set_log_view_all(cJSON_IsTrue(it));
+    /* 2 or 4 only; the setter refuses anything else rather than storing it,
+       so a bad value cannot produce a pane nobody has seen. */
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "cw_decode_rows")))
+        settings_set_cw_decode_rows((uint8_t)it->valueint);
     if (cJSON_IsBool(it = cJSON_GetObjectItem(root, "distance_in_miles")))
         settings_set_distance_in_miles(cJSON_IsTrue(it));
     /* #302: 0 = 14.074.000, 1 = 14,074,000. Anything else is refused by the
@@ -6095,8 +7156,45 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
      * the same deliberate treatment as sim_mode_en above. wspr_tx_dbm is a
      * DECLARED power published with every spot - a wrong value here is
      * misinformation about the operator's station, not a display bug. */
-    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "wspr_dial_hz")))
-        settings_set_wspr_dial_hz((uint32_t)it->valuedouble);
+    /* ⛔ AND RETUNE THE RADIO, which this did not do for as long as it existed.
+     *
+     * John W5JSS, 2026-10-18: "I tried changing the band in the WSPR drawer,
+     * but the QMX didn't update unless I turned on TX." He was driving from the
+     * browser, and this handler wrote the stored dial and stopped there. The
+     * Tab5's own band picker (wspr_screen_view.c's bp_apply) does four things:
+     * stores the dial, resets the waterfall floor for the new band, writes the
+     * frequency with cat_set_frequency_forced(), and moves the top bar. Three
+     * of them were missing here, so the page said 20 m while the radio stayed
+     * on 15 m - and his log says so outright:
+     *
+     *   W (29504045) wspr_view: dial MISMATCH: the radio is tuned to
+     *       21.094600 MHz but this page is set to 14.095600 MHz
+     *
+     * which also means the spots he did hear would have been reported to
+     * wsprnet on the wrong frequency. The page's own dial push is a bounded
+     * one-shot armed by entering the page, so nothing else was going to
+     * correct it.
+     *
+     * ⚠ The same class the comment two blocks down is pleased about catching
+     * ("that is precisely the swr_limit_x10 bug the v1.6.0 parity pass found").
+     * A POST case existed here, so the diff of the two surfaces showed a match;
+     * what differed was what the setter is expected to DO on each side.
+     *
+     * cat_set_frequency_forced() + ui_update_frequency() from the httpd task is
+     * the established pattern - the set_freq action above does exactly this,
+     * and for the same reason: do not wait to be told by the FA poll. */
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "wspr_dial_hz"))) {
+        const uint32_t dial = (uint32_t)it->valuedouble;
+        const bool changed = (dial != settings_get_wspr_dial_hz());
+        settings_set_wspr_dial_hz(dial);
+        if (changed && dial) {
+            wspr_rx_wf_floor_reset();      /* the new band has its own noise floor */
+            cat_set_frequency_forced(dial);
+            ui_update_frequency(dial);
+            ESP_LOGW(TAG, "WSPR dial set to %lu Hz from the web - radio retuned",
+                     (unsigned long)dial);
+        }
+    }
     /* wspr_net_en was in the GET but had NO POST case - the browser would have
      * shown it, accepted a change and silently dropped it. That is precisely
      * the swr_limit_x10 bug the v1.6.0 parity pass found; caught here by
@@ -6176,7 +7274,23 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
          * measurably takes 5.4 W to 1.6 W. */
         if (v < 0)  v = 0;
         if (v > 37) v = 37;
+        /* ⛔ AND APPLY IT, the same as the Tab5 dropdown does. Sibling of the
+         * wspr_dial_hz gap above, found by sweeping it rather than from a
+         * report. ui.c's wspr_pa_cal_apply_and_show() calls
+         * wspr_pa_apply_declared_dbm() on every change; this handler stored the
+         * figure and stopped - so declaring a different power from the browser
+         * while WSPR ran left the radio at the voltage calibrated for the OLD
+         * one, and every spot went to wsprnet declaring the new one. Declared
+         * power that does not match what the finals are fed is the same fault
+         * John W5JSS reported as "2 W instead of 1 W", reachable with nothing
+         * broken at all.
+         *
+         * Only on a change: the function is also the drawer-refresh path and
+         * writing on every POST would re-send the voltage for any unrelated
+         * setting saved from the same form. */
+        const bool dbm_changed = ((int8_t)v != settings_get_wspr_tx_dbm());
         settings_set_wspr_tx_dbm((int8_t)v);
+        if (dbm_changed) wspr_pa_apply_declared_dbm((int8_t)v);
     }
 
     cJSON *cq = cJSON_GetObjectItem(root, "cq");
@@ -6224,6 +7338,8 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
         BOOLF("excl_plain_cq",      excl_plain_cq);
         BOOLF("incl_cq_only",       incl_cq_only);
         BOOLF("cq_show_others",     cq_show_others);
+        BOOLF("hide_worked_before", hide_worked_before);
+        BOOLF("robot_skip_directed_cq", robot_skip_directed_cq);
         BOOLF("skip_tx1",           skip_tx1);
         BOOLF("auto_pileup",        auto_pileup);
         BOOLF("cq_manual_pick",     cq_manual_pick);
@@ -6247,6 +7363,7 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
     BOOLTOP("bt_mouse_en",       settings_set_bt_mouse_en);
     BOOLTOP("pskreporter_en",    settings_set_pskreporter_en);
     BOOLTOP("greylist_en",       settings_set_greylist_en);
+    BOOLTOP("tx_band_guard_off", settings_set_tx_band_guard_off);
     BOOLTOP("qmx_gps",           settings_set_qmx_gps);
     // Fox/Hound: 0 off, 1 guided, 2 automatic. A number rather than a bool
     // because it is a ladder, not a switch - see ft8_hound.h.
@@ -6260,6 +7377,13 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
     // sends not one CAT byte while it is on), so remote practice needs no trust.
     BOOLTOP("sim_mode_en",       settings_set_sim_mode_en);
     BOOLTOP("cw_decode_en", settings_set_cw_decode_en);
+    BOOLTOP("log_view_all", settings_set_log_view_all);
+    // Rows of decoded CW, 2 or 4 (Bryan N0LUF). A number, not a switch, and
+    // the setter refuses anything else.
+    {
+        cJSON *cr = cJSON_GetObjectItem(root, "cw_decode_rows");
+        if (cJSON_IsNumber(cr)) settings_set_cw_decode_rows((uint8_t)cr->valuedouble);
+    }
     BOOLTOP("distance_in_miles", settings_set_distance_in_miles);
     BOOLTOP("field_day_en",      settings_set_field_day_en);
     if ((s = cJSON_GetStringValue(cJSON_GetObjectItem(root, "fd_class"))))   settings_set_fd_class(s);
@@ -6319,6 +7443,13 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
     if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "bandplan_region")))
         settings_set_bandplan_region((uint8_t)it->valuedouble);
 
+    /* PORT.A: drive only the selected relay pin. The setter re-configures the
+     * pads, so this takes effect on this request and not at the next boot -
+     * which matters, because the whole point of turning it on is to STOP
+     * driving a pin that something else is connected to. */
+    { cJSON *b = cJSON_GetObjectItem(root, "relay_solo_pin");
+      if (cJSON_IsBool(b)) settings_set_gpio_relay_solo(cJSON_IsTrue(b)); }
+
     // CW pitch and the IF trim: live setter AND NVS, same as the drawer's sliders -
     // ui_set_* do both, and ui_set_cw_pitch_hz also pushes the QMX's own CW centre.
     // Both clamp internally, so a hand-written value cannot put the display out of
@@ -6329,6 +7460,10 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
     }
     if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "if_cal_hz")))
         ui_set_cw_cal_hz((int16_t)it->valuedouble);
+    /* T90's SSB low-cut trim. No live apply: sb_tune_feed() reads the setting
+     * on every frame, so a change takes effect on the next press. */
+    if (cJSON_IsNumber(it = cJSON_GetObjectItem(root, "sb_lowcut_hz")))
+        settings_set_sb_lowcut_hz((uint16_t)it->valuedouble);   // clamps 0..600
 
     // Battery care. status.c re-reads the config on every poll, so storing it is
     // enough - there is nothing to apply live.
@@ -6401,6 +7536,37 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
              * audio to the headphone auto-mute after v1.16.4. It is on the
              * Tab5 so a user with no sound can reach it there; it is here so
              * they can reach it from a phone. Applies immediately. */
+            /* ⚠ TURNING IT ON NEEDS A RESTART and the caller must be told,
+               not left to discover it. The codec is opened at boot, before
+               the USB host takes the DMA RAM, so a mid-session enable cannot
+               open it safely - see rx_audio_set_enabled(). Switching OFF
+               takes effect at once. */
+            if (cJSON_IsBool(v = cJSON_GetObjectItem(ra, "en"))) {
+                bool want = cJSON_IsTrue(v);
+                settings_set_rx_audio_en(want);
+                rx_audio_set_enabled(want);
+                /* How a caller DETECTS the restart requirement without a
+                   second field to keep in step: read the group back. "en"
+                   reports the live audio path, so a POST of true followed by
+                   a GET of false means "stored, waiting for a restart". The
+                   Tab5 also toasts it. */
+            }
+            if (cJSON_IsNumber(v = cJSON_GetObjectItem(ra, "vol"))) {
+                int vol = v->valueint;
+                if (vol < 0) vol = 0;
+                if (vol > 100) vol = 100;
+                settings_set_rx_audio_vol((uint8_t)vol);
+                rx_audio_set_volume((uint8_t)vol);
+            }
+            /* CW audio peak filter, Hz at -3 dB; 0 = off. Live - the audio
+             * chain rebuilds it on its next retune, within a frame. */
+            if (cJSON_IsNumber(v = cJSON_GetObjectItem(ra, "cw_peak_hz"))) {
+                int hz = v->valueint;
+                if (hz < 0)    hz = 0;
+                if (hz > 1000) hz = 1000;
+                settings_set_cw_peak_hz((uint16_t)hz);
+                rx_audio_set_cw_peak_hz((uint16_t)hz);
+            }
             if (cJSON_IsBool(v = cJSON_GetObjectItem(ra, "hp_mute_en"))) {
                 settings_set_hp_mute_en(cJSON_IsTrue(v));
                 ESP_LOGI(TAG, "web: headphone auto-mute -> %s",
@@ -6460,13 +7626,25 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
             wf_rows = m * 10;
         }
         if (wf_rows >= 0) {
-            if (wf_rows < 1)  wf_rows = 1;
+            /* 0 = off. See render_set_waterfall_rows_per_s() for why the floor
+             * of 1 was removed: 1 row/s still redraws the whole carpet when it
+             * shifts, so it could not answer "does the spectrum run free
+             * without the waterfall". */
             if (wf_rows > 40) wf_rows = 40;
             /* Apply AND store, same as every slider in this block - storing
                alone leaves the live waterfall on the old value until reboot. */
             render_set_waterfall_rows_per_s((uint8_t)wf_rows);
             settings_set_wf_rows_per_s((uint8_t)wf_rows);
             ui_sync_wf_rate_controls();
+        }
+        /* Spectrum peak hold, seconds; 0 = off. Applied live - there is
+         * nothing to restart, the buffers are built on the next push. */
+        if (cJSON_IsNumber(v = cJSON_GetObjectItem(disp, "peak_hold_s"))) {
+            int sec = v->valueint;
+            if (sec < 0)  sec = 0;
+            if (sec > 60) sec = 60;
+            settings_set_spec_peak_s((uint8_t)sec);
+            ui_set_peak_hold_s((uint8_t)sec);
         }
         if (cJSON_IsNumber(v = cJSON_GetObjectItem(disp, "wf_window"))) {
             uint8_t idx = (uint8_t)v->valuedouble; if (idx > 2) idx = 0;
@@ -6510,11 +7688,41 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
                 settings_set_db_max(mx);
             }
         }
+        /* ⛔ STORING IT IS NOT APPLYING IT. This used to call
+         * settings_set_ema_alpha() alone, under a comment claiming "the render
+         * task reads it live" - it does not. The setter writes s_pending and
+         * marks dirty; only main.c's boot-time render_set_ema_alpha() ever
+         * reached the pipeline. So smoothing changed from the browser moved
+         * the BROWSER's own trace (it reads wf.ema_pct from /api/status) and
+         * left the Tab5 drawing on the old coefficient until a reboot. Found
+         * 2026-10-24 while inverting the control for Sam W7STF; it is the
+         * mirror of the "applied but never stored" class this file records
+         * elsewhere, and the Tab5 drawer callback has always done both.
+         *
+         * `smooth_pct` is the operator-facing name (higher is smoother) and
+         * `ema_pct` the raw coefficient. If a payload carries both, the
+         * operator-facing one is applied last and wins. */
+        bool ema_set = false;
+        float a = 0.0f;
         if (cJSON_IsNumber(v = cJSON_GetObjectItem(disp, "ema_pct"))) {
-            float a = (float)v->valuedouble / 100.0f;
-            if (a < 0.0f) a = 0.0f;
-            if (a > 1.0f) a = 1.0f;
-            settings_set_ema_alpha(a);      // the render task reads it live
+            a = (float)v->valuedouble / 100.0f;
+            ema_set = true;
+        }
+        if (cJSON_IsNumber(v = cJSON_GetObjectItem(disp, "smooth_pct"))) {
+            a = (float)(100.0 - v->valuedouble) / 100.0f;
+            ema_set = true;
+        }
+        if (ema_set) {
+            /* ⛔ THE FLOOR IS 0.05, NOT 0. alpha 0 is not "maximum smoothing",
+             * it is a trace that never takes a new sample again - frozen, and
+             * indistinguishable from a dead spectrum. The Tab5 slider stops at
+             * 95% smoothing for this reason; smooth_pct 100 from the API lands
+             * on the same place rather than on a frozen picture. */
+            if (a < 0.05f) a = 0.05f;
+            if (a > 1.0f)  a = 1.0f;
+            settings_set_ema_alpha(a);
+            render_set_ema_alpha(a);        // the part that was missing
+            ui_sync_smoothing_controls();   // and the drawer must follow
         }
     }
 
@@ -6706,8 +7914,28 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
     cJSON_Delete(root);
     settings_flush();
 
+    /* The save succeeded. `warnings` names anything the device could not
+     * carry out - today only the keyer speed with no radio attached - so the
+     * page can say what did not happen without calling the whole save a
+     * failure, which is what Randy N4OPI was shown. Absent when empty, so a
+     * client that does not know the field sees exactly what it saw before. */
     httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    if (n_warn == 0)
+        return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON *arr = cJSON_AddArrayToObject(resp, "warnings");
+    for (int i = 0; arr && i < n_warn; i++)
+        cJSON_AddItemToArray(arr, cJSON_CreateString(warn[i]));
+    char *out = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    if (!out) return httpd_resp_send(req, "{\"ok\":true}", HTTPD_RESP_USE_STRLEN);
+    esp_err_t rc = httpd_resp_send(req, out, HTTPD_RESP_USE_STRLEN);
+    free(out);
+    return rc;
+    #undef SET_WARN
 }
 
 // GET /api/decodes - the FT8/FT4 decode list, as the Tab5 shows it.
@@ -6790,6 +8018,88 @@ static esp_err_t psk_rx_handler(httpd_req_t *req)
     return e;
 }
 
+
+/* GET /api/sched - the scheduled-events list behind ui/sched_modal.c (T116).
+ *
+ * ⭐ ONE SOURCE, TWO SURFACES. The data layer (sched_events_get) is shared, so
+ * the browser cannot show a different timeline from the glass. Only the pane
+ * was Tab5-only, which is the parity gap class this project keeps re-finding.
+ *
+ * ⛔ THE FILTER IS NOT DONE HERE. The Tab5 pane filters All/Contests/?OTA in
+ * the renderer from `is_contest`, so doing it in the query string would be a
+ * second implementation of the same rule. The browser gets every row and the
+ * same flag.
+ *
+ * sched_events_request(false) respects SCHED_TTL_S, so a page polling this
+ * endpoint cannot hammer spothole - it is the same call the pane makes when it
+ * opens, and it returns at once because the fetch runs on the spots task.
+ *
+ * ⚠ SPOTHOLE BEING DOWN IS AN ORDINARY STATE. There is no error field: the
+ * three facts the page needs to tell "slow" from "empty" are `busy`, `age_s`
+ * (-1 = never) and `version` (0 = never fetched), exactly as refresh() in
+ * sched_modal.c uses them. Ian M0TRT asked for that when he granted API use. */
+static esp_err_t sched_handler(httpd_req_t *req)
+{
+    /* ?force=1 is the pane's Refresh button. Without it the TTL decides, which
+     * is what an ordinary page poll must get. */
+    bool force = false;
+    {
+        char q[32];
+        if (httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK) {
+            char v[8];
+            if (httpd_query_key_value(q, "force", v, sizeof v) == ESP_OK)
+                force = (v[0] == '1' || v[0] == 't' || v[0] == 'y');
+        }
+    }
+    sched_events_request(force);
+
+    /* SCHED_MAX events are ~3.4 KB - too much for the httpd task's stack, the
+     * same reason psk_rx_handler above goes to PSRAM for its report array. */
+    sched_event_t *ev = heap_caps_malloc(sizeof(sched_event_t) * SCHED_MAX,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ev) return httpd_resp_send_500(req);
+    int n = sched_events_get(ev, SCHED_MAX);
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) { heap_caps_free(ev); return httpd_resp_send_500(req); }
+    cJSON_AddNumberToObject(root, "age_s",   sched_events_age_s());
+    cJSON_AddBoolToObject(root,   "busy",    sched_events_busy());
+    cJSON_AddNumberToObject(root, "version", (double)sched_events_version());
+    cJSON_AddBoolToObject(root,   "wifi",    wifi_is_connected());
+    /* The device's clock, so the page's "in 2h 10m" is computed against the
+     * same now the sort used. A browser clock that is minutes out would put
+     * rows in NOW that the Tab5 still shows as upcoming. */
+    cJSON_AddNumberToObject(root, "now",     (double)(int64_t)time(NULL));
+
+    cJSON *arr = cJSON_AddArrayToObject(root, "events");
+    for (int i = 0; i < n && arr; i++) {
+        cJSON *o = cJSON_CreateObject();
+        if (!o) break;
+        cJSON_AddStringToObject(o, "what", ev[i].what);
+        /* Omitted when empty, like psk_rx's optional fields: a contest has no
+         * reference, and "" would read as one that failed to arrive. */
+        if (ev[i].ref[0]) cJSON_AddStringToObject(o, "ref", ev[i].ref);
+        cJSON_AddStringToObject(o, "src", ev[i].src);
+        /* The column form, computed by the SAME function the pane uses, so the
+         * two surfaces cannot name a source differently. */
+        cJSON_AddStringToObject(o, "srcs", sched_src_short(ev[i].src));
+        /* 0 means the feed gave no usable time - sent as 0 rather than omitted
+         * because the pane draws "--:--" for it and the page must do the same. */
+        cJSON_AddNumberToObject(o, "start", (double)ev[i].start_unix);
+        cJSON_AddNumberToObject(o, "end",   (double)ev[i].end_unix);
+        cJSON_AddBoolToObject(o,   "contest", ev[i].is_contest);
+        cJSON_AddItemToArray(arr, o);
+    }
+    heap_caps_free(ev);
+
+    char *txt = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!txt) return httpd_resp_send_500(req);
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t e = httpd_resp_sendstr(req, txt);
+    cJSON_free(txt);
+    return e;
+}
 
 /* GET /api/wspr - the spot list and the cycle state, mirroring /api/decodes'
  * shape so the browser side needs no new idioms.
@@ -6973,6 +8283,21 @@ static esp_err_t wspr_handler(httpd_req_t *req)
             const char *full = country_display(snap[i].call, 64);
             cJSON_AddStringToObject(o, "country", full ? full : "");
         }
+        /* WHICH BAND THE SPOT CAME FROM. Kevin KQ4DTX, 2026-10-19: "add a
+         * column for band heard on in the WSPR section for the web browser.
+         * It shows this on the Tab5 but doesn't show it when looking at it
+         * over the web browser."
+         *
+         * Derived HERE from the stored dial with wspr_band_name_for_dial(),
+         * the same call the Tab5 column makes, so the two screens cannot name
+         * a band differently. The struct deliberately keeps the DIAL and not
+         * a label (wspr_spots.h says why), and a spot recorded before the
+         * dial was kept has none - that sends "" rather than a guess, which
+         * is the same honesty the Tab5 shows. */
+        {
+            const char *bn = wspr_band_name_for_dial(snap[i].dial_hz);
+            cJSON_AddStringToObject(o, "band", bn ? bn : "");
+        }
         cJSON_AddNumberToObject(o, "utc",   (double)snap[i].cycle_utc);
         cJSON_AddNumberToObject(o, "hz",    snap[i].freq_hz);
         /* null, not a number, when nothing measured it - the browser renders
@@ -7091,8 +8416,20 @@ static esp_err_t decodes_handler(httpd_req_t *req)
     for (int i = 0; i < n; i++) {
         const ft8_call_t *r = &snap[i];
         bool is_partner = working[0] && strcasecmp(r->call, working) == 0;
-        if (!is_partner) {
+        /* And anyone talking to US - the same exemption the Tab5 list makes,
+         * swept here at the same time because the two lists filter separately
+         * and this is the second place #176's rule stopped short. Serhiy
+         * AA1SL could not see the stations answering his CQ with only_cq set.
+         * `me` is already upper-cased above for the sort. */
+        const bool mentions_me = me[0] && strstr(r->last_text, me);
+        if (!is_partner && !mentions_me) {
             if (hide_cq && strncmp(r->last_text, "CQ ", 3) == 0) continue;
+            // Worked before on this band, and the operator asked for them to go
+            // (Randy N4OPI). Applied HERE as well as on the Tab5 because the two
+            // lists filter separately - the defect js8_chat_copy() records, one
+            // screen filtering and the other not.
+            if (qs.ft8_filters.hide_worked_before &&
+                adif_log_contains_call_on_band(r->call, dial_hz)) continue;
             if (qs.ft8_filters.incl_cq_only && strncmp(r->last_text, "CQ ", 3) != 0) continue;
             if (!ft8_filter_match(r->last_text, &qs.ft8_filters)) continue;
         }
@@ -7174,6 +8511,17 @@ static esp_err_t decodes_handler(httpd_req_t *req)
         cJSON *garr = cJSON_AddArrayToObject(root, "greylist");
         for (int i = 0; i < ng; i++)
             cJSON_AddItemToArray(garr, cJSON_CreateString(gl[i]));
+
+        /* ⭐ The stations the OPERATOR skipped, separately from the ones the
+         * software set aside after timeouts. Randy N4OPI asked to see his own
+         * skips and be able to clear them; showing him entries he never made,
+         * under a Clear button that also undoes them, would be a different
+         * feature wearing the same label. Newest first. */
+        char sk[24][12];
+        int ns = ft8_greylist_get_skipped(sk, 24);
+        cJSON *sarr = cJSON_AddArrayToObject(root, "skipped");
+        for (int i = 0; i < ns; i++)
+            cJSON_AddItemToArray(sarr, cJSON_CreateString(sk[i]));
     }
 
     char *out = cJSON_PrintUnformatted(root);
@@ -7665,6 +9013,10 @@ static const httpd_uri_t uri_psk_rx = {
     .uri = "/api/psk_rx", .method = HTTP_GET, .handler = psk_rx_handler,
 };
 
+static const httpd_uri_t uri_sched = {
+    .uri = "/api/sched", .method = HTTP_GET, .handler = sched_handler,
+};
+
 static const httpd_uri_t uri_help = {
     .uri = "/api/help", .method = HTTP_GET, .handler = help_handler,
 };
@@ -7789,6 +9141,9 @@ static esp_err_t term_post_handler(httpd_req_t *req)
     const char *action = cJSON_IsString(ja) ? ja->valuestring : "";
     bool ok = false;
     const char *err = NULL;
+    /* T65: a key the transmit guard refused comes back with its reason here,
+     * and `err` points at it rather than at "no session". */
+    char term_err[128] = {0};
 
     if (!strcmp(action, "open")) {
         ok = qmx_term_open();
@@ -7799,9 +9154,12 @@ static esp_err_t term_post_handler(httpd_req_t *req)
         qmx_term_close();
         ok = true;
     } else if (!strcmp(action, "key")) {
+        /* ⛔ T65: a refused key is NOT "no session". Saying so would send the
+         * operator power-cycling the radio over a guard doing its job. */
         const cJSON *jk = cJSON_GetObjectItem(root, "key");
-        ok = cJSON_IsString(jk) && qmx_term_key(jk->valuestring);
-        if (!ok) err = "no session";
+        ok = cJSON_IsString(jk) &&
+             qmx_term_key_checked(jk->valuestring, term_err, sizeof(term_err));
+        if (!ok) err = term_err[0] ? term_err : "no session";
     } else if (!strcmp(action, "text")) {
         // Typing a value into a menu field. One character at a time through the
         // same path as a key, so there is a single place that writes to the port.
@@ -7810,10 +9168,10 @@ static esp_err_t term_post_handler(httpd_req_t *req)
             ok = true;
             for (const char *p = jt->valuestring; *p && ok; p++) {
                 char one[2] = { *p, 0 };
-                ok = qmx_term_key(one);
+                ok = qmx_term_key_checked(one, term_err, sizeof(term_err));
             }
         }
-        if (!ok) err = "no session";
+        if (!ok) err = term_err[0] ? term_err : "no session";
     } else {
         err = "unknown action";
     }
@@ -7825,6 +9183,44 @@ static esp_err_t term_post_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
 }
+
+/* ⛔⛔ THE BROWSER'S OWN LOG, INTO THE SERIAL CAPTURE.
+ *
+ * Operator, 2026-10-30, after I had asked him eight times whether a web
+ * gesture still misbehaved: "Why are you asking me time after time if its
+ * still jumping - is it because you cannot check it your self? I am NOT your
+ * instrument! Then hurry up implementing web screen logs to the capture so
+ * that you can see exactly what happens."
+ *
+ * He is right. Every other subsystem on this board writes to the capture and
+ * the one that runs in a browser did not, so the only way to learn what the
+ * page did was to ask a person to watch it - which is slow, lossy, and not
+ * his job. The capture is the diagnostic record; the browser belongs in it.
+ *
+ * Deliberately plain: a POST of text, logged at INFO under "weblog" with the
+ * page's own millisecond stamp preserved. No JSON schema to keep in step, and
+ * no reply body worth parsing - a logger that can fail the caller is a logger
+ * people stop calling. It answers 204 whatever happens. */
+static esp_err_t weblog_handler(httpd_req_t *req)
+{
+    char buf[512];
+    int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
+    if (len > 0) {
+        buf[len] = 0;
+        /* One line per message: a newline from the page would otherwise forge
+         * log lines in the capture, which is the one file that has to be
+         * trustworthy. */
+        for (int i = 0; i < len; i++)
+            if (buf[i] == 0x0A || buf[i] == 0x0D) buf[i] = ' ';
+        ESP_LOGI("weblog", "%s", buf);
+    }
+    httpd_resp_set_status(req, "204 No Content");
+    return httpd_resp_send(req, NULL, 0);
+}
+
+static const httpd_uri_t uri_weblog = {
+    .uri = "/api/weblog", .method = HTTP_POST, .handler = weblog_handler,
+};
 
 static const httpd_uri_t uri_term_get = {
     .uri = "/api/term", .method = HTTP_GET, .handler = term_get_handler,
@@ -8156,6 +9552,7 @@ esp_err_t webserver_start(void)
     reg(&uri_wspr);
     reg(&uri_decodes);
     reg(&uri_psk_rx);
+    reg(&uri_sched);       // T116 scheduled events, same list as the Tab5 pane
     reg(&uri_help);
     reg(&uri_manual);
     reg(&uri_eqsl_creds);
@@ -8171,6 +9568,7 @@ esp_err_t webserver_start(void)
     reg(&uri_config_post);
     reg(&uri_term_get);
     reg(&uri_term_post);
+    reg(&uri_weblog);
     filebrowser_register(s_server);   // /files + /api/files + /api/file
     webserver_ws_start(s_server);
 

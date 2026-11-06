@@ -30,6 +30,12 @@ void ui_apply_saved_mode_start(void);
 // Phase 4/5 hooks (stubs for now)
 void ui_update_frequency(uint32_t freq_hz);
 void ui_update_smeter(int s_units);
+/* T120 - the strongest S-unit reading of the last few seconds, for the
+ * manual log window's received report. false when nothing was measured in
+ * that time, which is NOT the same as a weak signal: the caller falls back
+ * to its own default rather than offering S0. See ui.c for the hold policy
+ * and for the one thing about it that has not been measured. */
+bool ui_smeter_recent_peak(int *out_units);
 void ui_update_mode(const char *mode);   // Phase 5.10: e.g. "USB", "CW"
 void ui_update_band(const char *band);   // Phase 5.10: e.g. "20m", "40m"
 void ui_refresh_band_label(uint32_t freq_hz);  // cheap, call every FA poll
@@ -85,6 +91,9 @@ uint32_t ui_band_last_hz(uint32_t center_hz); // 0 if never visited      // CW s
 // or in a gap between bands - used to refuse saving an out-of-band memory
 // channel frequency.
 bool ui_validate_band_freq_hz(uint32_t hz, uint32_t *lo_out, uint32_t *hi_out);
+// The range the current PAGE lets the operator tune across: the band's edges,
+// or on the CW page its CW + DiGi segments. False when hz is in no band.
+bool ui_page_range_hz(uint32_t hz, uint32_t *lo_out, uint32_t *hi_out);
 int16_t  ui_get_if_cal_hz(void);         // per-unit IF calibration trim in Hz
 int   ui_get_pan_offset_bins(void);     // current pan offset in FFT bins
 void  ui_set_zoom(float zoom, int pan_bins); // set zoom+pan, persists zoom to NVS
@@ -114,6 +123,17 @@ void ui_note_view_reframe(void);
  * See the comment above that function in ui.c. */
 uint32_t ui_bandplan_move_view(int64_t view_center_hz);
 void ui_request_bandplan_view(int64_t view_center_hz);
+/* T126: move the VIEW inside what the radio already hears and leave the dial
+ * alone - the opposite promise from ui_request_bandplan_view(), which is the
+ * band-plan knob and may retune. Queued for the LVGL thread the same way.
+ * ui_pan_is_available() is false when the still view is off, because then the
+ * spectrum follows the dial and there is no independent window to move. */
+void ui_request_pan_hz(int64_t pan_hz);
+/* Steps whenever the spectrum's view actually moves. Carried in the WS frame
+ * trailer so the browser can tell, exactly and at any zoom, which frame is the
+ * first one drawn on the new window - see the note at sv_apply_pan_hz(). */
+uint8_t ui_view_seq8(void);
+bool ui_pan_is_available(void);
 
 void ui_set_still_view(bool on);
 bool ui_get_still_view(void);
@@ -135,6 +155,14 @@ bool ui_pan_view_current(pan_view_cfg_t *c, pan_view_t *v, int n_bins);
  * See ui.c for the four separate bug reports that came from the browser having
  * no viewport at all above zoom x1. */
 void ui_screen_view_hz(int64_t *lo_out, int32_t *span_out);
+/* The on-device spectrum viewport. The CW page's keyer pane covers columns
+ * [0, CW_PANE_W), so the Tab5 draws the view into [ui_spec_x0(), 1280) and the
+ * WEB keeps the full width - see the block comment in ui.c. Anything drawing on
+ * the spectrum, the waterfall or the axis must use these two and the _disp()
+ * viewport, or it will disagree with the trace about where a frequency is. */
+int  ui_spec_x0(void);
+int  ui_spec_w(void);
+bool ui_pan_view_current_disp(pan_view_cfg_t *c, pan_view_t *v, int n_bins);
 
 int  ui_get_if_bin_shift(int n_bins);  // Total bin shift = (IF_OFFSET_HZ + if_cal_hz) -> bins
 int  ui_get_if_offset_hz(void);        // Baseband Hz the dial maps to (12 kHz, +CW LO offset+trim in CW)
@@ -207,12 +235,82 @@ bool ui_update_line_tappable(void);
  * dropdown) at the stored value. Call after changing it from anywhere that
  * is not one of those two - /api/settings does. */
 void ui_sync_wf_rate_controls(void);
+/* Same job for the Smoothing slider, called from the same handler. ⚠ The
+ * slider is SMOOTHING PERCENT and the stored value is the EMA coefficient;
+ * the inversion lives in ui.c next to smoothing_label(). */
+void ui_sync_smoothing_controls(void);
 
 /* Band-plan repaint counts since the previous call, then reset. `calls` counts
  * every path into update_bandplan_strip(); `from_poll` counts only the
  * unconditional refresh reached from cat's poll_task. Diagnostic for the strip's
  * 20% share of invalidated pixels - see the comment above update_bandplan_strip. */
 void ui_bandplan_call_counts(unsigned *calls, unsigned *from_poll, unsigned *skipped);
+
+/* ⭐ HOW MANY FRAMES DREW THE SAME SPECTRUM - the last unmeasured stage.
+ *
+ * The chain from the FFT to the glass changes rate twice. fft_task publishes
+ * ~47 spectra/s; render_task samples ONE of them every 100 ms (so the data
+ * changes at exactly 10 Hz); LVGL then redraws whenever core 0 lets it, which
+ * measured 12.2 fps mean with the interval spread 10.9-13.0. Ten and twelve are
+ * not harmonically related, so each spectrum is shown once or twice in an
+ * irregular pattern, and a refresh that runs long skips one entirely.
+ *
+ * Nothing measured that. display_frame_spacing() counts frames and
+ * render_push_spacing() counts pushes; neither can see that two frames in a row
+ * carried the SAME numbers, which is what a stepped trace is made of.
+ *
+ * repeat[] bins the distinct spectra by how many consecutive refreshes drew
+ * them: index 0 = shown once, 1 = twice, 2 = three times, 3 = four or more. A
+ * steady 1,1,1,... or 2,2,2,... looks smooth; an alternating 1,2,1,1,2 is the
+ * stutter, in numbers. `skipped` counts pushes that NO refresh ever showed.
+ *
+ * `lock_fail` is the other silent hole: ui_push_spectrum() gives up after 20 ms
+ * waiting for the LVGL lock and returns, throwing the frame away with nothing
+ * recording it. A failed take costs the full 20 ms, so it also inflates
+ * render_push_spacing()'s push_max_us - which is exactly how a dropped frame
+ * could read as a slow draw.
+ *
+ * age_* is push -> the first refresh that showed it, i.e. how stale the trace
+ * is by the time it reaches the eye.
+ *
+ * All O(1); the per-frame half runs inside the REFR_READY callback. Reads and
+ * RESETS, so the caller's cadence is the window. */
+typedef struct {
+    unsigned frames;        /* LVGL refreshes counted in this window      */
+    unsigned gens;          /* distinct spectra those frames showed       */
+    unsigned repeat[4];     /* gens shown 1, 2, 3, >=4 times in a row     */
+    unsigned skipped;       /* pushes no refresh ever drew                */
+    unsigned lock_fail;     /* ui_push_spectrum() could not get the lock  */
+    unsigned wf_lock_fail;  /* waterfall rows lost the same way           */
+    unsigned age_mean_us;   /* push -> first refresh showing it           */
+    unsigned age_max_us;
+    /* ⭐ The gap between one spectrum APPEARING and the next appearing -
+     * i.e. how long each picture stood still. This, not the push interval and
+     * not the frame interval, is what a moving trace is made of. Nominal is
+     * 100 ms (the data rate); the SD is the stutter, in milliseconds. */
+    unsigned appear_n;
+    unsigned appear_min_us;
+    unsigned appear_mean_us;
+    unsigned appear_max_us;
+    unsigned appear_sd_us;
+    /* Partial-invalidate decision, per window: which branch rejected the
+     * band path, and how tall the band was when it was computed. */
+    unsigned pi_partial, pi_no_array, pi_stale, pi_overlay, pi_wide;
+    unsigned pi_band_mean_px;
+    /* Carpet: rows written into the buffer, and how many of those actually
+     * moved the view. rows/shifts should equal the shift batch. */
+    unsigned wf_shifts, wf_rows_written;
+} ui_spec_frame_stats_t;
+
+void ui_spec_frame_stats(ui_spec_frame_stats_t *out);
+
+/* Waterfall viewport-shift batching. Every row is still written on its own
+ * tick; the VIEW moves N rows at a time, because moving it costs the whole
+ * 474 kpx carpet whether it moves 1 px or N. 0 = auto (sized from the row
+ * rate), >=1 forces a value - 1 is the pre-2026-10-22 behaviour exactly.
+ * See the measurement above ui_push_waterfall_row(). */
+void ui_wf_set_shift_batch(int n);
+int  ui_wf_get_shift_batch(void);
 
 void ui_set_resource_monitor_text(const char *text);
 
@@ -307,6 +405,37 @@ void ui_help_overlay_changed(void);
 // way it already skips them in FT8 mode - see render.c's pan_visible.
 bool ui_any_overlay_active(void);
 
+/* ---- SERVER MODE (T19, Sam W7STF's A1) ------------------------------------
+ *
+ * "We just shut down any activity (including the screen) that do not serve
+ * the Web Socket."
+ *
+ * ⛔ THE SAVING IS NOT THE BACKLIGHT. A dark screen with taskLVGL still
+ * drawing leaves core 0 exactly where it was - measured 2026-10-23, taskLVGL
+ * 64.5-68.6 % of core 0 with the panadapter up. What costs is the DRAWING:
+ * the waterfall carpet alone was 4127 kpx/s of 4804 invalidated pixels in
+ * that same sample. So server mode gates the CANVASES, and the backlight
+ * goes off with them because nobody is looking.
+ *
+ * ⛔ IT DOES NOT SUSPEND taskLVGL. Timers, modals and the touch path all
+ * still expect to run, and stopping the task they live on is the risk this
+ * feature was re-sized around. render_task simply skips the canvas work, the
+ * same way it already does under a full-screen overlay - one predicate, not
+ * a second mechanism.
+ *
+ * The browser is unaffected: ws_push_task reads dsp_get_spectrum() itself,
+ * never this pipeline, so the web spectrum and waterfall keep running at
+ * full rate. That is the whole point - the Tab5 stops drawing for nobody and
+ * keeps feeding the screen someone is actually watching.
+ *
+ * ⚠ RAM ONLY, deliberately not persisted: a unit that boots with a dark
+ * screen and no trace is indistinguishable from a dead one. Switch it on
+ * when you want it; a reboot gives you the panadapter back.
+ *
+ * A touch wakes it, exactly like the idle sleep. */
+void ui_set_server_mode(bool on);
+bool ui_get_server_mode(void);
+
 // Opens the on-device docs Reader at its top level. Exported 2026-09-13 so
 // ui/spot_map_view.c's own settings drawer can offer the same "User Manual"
 // button the main drawer has, rather than duplicating reader_view.c's API.
@@ -365,6 +494,88 @@ void ui_set_bottom_wifi(const char *ssid, bool connected, int rssi_dbm, const ch
 // Bottom-bar UTC clock (center). valid=false shows "--:--:--" with suffix.
 // suffix is the time-source indicator, e.g. " UTC(NTP)" or " UTC".
 void ui_set_bottom_clock(int h, int m, int s, bool valid, const char *suffix);
+/* CW-Tune (A4 step 2, Sam W7STF): put the dial exactly on the CW signal
+ * nearest to it, so the tone lands at the CW centre.
+ *
+ * ⛔ OPERATOR-INVOKED, NEVER AUTOMATIC. The device used to carry a
+ * snap-to-peak that fired on its own; it was removed in 2026-08, and #276 is
+ * still open with Sam reporting "tuning is set, then there are one or two
+ * automatic corrections" and no cause established. A tuning aid that moves
+ * the dial unasked is indistinguishable from that fault, so this runs once
+ * per press and does nothing in between.
+ *
+ * Accuracy is the FFT bin (46.9 Hz at 48 kHz / 1024) refined by parabolic
+ * interpolation on the three dB values around the peak - a few Hz on a clean
+ * carrier, which puts the tone inside a 300 Hz CW filter. It is not a
+ * frequency counter. */
+typedef enum {
+    UI_CW_TUNE_OK = 0,
+    UI_CW_TUNE_NOT_CW,        /* not in CW/CW-R                       */
+    UI_CW_TUNE_NO_FREQ,       /* the dial is not known yet (no CAT)   */
+    UI_CW_TUNE_NO_SPECTRUM,   /* nothing has been drawn yet           */
+    UI_CW_TUNE_NO_SIGNAL,     /* nothing stands above the noise       */
+    UI_CW_TUNE_LISTENING,     /* nothing yet - waiting for a signal   */
+} ui_cw_tune_t;
+
+/* Returns what happened; *moved_hz (may be NULL) is how far the dial went. */
+ui_cw_tune_t ui_cw_tune_to_peak(int32_t *moved_hz);
+const char  *ui_cw_tune_reason(ui_cw_tune_t r);
+
+/* T90 SSB auto-tune - the sibling of CW-Tune, on the same gesture.
+ *
+ * SSB has no carrier, so the reference is the sharp edge the far station's
+ * own transmit filter leaves at the suppressed carrier. The estimate alone is
+ * worth about +/-100 Hz, which would be useless on its own - what makes it
+ * work is that the other operator is nearly always on a round 500 Hz, so the
+ * estimate only has to pick the right grid point. Measured on two real bench
+ * captures: every accepted frame snapped to the SAME point, on a clean band
+ * and on one with a second station 1 kHz away.
+ *
+ * It is a VOTE over a 4 s window, not one frame: the estimator accepts about
+ * 10 % of frames on a clean band and 2.5 % with a neighbour present, so a
+ * single frame can be the only evidence there is. Fewer than two agreeing
+ * frames is a refusal, and a refusal leaves the dial alone. */
+typedef enum {
+    UI_SB_TUNE_OK = 0,
+    UI_SB_TUNE_NOT_SSB,       /* not in USB/LSB                        */
+    UI_SB_TUNE_NO_FREQ,       /* the dial is not known yet (no CAT)    */
+    UI_SB_TUNE_NO_SPECTRUM,   /* nothing has been drawn yet            */
+    UI_SB_TUNE_LISTENING,     /* the 4 s window is open                */
+    UI_SB_TUNE_NO_EDGE,       /* the window closed without two votes   */
+} ui_sb_tune_t;
+
+/* RIT park/restore - switch an offset off and back on WITHOUT losing it,
+ * which is what a rig with a dedicated RIT button does and what clearing it
+ * cannot express (Roy KI0ER's round robin: one station off frequency, the
+ * offset wanted and unwanted as the turn passes round).
+ *
+ * On the Tab5 this is a long press on the RIT pill. It is also /api/cmd
+ * {"action":"rit_park"}, because a long press is not available to a browser
+ * and the parked value is firmware state either surface may move.
+ *
+ * Safe from any task: it drives CAT and a static int, and touches no widget. */
+typedef enum {
+    UI_RIT_PARKED = 0,   /* an engaged offset was stood down and remembered */
+    UI_RIT_RESTORED,     /* the remembered offset was put back              */
+    UI_RIT_NOTHING,      /* nothing engaged and nothing parked              */
+} ui_rit_park_t;
+
+/* *hz (may be NULL) is the offset parked or restored; 0 for UI_RIT_NOTHING. */
+ui_rit_park_t ui_rit_park_toggle(int *hz);
+
+/* The parked offset in Hz, 0 if nothing is parked. */
+int ui_rit_parked_hz(void);
+
+ui_sb_tune_t ui_sb_tune_start(void);
+const char  *ui_sb_tune_reason(ui_sb_tune_t r);
+
+/* Spectrum peak hold: the window in SECONDS, 0 = off. A sliding window, not
+ * a latch - what is drawn is the highest each column reached in the last N
+ * seconds. Safe from any task: the setter only stores the number, and the
+ * buffers live and die inside ui_push_spectrum(). */
+void    ui_set_peak_hold_s(uint8_t secs);
+uint8_t ui_get_peak_hold_s(void);
+
 bool ui_get_flat_mode(void);
 void ui_set_flat_mode(bool on);
 /* Flat mode from the web (#357). ui_set_flat_mode() moves LVGL objects and so
@@ -418,6 +629,12 @@ void ui_restart_edge_grip_anims(void);
 // ui_theme_style_textarea(); not normally called directly.
 void ui_kbd_note_focus(lv_obj_t *ta);
 void ui_kbd_note_unfocus(lv_obj_t *ta);
+
+// True while EITHER physical keyboard can type - BLE or the snap-on. This is
+// the predicate ui_osk_show() gates on, and the one a layout should ask when
+// it needs to know whether the 280 px on-screen keyboard will appear. Never
+// cached: both halves go false on a detach. See T131 in TODO.md.
+bool ui_phys_kbd_active(void);
 
 // Register the open modal's Save and Cancel buttons so the physical keyboard's
 // Enter key clicks Save (commit + close) and Esc clicks Cancel. Either may be

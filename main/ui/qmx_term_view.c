@@ -121,9 +121,19 @@ static void worker_task(void *arg)
             qmx_term_close();
             s_status = ST_CLOSED;
             break;
-        case CMD_KEY:
-            qmx_term_key(c.key);
+        case CMD_KEY: {
+            /* ⛔ T65: a refused key must SAY so. Several rows of the radio's
+             * Hardware tests menu key the transmitter, and on the Diagnostics
+             * screen `t` keys at full PA voltage with no SWR protection - so
+             * those keys are refused. Without this the press would simply do
+             * nothing on the glass, which reads as a dead touch screen and
+             * sends the operator looking for a fault that is not there. */
+            char why[128];
+            if (!qmx_term_key_checked(c.key, why, sizeof(why)) && why[0]) {
+                ui_toast_ms(why, 6000);
+            }
             break;
+        }
         case CMD_GOTO_GPS:
             /* Walk to the radio's own GPS viewer. Screen-driven both steps -
              * see qmx_term_select(), and note that this menu's siblings
@@ -756,24 +766,11 @@ static void build(void)
      * keybords we use in this app." My first version took LVGL's default theme,
      * which is a light keyboard in a dark application.
      *
-     * This is the same block ft8_cq_modal/identity_config/wifi use: the shared
-     * per-key style on LV_PART_ITEMS, then ui_theme_style_keyboard() for the
-     * surface and the checked-state override, then montserrat_28. Copied
-     * deliberately rather than re-invented, since "equal to the others" is the
-     * requirement and the shared helper is what defines equal. */
+     * ui_theme_style_keyboard() is what defines "equal to the others" - the
+     * surface, the keys and the checked-state override - so this is that call
+     * plus montserrat_28. The per-key block that used to sit in front of it
+     * here, and in nine other files, now lives inside it. */
     s_kb = lv_keyboard_create(s_overlay);
-    static lv_style_t style_kb_btn;
-    static bool kb_btn_style_inited = false;
-    if (!kb_btn_style_inited) {
-        lv_style_init(&style_kb_btn);
-        lv_style_set_bg_color(&style_kb_btn, lv_color_hex(UI_COLOR_KEY_BG));
-        lv_style_set_bg_opa(&style_kb_btn, LV_OPA_COVER);
-        lv_style_set_text_color(&style_kb_btn, lv_color_white());
-        lv_style_set_border_width(&style_kb_btn, 1);
-        lv_style_set_border_color(&style_kb_btn, lv_color_hex(0x505050));
-        kb_btn_style_inited = true;
-    }
-    lv_obj_add_style(s_kb, &style_kb_btn, LV_PART_ITEMS);
     ui_theme_style_keyboard(s_kb);
     lv_obj_set_size(s_kb, LV_PCT(100), KB_H);   /* KB_VIS_H is derived from this */
     lv_obj_align(s_kb, LV_ALIGN_BOTTOM_MID, 0, 0);

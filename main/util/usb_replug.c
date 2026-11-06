@@ -95,6 +95,7 @@ esp_err_t usb_replug(uint32_t off_ms)
 #include "diag_log.h"
 #include "radio.h"        // KX3 profile: no zombie replug (see below)
 #include "audio.h"
+#include "settings.h"
 #include "esp_timer.h"
 
 #define DET_CHECK_MS   15000
@@ -148,6 +149,21 @@ static void usb_stale_detect_task(void *arg)
     bool     ever_active = false; // any driver was live at least once THIS boot
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(DET_CHECK_MS));
+
+        // Either simulation mode means the operator has deliberately opted
+        // out of needing a radio (phantom stations, nothing ever keyed), so
+        // "power-cycle the QMX" is noise on top of a practice session - and
+        // it lands as a toast across the page (operator-reported 2026-08-04).
+        // Skipping the whole check also parks the auto-replug, which is the
+        // right call here: a practice session has no USB work to protect.
+        //
+        // ⛔ NARROW ACCESSORS, never settings_load_all(). This task's stack is
+        // 4096 bytes and qmx_settings_t is 3888 (nm on s_pending), so one local
+        // copy overflows it: a Breakpoint exception in usb_stale_det at 4.740 s
+        // of every boot, i.e. a crash loop. It fitted when it was written and
+        // stopped fitting because the STRUCT grew - nobody touched this line.
+        // See CLAUDE.md's "Task stacks on this board are TINY".
+        if (settings_get_sim_mode_en() || settings_get_cw_sim_en()) continue;
 
         uint32_t fails = diag_log_usb_enum_failures();
         // audio_uac_active() is load-bearing here, not belt-and-suspenders:

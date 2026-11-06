@@ -17,6 +17,7 @@
 #include "util/country.h"
 #include "storage/sd_archive.h"   // "Restore from SD" - card presence + the read
 #include "util/psram_task.h"      // the restore runs OFF taskLVGL; see restore_task()
+#include "storage/settings.h"    // the sticky Today/All choice (T113)
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -1330,6 +1331,12 @@ static void filter_btn_cb(lv_event_t *e)
 {
     (void)e;
     s_today_only = !s_today_only;
+    /* ⭐ STICKY UNTIL CHANGED (T113, Bruce N9JCV). Only this path stores it -
+       a TAP is the operator choosing. The fallback in render_tick_cb() also
+       writes s_today_only, and it must NOT reach NVS: that one flips to All
+       because Today came out empty, which is the window rescuing itself, not
+       a preference. */
+    settings_set_log_view_all(!s_today_only);
     /* Deferred for the same reason the search box is - see search_ta_cb(). This
        one predates the search and has never crashed, because a single tap is a
        different point in the dispatch from a keystroke with the on-screen
@@ -1564,23 +1571,10 @@ static void modal_build(void)
     // On the modal, not the panel: it has to be able to sit BELOW the panel
     // rather than inside it. Hidden until the search field is touched.
     s_search_kb = lv_keyboard_create(s_modal);
-    // ui_theme_style_keyboard() alone styles the keyboard's own background but
-    // NOT its keys, so on its own it leaves LVGL's default white keys - which
-    // is what shipped to the bench and looked nothing like the rest of the app.
-    // Every other modal here adds this per-key style as well; same block, same
-    // values, so this keyboard matches the ones beside it.
-    static lv_style_t style_kb_btn;
-    static bool kb_btn_style_inited = false;
-    if (!kb_btn_style_inited) {
-        lv_style_init(&style_kb_btn);
-        lv_style_set_bg_color(&style_kb_btn, lv_color_hex(UI_COLOR_KEY_BG));
-        lv_style_set_bg_opa(&style_kb_btn, LV_OPA_COVER);
-        lv_style_set_text_color(&style_kb_btn, lv_color_white());
-        lv_style_set_border_width(&style_kb_btn, 1);
-        lv_style_set_border_color(&style_kb_btn, lv_color_hex(0x505050));
-        kb_btn_style_inited = true;
-    }
-    lv_obj_add_style(s_search_kb, &style_kb_btn, LV_PART_ITEMS);
+    // ui_theme_style_keyboard() now carries the per-key style too, so this is
+    // the whole look in one call. It used to style only the keyboard's own
+    // background, leaving LVGL's default white keys, and every modal pasted
+    // the key style in front of it - see that function for what that cost.
     ui_theme_style_keyboard(s_search_kb);
     lv_obj_set_size(s_search_kb, LV_PCT(100), ADIF_KB_H);
     lv_obj_align(s_search_kb, LV_ALIGN_BOTTOM_MID, 0, 0);
@@ -1657,7 +1651,11 @@ void adif_view_modal_show(void)
     s_query[0] = 0;
     if (s_search_ta) lv_textarea_set_text(s_search_ta, "");
     kb_hide();
-    s_today_only = true;
+    /* Was unconditionally `true`, so the window reopened on Today however it
+       was left (T113). The search box above still resets, for the reason
+       stated there - a stale query hides records silently, where a remembered
+       filter says which one it is on the button. */
+    s_today_only = !settings_get_log_view_all();
 
     /* ⛔ This function is called FROM A BUTTON CALLBACK
      * (adif_or_pileup_btn_cb), so it must not render: list_render_now() does

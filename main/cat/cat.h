@@ -24,6 +24,11 @@ esp_err_t cat_init(void);
  *         ESP_ERR_TIMEOUT if rate-limited
  */
 esp_err_t cat_set_frequency(uint32_t freq_hz);
+/* The frequency the radio will actually hold for any value you ask for -
+ * every dial write is rounded to the QMX's 10 Hz encoder grid. Use it before
+ * comparing a readback against a target you computed, or the two can never
+ * agree (KX7R's v1.22.0 band walk; see the note in cat_set_frequency). */
+uint32_t  cat_quantise_dial_hz(uint32_t freq_hz);
 
 /**
  * @brief Same as cat_set_frequency() but bypasses the 200 ms rate-limiter.
@@ -331,6 +336,35 @@ bool cat_get_vox_disabled(void);
 esp_err_t cat_send_raw_cmd(const char *fmt, ...);
 
 /**
+ * @brief The ONE door for CAT text that did not come from our own code (T64).
+ *
+ * ⛔ EVERY path that accepts a CAT string from outside the firmware - the
+ * web API's cat_raw today, a PC pass-through (T63) tomorrow - MUST come
+ * through here, and `tools/check_tx_guard.py` refuses the build if anything
+ * under main/net/ calls cat_send_raw_cmd() directly instead.
+ *
+ * WHY: the band guard's other six sites are found by grepping our source for
+ * the literal "TX;". A command that arrives at runtime is invisible to that,
+ * so from v1.0 to v1.20.3 `/api/cmd {"action":"cat_raw","cmd":"TX;"}` keyed the
+ * radio on any frequency, with no guard and no authentication.
+ *
+ * It classifies the text (cat_keying_cmds.h), and when anything in it can
+ * cause RF it consults tx_band_guard_allows() with the frequency that would
+ * actually be EMITTED - the dial, plus a TA audio offset when one is given.
+ *
+ * ⛔ STRICTER THAN THE INTERNAL PATHS IN ONE WAY: those are documented to pass
+ * unchecked when the dial reads 0, because refusing every transmission on a
+ * flaky CAT link would be worse. Here an unknown dial REFUSES - a raw command
+ * is never the only way to get a signal out, so the safe answer is free.
+ *
+ * @param cmd      the text, which may hold several commands ("FA7074000;TX;")
+ * @param err      optional buffer for the reason on a refusal
+ * @param err_len  its size
+ * @return ESP_OK when sent, ESP_ERR_NOT_ALLOWED when the guard refused.
+ */
+esp_err_t cat_send_external_cmd(const char *cmd, char *err, size_t err_len);
+
+/**
  * @brief Query the QMX's instantaneous power output and SWR (PC; and SW;).
  *
  * Both readings are only valid while the radio is keyed (transmitting) - SW;
@@ -453,6 +487,105 @@ void cat_query_af_gain(void);
  * Divide by 4 for the dB figure the QMX displays. */
 int cat_get_af_gain(void);
 
+/* ---- CW sidetone (monitor) level: MMCW|Sidetone volume + Sidetone abs/rel --
+ *
+ * T139, Michael KZ4LY: "the Tab5 overwrites the CW monitor volume", so he
+ * cannot set the receive audio down and his own keying monitor up. He wanted
+ * QMX headphones plus Tab5 earbuds for a binaural setup.
+ *
+ * ⭐ NOTHING WAS OVERWRITING A STORED VALUE. It is the radio's own
+ * "Sidetone abs/rel" parameter, which ships as **Relative**. QMX operation
+ * manual 1_04_001, CW menu:
+ *
+ *   Relative: "the sidetone level is set by the Sidetone volume parameter,
+ *   however it is also affected by the main volume control. As you increase
+ *   the volume ... the received signals AND the sidetone volume both increase
+ *   by the same amount."
+ *
+ *   Absolute: "the sidetone level is fixed by the Sidetone volume parameter,
+ *   regardless of the setting of the main volume control."
+ *
+ * The drawer's "QMX volume" slider writes AG, which IS the main volume
+ * control, so on a factory-default radio it drags the monitor with it. What he
+ * asked for needs Absolute - and there is no AG-style two-letter command for
+ * either parameter. The CAT manual's whole command list has no sidetone entry;
+ * both live in the configuration menu and are reached with MM, which this file
+ * already speaks for the CW filters, the CW centre and the PA voltage.
+ *
+ * ⛔ NOTHING HERE IS STORED ON THE TAB5, deliberately. An MM Set writes the
+ * QMX's own EEPROM (CAT manual: "Menu Manager MM Set commands ARE stored in
+ * the configuration memory"), so the radio is the only copy. A shadow in NVS
+ * would be a second answer to "what is the monitor level", which is the exact
+ * confusion the second half of T139 is about - he could not tell who owned the
+ * value. Read it from the radio, write it to the radio, show what it says.
+ *
+ * ⛔ AN MM WRITE IS EXPENSIVE AND THE RANGE IS NOT GUESSED.
+ *  - Expensive: it sprays a menu redraw back down the CAT port, needs MU; to
+ *    take effect on "On demand", and MU; drops IQ mode so the panadapter
+ *    flattens until the handshake re-asserts Q9. That is ~0.6 s of flat
+ *    spectrum, so the drawer commits on slider RELEASE, like RF gain, and
+ *    skips a write that would not change anything.
+ *  - Not guessed: the operation manual gives the default (70) and NO range.
+ *    cat_sidetone_vol_max() is read off the radio with MM discovery
+ *    (MMCW|Sidetone volume?; -> MM<type>|<len>|Sidetone volume;) at first
+ *    connect, exactly as the CW filter mask is. It returns 0 when the radio
+ *    has not answered, and the drawer then shows no slider at all rather than
+ *    a scale invented here and displayed as if it were the radio's. */
+void cat_request_sidetone_vol(uint16_t v);
+
+/* Relative (false) or Absolute (true), the radio's own two values. */
+void cat_request_sidetone_absolute(bool absolute);
+
+/* Ask the radio for both; the answers land asynchronously in the two getters.
+ * Called when the drawer opens and when the web status page is loaded, for the
+ * same reason as AF gain - a surface showing a stale value is worse than one
+ * showing none. */
+void cat_query_sidetone(void);
+
+/* Last sidetone volume read back from the radio, or -1 if never read. */
+int cat_get_sidetone_vol(void);
+
+/* 1 = Absolute, 0 = Relative, -1 = never read. */
+int cat_get_sidetone_absolute(void);
+
+/* Top of the sidetone-volume range as the RADIO reports it, or 0 if discovery
+ * has not answered. 0 means "do not offer the control", never "the range is
+ * zero" - see the block above. */
+uint16_t cat_sidetone_vol_max(void);
+
+/* ---- T144: Semi QSK (break-in delay) ------------------------------------
+ *
+ * Michael KZ4LY / Gyula HA3HZ: receive comes back the instant a CW signal
+ * ends, which chatters a relay behind a power amp - they want a configurable
+ * hang time. The radio already has this (operation manual 1_04_001 S5.10):
+ * "Semi QSK" picks Auto/Contest/a custom unit, and "Custom Semi QSK" is the
+ * delay value when a custom mode is picked. MM path and list discovered
+ * LIVE (not guessed) on bench1 2026-11-04 via the cat_raw dev endpoint -
+ * see cat.c's own comment at CW_QSK_MODE_COUNT for the measurement. */
+#define CW_QSK_MODE_COUNT 6
+
+/* One of the strings cat_cw_qsk_modes() returns, exactly - "OFF", "Auto",
+ * "Contest", "Custom dits", "Custom decidits" or "Custom ms". */
+void cat_request_cw_qsk_mode(const char *mode);
+
+/* 0..999 ms. Only meaningful when the mode is one of the three Custom
+ * variants - the radio stores it regardless, this does not enforce that. */
+void cat_request_cw_qsk_delay(int ms);
+
+/* Ask the radio for both; same lazy-per-surface-open pattern as
+ * cat_query_sidetone(). */
+void cat_query_cw_qsk(void);
+
+/* "" until the radio has answered at least once this session. */
+const char *cat_get_cw_qsk_mode(void);
+
+/* 0..999, or -1 if never read. */
+int cat_get_cw_qsk_delay(void);
+
+/* The fixed CW_QSK_MODE_COUNT-entry list, radio-measured, for building a
+ * dropdown/selector. Never NULL. */
+const char *const *cat_cw_qsk_modes(void);
+
 /* ---- CW keyer speed (KS), in words per minute --------------------------
  *
  * Asked for by Ralph Hellmig on the group, 2026-10-10: there was no way to
@@ -560,6 +693,30 @@ void cat_request_iq_reassert(void);
  * so the menu-manager item is the only thing that works. Thread-safe.
  */
 void cat_request_cw_passband(uint32_t hz);
+
+/* ---- CW keyer / decoder surface (CW page, v1.4) ---------------------------
+ * Three commands, all present in QMX 1_03_002 AND 1_04 (verified against both
+ * cached CAT manuals, docs/qmx-reference/):
+ *   KY <text>;  radio keys the CW itself (timing, envelope, keyer settings);
+ *               80-char circular TX buffer, append-while-sending OK, ?; on
+ *               overflow. NOTE the "Kenwood TS480 compatibility" System-Config
+ *               setting changes the wire format (fixed 24-char padded) - this
+ *               implementation speaks the compat-OFF form and is
+ *               HARDWARE-UNVERIFIED until the first bench session with a QMX.
+ *   KS / KSnnn; keyer speed get/set in WPM.
+ *   TB;         returns + empties the QMX's own CW-decode buffer ("TBtnns;",
+ *               t = KY chars remaining 0-9, 0 = receiving); polled ~1 Hz while
+ *               the CW page is visible (cat_cw_poll_set_active). Decoded text
+ *               is pushed to cw_screen_feed_decoded() (ui/cw_screen_view.h).
+ * All writes deferred to the poll task per the cross-thread CAT rule. */
+void cat_request_cw_send(const char *text);   /* expanded text, <= ~90 chars */
+/* ⚠ cat_request_keyer_wpm/cat_query_keyer_wpm/cat_get_keyer_wpm are declared
+ * above with main's own signatures (uint16_t, no clamp) - this block used to
+ * re-declare them as uint8_t and the merge of 2026-10-19 made that a
+ * conflicting-types error. Main's keyer surface is the one that ships; only
+ * the two CW-page-specific calls below are declared here. */
+int  cat_get_cw_tx_remaining(void);           /* TB t-field: 0 = receiving, -1 = unknown */
+void cat_cw_poll_set_active(bool active);     /* TB; poll while CW page visible */
 
 /**
  * @brief Cooperatively pause/resume the background FA;/MD;/FW; poll loop.

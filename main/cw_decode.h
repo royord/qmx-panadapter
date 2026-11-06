@@ -48,6 +48,14 @@ extern "C" {
 // noise and is dropped. Spaces neither start nor break a run - noise produces
 // plenty of them - but any other character ends it.
 //
+// ⭐ THE SAME VERDICT GOVERNS THE DECODER'S '*', and that is the whole point of
+// routing both through one run counter. A SHORT run of '*' is the decoder
+// losing a character inside real text, so ONE '*' is printed - the radio's own
+// notation, which is what the operator reads on the QMX's LCD. A LONG run was
+// the decoder chewing on noise and is dropped as before. So the screen stays
+// consistent with the radio without taking back the 23.6%-of-everything flood
+// that dropping '*' was measured to remove.
+//
 // This cannot make a wrong decision permanently: at most CW_SQUELCH_RUN
 // characters are ever held, and a genuine "EEEE" (unusual in real CW) costs
 // nothing but those characters.
@@ -57,13 +65,22 @@ extern "C" {
 typedef struct {
     char pend[CW_SQUELCH_HOLD];
     int  n_pend;   // held, waiting on a verdict
-    int  run;      // consecutive E/T (may exceed CW_SQUELCH_RUN)
+    int  run;      // consecutive E/T AND '*' (may exceed CW_SQUELCH_RUN)
     int  emitted;  // anything released yet? - stops a leading space
 } cw_squelch_t;
 
 // Push one decoded character. Writes any characters that are now released to
 // out and returns how many. PORTABLE; host-tested.
 int cw_squelch_push(cw_squelch_t *st, char c, char *out, size_t out_sz);
+
+// T141: force a release of whatever is pending, for a caller with its own
+// clock to call once nothing new has arrived for a while - a real trailing
+// E/T can otherwise sit unreleased forever on a band that goes quiet right
+// behind it. Same run-length verdict cw_squelch_push would have applied: a
+// short run is real text and comes out verbatim; a long run is still noise
+// and is dropped. Writes to out (NUL-terminated) and returns how many
+// characters were released. PORTABLE; host-tested.
+int cw_squelch_flush_stale(cw_squelch_t *st, char *out, size_t out_sz);
 
 // ---- speed estimate --------------------------------------------------------
 //
@@ -149,6 +166,9 @@ unsigned cw_decode_total(void);
  *
  * ⚠ THE STRIP GROWS UPWARD over the waterfall - the bottom edge, just above
  * the band plan, is fixed. Four rows cover about 66 px more of it than two. */
+/* ⚠ 2026-10-17: this is now the MAXIMUM, not the count. How many are actually
+ * in use is a setting - cw_decode_rows() below - and the buffer stays this
+ * size whatever it says. Raising this line still raises the ceiling. */
 #define CW_LINE_ROWS 4
 #define CW_GRID_CELLS (CW_LINE_ROWS * CW_LINE_COLS)
 
@@ -157,6 +177,17 @@ unsigned cw_decode_total(void);
 // only thing separating what has just been decoded from what is about to be
 // overwritten. Always NUL-terminated; returns the number of columns written.
 size_t cw_decode_line(char *out, size_t out_sz);
+
+/* The TX mask for that same grid, cell for cell: 1 where the character was our
+ * own transmission rather than something received. Sam W7STF (T06) asked for
+ * transmitted morse in its own colour, and the radio already supplies the
+ * answer - TB's t-field counts the characters of a KY send still to go, so a
+ * response with t > 0 carries the QMX decoding its own keying.
+ *
+ * ⚠ Approximate at the seam by a character or two: the tail of a send can
+ * arrive in the response where t has already reached 0, and reads as received.
+ * Pass out_sz >= CW_GRID_CELLS; returns the number of cells written. */
+size_t cw_decode_line_tx(uint8_t *out, size_t out_sz);
 
 /* The write position within that line, in columns: everything BEFORE it was
  * written on the current pass, everything after it survives from the previous
@@ -171,6 +202,41 @@ int cw_decode_wpm(void);
 
 // Forget everything (mode change, or the operator clearing the window).
 void cw_decode_clear(void);
+
+/* How many of the CW_LINE_ROWS rows are in use, and setting it.
+ *
+ * Bryan N0LUF, 2026-10-16: "Maybe an option to select 2 or 4 lines as well?"
+ * Four rows cover about 66 px more of the waterfall than two.
+ *
+ * ⛔ THIS IS THE WRAP MODULUS, not a draw count, which is why it lives with
+ * the write position and not in either screen. Drawing two rows while the text
+ * still wrapped over four would decode half of every pass into rows nobody can
+ * see. Both screens ask for this number; neither decides it.
+ *
+ * ⛔ Changing it WIPES the grid - see the note at the definition. */
+int  cw_decode_rows(void);
+void cw_decode_set_rows(int rows);
+
+/* How many COLUMNS the grid wraps at. The panadapter fits 72 of qmx_mono_25
+ * across 1280 px; the CW page's ticker sits beside a 320 px pane and fits 64.
+ * Whichever screen is up sets it, and like a row change the grid is wiped
+ * rather than re-wrapped - see the definition for why that is the honest
+ * choice while the ring cannot carry the TX mask. Clamped to [8, CW_LINE_COLS];
+ * the backing buffer is always the maximum, so this never reallocates. */
+void cw_decode_set_cols(int cols);
+
+/* What it is now - a renderer needs it to slice the grid into rows. */
+int cw_decode_cols(void);
+
+/* Feed DECODED TEXT straight into the one model - squelch, ring, grid, speed
+ * stamps and the microSD transcript - for text that never arrived as a "TB...;"
+ * frame. The CW simulator is the caller that needs it: its phantom QSOs are
+ * generated locally, so without this they would reach cw_qso's capture logic
+ * and never the screen.
+ *
+ * is_tx = the operator's own keying coming back through the decoder. The
+ * simulator passes false; its phantoms are received text. */
+void cw_decode_feed_text(const char *text, int n, bool is_tx);
 
 // Bytes currently staged for the microSD transcript, without copying any of
 // them - for logging/diagnostics only (e.g. "N bytes still waiting" on a

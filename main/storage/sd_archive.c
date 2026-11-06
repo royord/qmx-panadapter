@@ -6,6 +6,8 @@
 #include <errno.h>
 #include <unistd.h>     // fsync
 #include <sys/stat.h>
+#include <dirent.h>     // opendir/readdir - history-folder pruning
+#include <time.h>       // gmtime_r/strftime - history filenames
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -40,7 +42,7 @@ static const char *TAG = "sd_arch";
 #define SD_MOUNT_POINT   "/sdcard"
 #define SD_DIR           "/sdcard/qmx-panadapter"
 #define SD_LOG_PATH      "/sdcard/qmx-panadapter/qmx-log.txt"
-#define SD_LOG_PATH_1    "/sdcard/qmx-panadapter/qmx-log.1.txt"
+#define SD_HISTORY_DIR   "/sdcard/qmx-panadapter/history"
 #define SD_ADIF_PATH     "/sdcard/qmx-panadapter/qso.adi"
 #define SD_ADIF_PREV     "/sdcard/qmx-panadapter/qso.prev.adi"
 #define SD_CONFIG_PATH   "/sdcard/qmx-panadapter/qmx-config.txt"
@@ -526,7 +528,49 @@ static void mirror_cw(void)
                  was_paused ? " (stream was already paused)" : "");
 }
 
-// Append all newly-captured diag bytes to qmx-log.txt, rotating at 5 MB.
+// Keep at most this much SD space free before history starts giving way -
+// below this, the OLDEST history file is deleted. "Nearly indefinite", per
+// KZ4LY's 2026-11-02 request, not literally indefinite: the card we already
+// recommend (32 GB) holds many thousands of 5 MB generations before this
+// ever fires in practice.
+#define SD_HISTORY_LOW_SPACE_BYTES (50ULL * 1024 * 1024)
+
+// esp_vfs_fat_info() is EXPENSIVE - measured 10 s on a 31 GB card, see
+// sd_space_report_once() above. Only call it from rotate_diag_log(), which
+// fires once per 5 MB of diagnostic log (hours to days of uptime), never
+// from a hot path.
+static void maybe_prune_history(void)
+{
+    uint64_t total = 0, freeb = 0;
+    if (esp_vfs_fat_info(SD_MOUNT_POINT, &total, &freeb) != ESP_OK) return;
+    if (freeb >= SD_HISTORY_LOW_SPACE_BYTES) return;
+
+    DIR *d = opendir(SD_HISTORY_DIR);
+    if (!d) return;
+    char oldest[256] = {0};   // d_name can be up to 255 chars + NUL
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        // Filenames are "diag-YYYYMMDD-HHMMSS-N.txt" - zero-padded and
+        // lexically sortable, so the smallest name IS the oldest file. No
+        // stat() needed, which matters: this can run on a card already short
+        // on space, where every extra FatFs call costs more.
+        if (!oldest[0] || strcmp(de->d_name, oldest) < 0)
+            snprintf(oldest, sizeof(oldest), "%s", de->d_name);
+    }
+    closedir(d);
+    if (!oldest[0]) return;   // nothing to prune
+    char path[256 + sizeof(SD_HISTORY_DIR) + 1];
+    snprintf(path, sizeof(path), "%s/%s", SD_HISTORY_DIR, oldest);
+    ESP_LOGW(TAG, "SD low on space (%llu KB free) - deleting oldest history file %s",
+             (unsigned long long)(freeb / 1024), oldest);
+    remove(path);
+}
+
+// Append all newly-captured diag bytes to qmx-log.txt, rotating at 5 MB into
+// history/ instead of discarding - KZ4LY, 2026-11-02: "is it possible to
+// keep nearly indefinite logs on it?" The 2-generation rotate-and-delete this
+// replaced is at git history if a reason ever turns up to go back to it.
 // Returns false on a write error (possible card removal).
 /* ⛔ THE 5 MB ROTATION WAS UNREACHABLE ON EVERY WiFi UNIT, AND THAT IS HOW THE
  * CARD FILLS UP (2026-09-22, chasing Dennis WN4FLA's "SD not mounted").
@@ -541,10 +585,13 @@ static void mirror_cw(void)
  *    grows without limit for the entire life of the card. The bench's own copy,
  *    pulled 2026-09-20, is 5,368,581 B - already past SD_LOG_MAX_BYTES.
  *
- *  - ⭐ The rotate is what FREES space (remove() of the previous
- *    qmx-log.1.txt), and it was gated behind a SUCCESSFUL write. On a card with
- *    no room left, the write is exactly the thing that cannot happen, so the
- *    one action that would recover the card was unreachable by construction.
+ *  - ⭐ The rotate is what FREES space (the move into history/, formerly a
+ *    remove() of the previous qmx-log.1.txt), and it was gated behind a
+ *    SUCCESSFUL write. On a card with no room left, the write is exactly the
+ *    thing that cannot happen, so the one action that would recover the card
+ *    was unreachable by construction. The rename below is still cheap on a
+ *    full card (a FAT directory-entry update, not a copy); maybe_prune_history()
+ *    is what actually frees bytes now, and only when space is genuinely low.
  *
  * Both write paths and the mount now go through this, and the size is checked
  * BEFORE writing as well as after. See sd_archive_task()'s unmount path for
@@ -554,18 +601,31 @@ static void rotate_diag_log(void)
 {
     const bool was_open = (s_log_file != NULL);
     if (s_log_file) { fflush(s_log_file); fclose(s_log_file); s_log_file = NULL; }
-    // remove() FIRST - this is the call that actually returns space to the
-    // volume. rename() alone frees nothing.
-    remove(SD_LOG_PATH_1);
-    if (rename(SD_LOG_PATH, SD_LOG_PATH_1) != 0)
-        ESP_LOGW(TAG, "rotate: rename %s failed: %s", SD_LOG_PATH, strerror(errno));
+
+    struct tm tmv;
+    time_t now = time(NULL);
+    gmtime_r(&now, &tmv);
+    // Trailing sequence number, not just the timestamp: if the clock has not
+    // synced yet (boot-time rotate, no SNTP/GPS), every rotation this boot
+    // would otherwise collide on the same "19700101-000000" name and silently
+    // overwrite - the one failure mode this file exists to avoid.
+    static uint32_t s_history_seq;
+    char dest[112];
+    snprintf(dest, sizeof(dest),
+             SD_HISTORY_DIR "/diag-%04d%02d%02d-%02d%02d%02d-%u.txt",
+             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (unsigned)++s_history_seq);
+    if (rename(SD_LOG_PATH, dest) != 0)
+        ESP_LOGW(TAG, "rotate: move %s to %s failed: %s", SD_LOG_PATH, dest, strerror(errno));
+    else
+        ESP_LOGW(TAG, "rotated diag log to %s", dest);
+    maybe_prune_history();
     s_log_bytes = 0;
     if (was_open) {
         s_log_file = fopen(SD_LOG_PATH, "ab");
         if (!s_log_file)
             ESP_LOGW(TAG, "rotate: reopen %s failed: %s", SD_LOG_PATH, strerror(errno));
     }
-    ESP_LOGW(TAG, "rotated diag log on SD - previous qmx-log.1.txt deleted");
 }
 
 static bool mirror_diag(void)
@@ -796,6 +856,33 @@ static int64_t s_mount_retry_last_us = 0;
 // as long as it took. SLOW_DRAIN_MAX keeps the worst case bounded while still
 // being 16x what a single chunk moved.
 #define SLOW_DRAIN_MAX_CHUNKS 16            // <= 64 KB inside one open
+
+/* ⛔ BYTES DO NOT BOUND TIME, AND THAT IS WHY THE CHUNK CAP ABOVE DID NOT
+ * HELP. The worst hold measured on the bench - 3,319 ms - moved 25 KB, well
+ * inside the 64 KB this allows, and the comment at the top of this file
+ * records 8,942 ms to write ONE byte. A cap counted in bytes cannot bound a
+ * stall whose cost is the card's, not the payload's.
+ *
+ * The web stream is PAUSED for the whole of this write (webserver_ws_set_
+ * paused below), so the hold is a gap in the operator's audio. Measured over
+ * 466 writes: median 213 ms, p90 464, p99 942, max 3,319. The median is
+ * inaudible behind rx_audio.c's 3 s ring; the tail is what gets heard, and
+ * what a browser can mistake for a dead socket and reconnect.
+ *
+ * 400 ms, and the arithmetic matters because too SMALL a budget is its own
+ * bug - the drain would stop keeping up and the backlog would grow forever:
+ *
+ *   - the log produces ~6 KB per 30 s pass (p90 7.8 KB)
+ *   - the card moves a median 28 KB/s, so 400 ms clears ~11 KB
+ *   - that is ~1.4x production at the median, so a healthy unit keeps up
+ *     with room to spare, and a slow spell (p10 13 KB/s = 5 KB) catches up
+ *     on the following passes instead of stalling the audio now
+ *
+ * ⚠ WHAT THIS CANNOT DO: the budget is checked BETWEEN chunks, so a single
+ * fwrite that blocks for seconds is not bounded by it. That case exists (the
+ * 8,942 ms one byte). This caps the multi-chunk backlog drain, which is what
+ * every measured outlier actually was. */
+#define SLOW_DRAIN_MAX_HOLD_MS 400
 static bool mirror_diag_slow(void)
 {
     static char buf[DIAG_CHUNK] SD_IO_ALIGNED;   // see storage/sd_io_buf.h
@@ -850,6 +937,17 @@ static bool mirror_diag_slow(void)
             s_diag_cursor = next;
             s_log_bytes  += got;
             wrote        += got;
+            /* Checked AFTER a chunk has landed, so every pass always makes
+             * progress - a budget tested first could livelock on a card slow
+             * enough that one chunk never fits, and the cursor would never
+             * move. What is left stays for the next pass 30 s later; the
+             * cursor is already advanced per chunk, so it resumes exactly
+             * here with nothing rewritten. */
+            if ((esp_timer_get_time() - diag_pause_t0) / 1000 >= SLOW_DRAIN_MAX_HOLD_MS) {
+                ESP_LOGW(TAG, "diag mirror: hold budget reached after %u B - "
+                              "leaving the rest for the next pass", (unsigned)wrote);
+                break;
+            }
             got = diag_log_read_from(s_diag_cursor, buf, sizeof(buf), &next);
         }
         // One fsync for the whole burst - it is the expensive part, and the
@@ -982,6 +1080,50 @@ static void sd_fail_diag(const char *where, int err)
     /* Recorded for the post-boot give-up, which must apply to ESP_ERR_NO_MEM
      * and nothing else - see the branch that reads it. */
     if (where && strcmp(where, "mount") == 0) s_last_mount_err = (esp_err_t)err;
+
+    /* ⛔ MUST RUN BEFORE THE n++ THROTTLE BELOW, NOT AFTER. maybe_prune_history()
+     * was only ever reached from rotate_diag_log(), which only fires once the
+     * CURRENT log generation crosses 5 MB - a condition about log-file size,
+     * not about the card. A card that is already full (accumulated history
+     * from before this pruning existed, or anything else eating space
+     * mid-generation) fails every write forever: the one thing that frees
+     * space never ran, because it was gated behind the write succeeding.
+     * Gyula HA3HZ, 2026-11-03 (qmx-diag-20261103-1021/1212, msg #182312):
+     * "the SD card was full of files, I had previously formatted the SD
+     * card to fix this" - he had to do by hand what the firmware should
+     * have recovered from itself. Same structural bug the big comment above
+     * rotate_diag_log() already fixed for the OLD 2-generation rotate; the
+     * Nov 2 "nearly indefinite" history replaced that rotate but inherited
+     * the same gate.
+     *
+     * A persistently-full card generates far more than SD_FAIL_DIAG_MAX (8)
+     * failures in a session - every retried write is another one - so if
+     * this sat below the throttle it would prune 8 times and then silently
+     * stop, exactly when recovery needs it most. ENOSPC only: every other
+     * failure here (DMA/heap exhaustion, a pulled card, a desynced SPI bus)
+     * has nothing to do with free space, and esp_vfs_fat_info() inside
+     * maybe_prune_history() is expensive (10 s measured on a 31 GB card) -
+     * paying that on every unrelated failure would make things worse, not
+     * better.
+     *
+     * COOLDOWN, separate from the n++ throttle above: a full card retries
+     * every few seconds (mirror_diag_slow()'s cadence, the burst path's
+     * same-chunk retry), and maybe_prune_history()'s own 10 s cost would
+     * otherwise stack call after call - stalling the SD task, and with it
+     * the WS-pause writers wait on, far worse than the fullness it is
+     * trying to cure. One prune attempt per PRUNE_COOLDOWN_US is still one
+     * file (several MB at 5 MB/generation) freed every cooldown window,
+     * which recovers a chronically full card in minutes, not seconds. */
+    if (err == ENOSPC) {
+        #define SD_PRUNE_COOLDOWN_US (15LL * 1000 * 1000)
+        static int64_t s_last_prune_us = 0;
+        int64_t now = esp_timer_get_time();
+        if (now - s_last_prune_us >= SD_PRUNE_COOLDOWN_US) {
+            s_last_prune_us = now;
+            maybe_prune_history();
+        }
+    }
+
     if (n++ >= SD_FAIL_DIAG_MAX) return;
     sd_space_report_once();
     ESP_LOGW(TAG, "SDFAIL[%s] err=0x%x | INT free=%u lblk=%u | DMA free=%u lblk=%u",
@@ -1087,6 +1229,7 @@ static bool try_mount(void)
              (int)(pre_p - post_p));
 
     ensure_dir(SD_DIR);
+    ensure_dir(SD_HISTORY_DIR);   // rotate_diag_log()'s destination, must exist before it fires
 
     // Open (append) the diag log. s_diag_cursor is NOT reset here: on the
     // first mount of the boot it's still 0, so read_from() (clamping to the

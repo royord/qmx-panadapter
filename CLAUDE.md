@@ -45,6 +45,10 @@ Standing rule:
 
 ## ⛔ FOUR boards share this machine — resolve by BENCH NAME
 
+⛔ **On `main` the bench is `bench1`, always.** bench2 is dedicated to
+`feat/cw-page` and carries that branch's firmware. Read `tools/bench.json` for
+the assignment - never a sentence in the prompt (got this wrong 2026-10-28).
+
 Use `bench flash <name>`, `bench capture <name>`, `bench antenna <name>`. See [bench setup](memory/project_bench_setup.md) for the registry and MAC addresses. All four boards enumerate as `VID_303A&PID_1001` with no serial number—the COM port follows the socket, not the board.
 
 ## Standing patches (MUST be applied before build)
@@ -58,10 +62,51 @@ Get-ChildItem tools/patches/apply_*.ps1 | ForEach-Object { powershell -File $_.F
 python tools/check_patches.py     # the authority - refuses the build if any is missing
 ```
 
+## ⛔ A release is not published until the OTA asset answers 200
+
+```powershell
+python tools/check_release_assets.py vX.Y.Z   # exits non-zero if OTA cannot reach it
+```
+
+The device builds its download URL by hand (`main/net/update_check.c`) and never
+reads the release's asset list, so an upload under any other name is a 404 — and
+a 404 is `esp_https_ota_begin()` → `ESP_FAIL` → **"could not reach the download
+(0xffffffff)"** on every Tab5 in the field.
+
+⛔ **The written warning has failed twice**: v1.12.4 (2026-09-10) and again
+**v1.20.4 (2026-10-22)**, which shipped with no `qmx_panadapter.bin` *and* with
+the merged binary the process explicitly forbids. Both times a user found it,
+not us. Run the checker; do not re-read the prose. See
+[release process](../../../memory/release_process.md) Phase 3.4 and
+[the v1.20.4 fault](../../../memory/project_v1204_ota_asset_was_never_uploaded.md).
+
+⭐ To repair a published release, **ADD the asset — never re-cut.** Then verify
+the served bytes with `cmp`, not the upload's exit code.
+
+## ⛔ Every transmit path must pass the band guard
+
+`python tools/check_tx_guard.py` — **it refuses the build if anything can put RF
+out without checking the band**, and it runs PRE_BUILD. Today: 6 keying sites,
+1 exempt (with its reason written in the script, not in prose).
+
+Out-of-band transmission is **his licence**, not a cosmetic defect: *"TX'ing out
+of band no matter what mode is a legal thing that potentially can fall back on
+my shoulders if not prohibited by my device"* (2026-10-21). RX is unrestricted;
+TX is not. See [the guard](../../../memory/project_t48_tx_band_guard.md).
+
+⚠ The guard needs the **IARU region** — set, or from the grid the GPS writes.
+An unknown region REFUSES, exactly as a missing callsign or grid already does.
+
+⛔ Never add a keying site without `tx_band_guard_allows()`, and never silence
+the checker by adding to EXEMPT without writing why.
+
 ## ⛔ What can key the radio is a FILE, not a memory
 
 `python tools/check_unattended_tx.py` is the authority over
-`docs/unattended-tx-inventory.md` — 11 arming sites, **6 unattended**. Run it
+`docs/unattended-tx-inventory.md` — **run it for the number**. This line said
+11 arming sites while the checker and the inventory both said 12 (corrected
+2026-10-17); a count in prose cannot keep up, the same rot the patches section
+above records. Today: 13 sites, **6 unattended** (12 -> 13 at v1.20.2, where `docs/unattended-tx-inventory.md` last changed - NOT at v1.21.0, as this line claimed; the prose has now been stale three times, which is why the checker is the authority). Run it
 every release; if the table changed, say so in the notes. ⛔ Never call a
 capability "not completed" or "not yet": say implemented or not, then proven or
 not — [why](../../../memory/feedback_the_operator_must_never_learn_his_own_release_from_a_user.md).
@@ -87,6 +132,41 @@ See [patches detail](memory/project_standing_patches.md).
 3. A stale file + process still running = dead capture (check content, not timestamps)
 4. `bench standdown <name>` stops capture + clears watchdog
 
+## "todo-table" — he asks for it by name, show exactly this
+
+Re-read `TODO.md` first (newest work queue at the top) and reconcile against the
+repo. It is a fresh table every time, never a replay of the last one.
+
+⛔ **RECONCILE MEANS GREP THE CODE, not read the row.** This applies to ANY
+answer about what is open, not only to a table he asked for by name. ⚠
+2026-10-28: I offered E17.2 as open work and he picked it; it had shipped nine
+days earlier as T06 (`ad34fc05`) and the row cited a `NULL` that is not in the
+file. Ten rows in that file were stale the same day, in both directions —
+"not flashed" for commits already on bench dev, and "owed" for promises
+already discharged. **A row that names a `file:line` is a claim to check.**
+And clear the row in the SAME change as the work, never later.
+
+⛔ **Only work that is NOT IMPLEMENTED.** Leave out anything whose remaining
+work is verifying, flashing or looking at something already built — he does not
+want the unverified list here. An unexplained symptom with no known cause IS new
+work and stays in.
+
+⛔ **Every row carries its `Tnn` ID** from the ID INDEX in `TODO.md` — that is
+how he refers to them. IDs are permanent: never renumber, never reuse, never
+close a gap. A new item takes the next free number and is added to the index in
+the same change.
+
+Grouped by **implementation effort**, in this order, columns `ID | Item | Who | Note`:
+
+1. **Minutes** — writing, or one question to a user
+2. **Small** — the mechanism already exists
+3. **Moderate** — a day; name what it is blocked on, usually a decision of his
+4. **Large** — multi-day or architectural
+5. **Investigation** — cause unknown
+
+Close with the two to take first and why. Name the reporter in `Who`; a row
+nobody asked for says `—`.
+
 ## Project documentation
 
 Detailed sections moved to memory for session speed:
@@ -101,6 +181,39 @@ Detailed sections moved to memory for session speed:
 - [FT8/FT4 features](../../../memory/project_ft8_features.md)
 - [Release process](../../../memory/project_release_process.md)
 - [Internal RAM audit](../../../memory/project_internal_ram_bss_audit.md) — where the 445 KB goes, what may and may NOT move to PSRAM
+
+## CW page is ON MAIN, and `cw_page_en` defaults ON from v1.24.0
+
+Merged 2026-11-02 (fast-forward, 104 commits). `feat/cw-page` is gone; do
+not recreate it - CW work is ordinary main work from here.
+
+⭐ **It ships ON as v1.24.0's own beta** (operator, 2026-11-03: "I want it
+turned on NOW and it just carries the beta status" - re-cut same version,
+see memory for the full exchange). The gate is still firmware, same four
+surfaces as before, just flipped: the drawer shows `MODE: CW`, `set_screen
+"cw"` works, boot restore honours a saved CW page, `ui_set_base_mode()`
+allows it. Turn it OFF with `{"action":"cw_enable","on":false}` or
+`cw_page_enabled = no` in a config file. The no-abort gap (`KY` cannot be
+cancelled - see memory/project_cw_ky_abort_rx_does_not_work.md) is why it is
+still "beta" everywhere it's documented, not why it is off.
+
+⚠ **Why it stays dark: `KY` has no abort.** The CAT manual documents none in
+TS480-compat-OFF mode, so a sent message runs to the end of the radio's
+80-character buffer. That is the open hardware question, and the gate comes
+off when it is answered - not before.
+
+⭐ **CW TRANSMIT WORKS - CAT `KY` KEYS THE RADIO**, confirmed off air by the
+operator 2026-09-30: *"the cw is keyed clearly on the antenna - i have tried
+it and it works"*. ⛔ Two bench evenings in August concluded the opposite on
+the strength of no sidetone and no LCD `M` - **practice mode suppresses both
+for message sending**, so the evidence for "it does not key" was two
+instruments that were switched off. Do not reinstate an "unverified" caveat.
+Generalise it: a negative result needs its instruments proved alive just as
+much as a positive one.
+
+`TB`'s t-field is the honest counter for what the radio is sending, and
+`KY;` GET readings depend on buffer state - baseline only after a QMX power
+cycle. Full history in `docs/cw-page-design.md`.
 
 See MEMORY.md index for complete topic list.
 

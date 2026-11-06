@@ -65,6 +65,9 @@ char *config_io_export(size_t *out_len)
     APP("wifi_enabled       = %s\n", yn(c.wifi_enabled));
     APP("cw_pitch_hz        = %u\n", (unsigned)c.cw_pitch_hz);
     APP("if_cal_hz          = %d\n", (int)c.cw_cal_hz);
+    APP("sb_lowcut_hz       = %u\n", (unsigned)c.sb_lowcut_hz);
+    APP("ft4_freq_hz        = %u\n", (unsigned)c.ft4_freq_hz);
+    APP("js8_freq_hz        = %u\n", (unsigned)c.js8_freq_hz);
     APP("iq_balance         = %s\n", yn(c.iq_enabled));
     APP("flat_spectrum      = %s\n", yn(c.flat_mode));
     APP("still_spectrum     = %s\n", yn(c.still_view));
@@ -73,6 +76,7 @@ char *config_io_export(size_t *out_len)
     APP("spot_map           = %s\n", yn(c.spotmap_en));
     APP("spots_sota         = %s\n", yn(c.sota_en));
     APP("wspr_enabled       = %s\n", yn(c.wspr_en));   /* the WSPR page master switch - default off */
+    APP("cw_page_enabled    = %s\n", yn(c.cw_page_en)); /* the CW page master switch - default OFF, see settings.h */
     APP("zoom               = %.2f\n", (double)c.zoom_factor);
     APP("colormap           = %u\n", (unsigned)c.colormap_idx);
     APP("brightness         = %u\n", (unsigned)c.brightness_pct);
@@ -111,6 +115,7 @@ char *config_io_export(size_t *out_len)
     APP("psk_rx_en          = %d\n", c.psk_rx_en ? 1 : 0);       // propagation feedback (who hears me)
     APP("bt_mouse_en        = %d\n", c.bt_mouse_en ? 1 : 0);     // BLE mouse
     APP("cluster_en         = %d\n", c.cluster_en ? 1 : 0);      // DX cluster feed (phone spots)
+    APP("binaural_en        = %d\n", c.binaural_en ? 1 : 0);     // panoramic CW split
     APP("rx_audio_vol       = %u\n", (unsigned)c.rx_audio_vol);
     APP("charge_limit       = %s\n", yn(c.charge_limit_en));
     APP("charge_limit_pct   = %u\n", (unsigned)c.charge_limit_pct);
@@ -118,6 +123,7 @@ char *config_io_export(size_t *out_len)
     APP("relay_pin          = %u\n", (unsigned)c.gpio_relay_pin);
     APP("relay_active_high  = %s\n", yn(c.gpio_relay_level));
     APP("relay_ms           = %u\n", (unsigned)c.gpio_relay_ms);
+    APP("relay_solo_pin     = %s\n", yn(c.gpio_relay_solo));
     /* Strings, not the raw enum: a backup file is read by hand as often as by
        this importer, and "relay"/"unit_gps" says which cable is plugged in
        where 1 would not. Written AFTER the relay triplet so the file reads in
@@ -166,6 +172,8 @@ char *config_io_export(size_t *out_len)
     APP("rit_pill           = %s\n", yn(c.rit_pill_show));
     APP("spur_mode          = %u\n", (unsigned)c.spur_mode);   // 0=off 1=subtract 2=interpolate
     APP("cw_decode          = %s\n", yn(c.cw_decode_en));
+    APP("cw_decode_rows     = %u\n", (unsigned)c.cw_decode_rows);
+    APP("log_view_all       = %s\n", yn(c.log_view_all));
     APP("spots_mode_filter  = %s\n", yn(c.spots_mode_filter));
     APP("drawer_expert      = %s\n", yn(c.drawer_expert));
     APP("distance_in_miles  = %s\n", yn(c.distance_in_miles));
@@ -220,6 +228,11 @@ char *config_io_export(size_t *out_len)
     APP("hound_mode = %u\n", (unsigned)c.hound_mode);     // 0 off, 1 guided, 2 auto
     APP("listen_every = %u\n", (unsigned)c.cq_listen_every);  // 0 = never pause to listen
 
+    APP("\n[cw]\n");
+    APP("# keyer memories 1-6; {MYCALL}, {PARK} and {CALL} expand at send time\n");
+    for (int i = 0; i < 6; i++) APP("%d = %s\n", i + 1, c.cw_msg[i]);
+    APP("park = %s\n", c.cw_park);
+
     APP("\n[ft8_filters]\n");
     APP("include1_on = %s\n", yn(c.ft8_filters.incl_en[0]));
     APP("include1    = %s\n", c.ft8_filters.incl_text[0]);
@@ -233,6 +246,8 @@ char *config_io_export(size_t *out_len)
     APP("exclude_plain_cq      = %s\n", yn(c.ft8_filters.excl_plain_cq));
     APP("only_cq               = %s\n", yn(c.ft8_filters.incl_cq_only));
     APP("cq_show_others        = %s\n", yn(c.ft8_filters.cq_show_others));
+    APP("hide_worked_before    = %s\n", yn(c.ft8_filters.hide_worked_before));
+    APP("robot_skip_directed_cq = %s\n", yn(c.ft8_filters.robot_skip_directed_cq));
 
     /* ⭐ THE POWER CALIBRATION - the reason this whole audit happened.
      *
@@ -324,7 +339,7 @@ static bool to_bool(const char *v)
            strcasecmp(v, "yes") == 0  || strcasecmp(v, "on") == 0;
 }
 
-typedef enum { SEC_NONE, SEC_SETTINGS, SEC_CQ, SEC_FILTERS, SEC_MEM, SEC_WIFI_KNOWN,
+typedef enum { SEC_NONE, SEC_SETTINGS, SEC_CQ, SEC_CW, SEC_FILTERS, SEC_MEM, SEC_WIFI_KNOWN,
                SEC_PWR_CAL, SEC_PWR_TARGET } section_t;
 
 int config_io_import(char *text)
@@ -389,6 +404,7 @@ int config_io_import(char *text)
             char *name = trim(p + 1);
             if      (strcasecmp(name, "settings") == 0)    sec = SEC_SETTINGS;
             else if (strcasecmp(name, "cq") == 0)          sec = SEC_CQ;
+            else if (strcasecmp(name, "cw") == 0)          sec = SEC_CW;
             else if (strcasecmp(name, "ft8_filters") == 0) sec = SEC_FILTERS;
             else if (strcasecmp(name, "memories") == 0)    sec = SEC_MEM;
             else if (strcasecmp(name, "wifi_known") == 0)  sec = SEC_WIFI_KNOWN;
@@ -418,6 +434,9 @@ int config_io_import(char *text)
             else if (!strcasecmp(key, "wifi_dns"))  { snprintf(sdns,  sizeof sdns,  "%s", val); sip_touched = true; }
             else if (!strcasecmp(key, "cw_pitch_hz"))       settings_set_cw_pitch_hz((uint16_t)atoi(val));
             else if (!strcasecmp(key, "if_cal_hz"))         settings_set_cw_cal_hz((int16_t)atoi(val));
+            else if (!strcasecmp(key, "sb_lowcut_hz"))      settings_set_sb_lowcut_hz((uint16_t)atoi(val));
+            else if (!strcasecmp(key, "ft4_freq_hz"))       settings_set_ftx_freq_hz(1, (uint32_t)strtoul(val, NULL, 10));
+            else if (!strcasecmp(key, "js8_freq_hz"))       settings_set_ftx_freq_hz(2, (uint32_t)strtoul(val, NULL, 10));
             else if (!strcasecmp(key, "iq_balance"))        settings_set_iq_enabled(to_bool(val));
             else if (!strcasecmp(key, "flat_spectrum"))     settings_set_flat_mode(to_bool(val));
             else if (!strcasecmp(key, "still_spectrum"))    { settings_set_still_view(to_bool(val));
@@ -427,6 +446,7 @@ int config_io_import(char *text)
             else if (!strcasecmp(key, "spot_map"))          settings_set_spotmap_en(to_bool(val));
             else if (!strcasecmp(key, "spots_sota"))        settings_set_sota_en(to_bool(val));
             else if (!strcasecmp(key, "wspr_enabled"))      settings_set_wspr_en(to_bool(val));
+            else if (!strcasecmp(key, "cw_page_enabled"))  settings_set_cw_page_en(to_bool(val));
             /* ⛔ DEAD KEY, kept only so an old config file still imports without
                a surprise. The quiet auto-download was removed in v1.14.4 and
                settings_set_ota_autodl() now changes nothing that runs. It has
@@ -464,6 +484,7 @@ int config_io_import(char *text)
             else if (!strcasecmp(key, "psk_rx_en"))         settings_set_psk_rx_en(atoi(val) != 0);
             else if (!strcasecmp(key, "bt_mouse_en"))       settings_set_bt_mouse_en(atoi(val) != 0);
             else if (!strcasecmp(key, "cluster_en"))        settings_set_cluster_en(atoi(val) != 0);
+            else if (!strcasecmp(key, "binaural_en"))       settings_set_binaural_en(atoi(val) != 0);
             else if (!strcasecmp(key, "rx_audio_vol"))      settings_set_rx_audio_vol((uint8_t)atoi(val));
             else if (!strcasecmp(key, "charge_limit"))      settings_set_charge_limit_en(to_bool(val));
             else if (!strcasecmp(key, "charge_limit_pct"))  settings_set_charge_limit_pct((uint8_t)atoi(val));
@@ -482,6 +503,12 @@ int config_io_import(char *text)
                 else if (!strcasecmp(key, "relay_active_high")) rl  = to_bool(val);
                 else                                            rms = (uint16_t)atoi(val);
                 settings_set_gpio_relay(rp, rl, rms);
+            }
+            /* Its own key, not part of the trio above: it has its own setter
+             * because applying it re-CONFIGURES the pads rather than just
+             * re-levelling them. */
+            else if (!strcasecmp(key, "relay_solo_pin")) {
+                settings_set_gpio_relay_solo(to_bool(val));
             }
             else if (!strcasecmp(key, "port_a_mode")) {
                 port_mode    = port_a_mode_parse(val);
@@ -522,6 +549,8 @@ int config_io_import(char *text)
             else if (!strcasecmp(key, "rit_pill"))          settings_set_rit_pill_show(to_bool(val));
             else if (!strcasecmp(key, "spur_mode"))         settings_set_spur_mode((uint8_t)atoi(val));
             else if (!strcasecmp(key, "cw_decode"))         settings_set_cw_decode_en(to_bool(val));
+            else if (!strcasecmp(key, "cw_decode_rows"))    settings_set_cw_decode_rows((uint8_t)atoi(val));
+            else if (!strcasecmp(key, "log_view_all"))      settings_set_log_view_all(to_bool(val));
             else if (!strcasecmp(key, "spots_mode_filter")) settings_set_spots_mode_filter(to_bool(val));
             else if (!strcasecmp(key, "drawer_expert"))     settings_set_drawer_expert(to_bool(val));
             else if (!strcasecmp(key, "distance_in_miles")) settings_set_distance_in_miles(to_bool(val));
@@ -554,6 +583,15 @@ int config_io_import(char *text)
             applied++;
             break;
 
+        case SEC_CW:
+            if (!strcasecmp(key, "park")) {
+                settings_set_cw_park(val); applied++;
+            } else {
+                int idx = atoi(key) - 1;        // "1".."6"
+                if (idx >= 0 && idx <= 5) { settings_set_cw_msg((uint8_t)idx, val); applied++; }
+            }
+            break;
+
         case SEC_CQ:
             if (!strcasecmp(key, "active")) {
                 int s = atoi(val) - 1;          // file is 1-based
@@ -584,6 +622,8 @@ int config_io_import(char *text)
             else if (!strcasecmp(key, "exclude_plain_cq"))      { filt.excl_plain_cq = b; filt_touched = true; }
             else if (!strcasecmp(key, "only_cq"))               { filt.incl_cq_only = b; filt_touched = true; }
             else if (!strcasecmp(key, "cq_show_others"))        { filt.cq_show_others = b; filt_touched = true; }
+            else if (!strcasecmp(key, "hide_worked_before"))    { filt.hide_worked_before = b; filt_touched = true; }
+            else if (!strcasecmp(key, "robot_skip_directed_cq")) { filt.robot_skip_directed_cq = b; filt_touched = true; }
             else if (!strcasecmp(key, "include1")) { strncpy(filt.incl_text[0], val, FT8_FILTER_TEXT_LEN - 1); filt.incl_text[0][FT8_FILTER_TEXT_LEN-1]='\0'; filt_touched = true; }
             else if (!strcasecmp(key, "include2")) { strncpy(filt.incl_text[1], val, FT8_FILTER_TEXT_LEN - 1); filt.incl_text[1][FT8_FILTER_TEXT_LEN-1]='\0'; filt_touched = true; }
             else if (!strcasecmp(key, "exclude1")) { strncpy(filt.excl_text[0], val, FT8_FILTER_TEXT_LEN - 1); filt.excl_text[0][FT8_FILTER_TEXT_LEN-1]='\0'; filt_touched = true; }

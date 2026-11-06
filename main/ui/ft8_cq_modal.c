@@ -10,6 +10,7 @@
 #include "ft8_screen_view.h"
 #include "ft8_msg_guard.h"
 #include "settings.h"
+#include "activation_modal.h"   /* activation_is_running - see forced_cq_modifier */
 #include "lvgl.h"
 #include "esp_log.h"
 #include <string.h>
@@ -98,32 +99,94 @@ static bool token_has_digit(const char *tok)
     return false;
 }
 
-// Core Field Day tagging logic, shared between the real TX path
-// (ft8_cq_get_active_text, reading the saved preset) and the editor's live
-// preview (reading whatever is currently typed, unsaved) - one function, so
-// the preview can never drift out of sync with what actually gets sent.
+/* THE CQ MODIFIER THE OPERATION IMPLIES, NOT JUST FIELD DAY.
+ *
+ * Bruce N9JCV, 2026-10-23, after a real activation: "Is it possible in this
+ * display of the transmitting message to include the word POTA? I know I
+ * activated but the message does not reflect it is calling CQ POTA." He had
+ * started an activation and his CQ still went out plain, so nobody hunting
+ * parks knew he was in one.
+ *
+ * He was told he should have long-pressed the CQ button and typed it. That is
+ * true, and it is beside the point, because THIS FUNCTION ALREADY DOES
+ * EXACTLY THAT FOR FIELD DAY: switch FD on and every CQ goes out as "CQ FD"
+ * without being asked. An activation had the same claim on the message and
+ * was not using the mechanism sitting next to it. An omission, not something
+ * an operator should have to know about.
+ *
+ * ONE MODIFIER, AND FD OUTRANKS AN ACTIVATION. FT8's CQ format has room for
+ * one token, so they cannot stack. Field Day wins because it is declared for a
+ * whole operation and is a contest exchange; an activation is a session inside
+ * which FD may still be running. Anything the preset carries (DX, a region) is
+ * replaced by either.
+ *
+ * It follows the LIVE activation, so it appears the moment one starts and goes
+ * when it stops. The operator never edits a preset for it and never has to
+ * remember to put it back.
+ */
+static const char *forced_cq_modifier(bool field_day_en)
+{
+    if (field_day_en) return "FD";
+    if (activation_is_running()) {
+        /* ⛔ THE PROGRAMME'S OWN NAME, from the activation table.
+         *
+         * This read `(type == 2) ? "SOTA" : "POTA"`, written when POTA and
+         * SOTA were the only two. v1.22.0 added five more and did not sweep
+         * this site, so a WWFF, IOTA, GMA, WCA or WWBOTA activation called
+         * "CQ POTA" - wrong information on the air, not a cosmetic slip.
+         * Found 2026-10-28 while fixing the CQ button label.
+         *
+         * ⚠ THE LIMIT IS THE PROTOCOL, NOT A GUESS. The FT4/FT8 QEX paper
+         * (Franke K9AN, Somerville G4WJS, Taylor K1JT) states that a CQ may be
+         * followed by three decimal digits OR ONE TO FOUR LETTERS. WWFF, IOTA,
+         * GMA and WCA fit. WWBOTA is six and cannot be encoded at all.
+         *
+         * ⛔ WWBOTA FALLS BACK TO A PLAIN CQ, and "BOTA" was rejected
+         * deliberately. Checked 2026-10-29: wwbota.net tells activators to
+         * call "CQ Bunkers on the Air" - a voice phrase, with no FT8 token
+         * given - and "BOTA" is already Beaches on the Air, so it would name
+         * the wrong programme. A plain CQ tells hunters nothing; a wrong token
+         * tells them something untrue.
+         *
+         * ⚠ WHAT IS SOURCED AND WHAT IS NOT. POTA and SOTA are everyday
+         * practice. WWFF is the programme's own rule - WWFF Global Rules v5.10
+         * encourages "CQ WWFF" (CQ 44 and CQ FF are also in use). For IOTA,
+         * GMA and WCA I found NO documented FT8 convention; the search was
+         * bounded and that is not evidence that none exists. The programme's
+         * own name is the default for them because it is at worst an
+         * unrecognised token and never a FALSE one, which is what the bug
+         * above actually was. */
+        const char *sig = settings_activation_sig_name();
+        if (sig && sig[0] && strlen(sig) <= 4) return sig;
+        return NULL;
+    }
+    return NULL;
+}
+
+// Shared between the real TX path (ft8_cq_get_active_text, reading the saved
+// preset) and the editor's live preview (reading whatever is currently typed,
+// unsaved) - one function, so the preview can never drift out of sync with
+// what actually gets sent.
 static void apply_fd_tag(const char *base, char *out, size_t len, bool field_day_en)
 {
     // Not a "CQ" message (or "CQ" isn't a standalone token) - nothing to tag.
-    bool is_cq = (strncmp(base, "CQ", 2) == 0) && (base[2] == ' ' || base[2] == '\0');
-    if (!field_day_en || !is_cq) {
+    bool is_cq = (strncmp(base, "CQ", 2) == 0) && (base[2] == ' ' || base[2] == 0);
+    const char *mod = forced_cq_modifier(field_day_en);
+    if (!mod || !is_cq) {
         snprintf(out, len, "%s", base);
         return;
     }
 
-    // Field Day mode: force the standard "CQ FD ..." modifier (same
-    // mechanism as "CQ POTA"/"CQ SOTA"), REPLACING any other modifier the
-    // preset carries (DX/POTA/SOTA/...) - FD signalling takes priority for
-    // the whole-operation duration FD mode is on, and FT8's CQ format only
-    // has room for one modifier token.
+    // Force the standard modifier, REPLACING any other the preset carries
+    // (DX/POTA/SOTA/...) - FT8's CQ format only has room for one token.
     const char *rest = base + 2;
     while (*rest == ' ') rest++;
     if (*rest && !token_has_digit(rest)) {
         while (*rest && *rest != ' ') rest++;  // skip the existing modifier token
         while (*rest == ' ') rest++;
     }
-    if (*rest) snprintf(out, len, "CQ FD %s", rest);
-    else       snprintf(out, len, "CQ FD");
+    if (*rest) snprintf(out, len, "CQ %s %s", mod, rest);
+    else       snprintf(out, len, "CQ %s", mod);
 }
 
 void ft8_cq_get_active_text(char *out, size_t len)
@@ -519,18 +582,6 @@ static void modal_build(void)
     ui_kbd_set_buttons(s_save_btn, cancel_btn);
 
     s_keyboard = lv_keyboard_create(s_modal);
-    static lv_style_t style_kb_btn;
-    static bool kb_btn_style_inited = false;
-    if (!kb_btn_style_inited) {
-        lv_style_init(&style_kb_btn);
-        lv_style_set_bg_color(&style_kb_btn, lv_color_hex(UI_COLOR_KEY_BG));
-        lv_style_set_bg_opa(&style_kb_btn, LV_OPA_COVER);
-        lv_style_set_text_color(&style_kb_btn, lv_color_white());
-        lv_style_set_border_width(&style_kb_btn, 1);
-        lv_style_set_border_color(&style_kb_btn, lv_color_hex(0x505050));
-        kb_btn_style_inited = true;
-    }
-    lv_obj_add_style(s_keyboard, &style_kb_btn, LV_PART_ITEMS);
     ui_theme_style_keyboard(s_keyboard);
     lv_obj_set_size(s_keyboard, LV_PCT(100), 280);
     lv_obj_align(s_keyboard, LV_ALIGN_BOTTOM_MID, 0, 0);

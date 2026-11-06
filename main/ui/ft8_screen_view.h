@@ -2,6 +2,30 @@
 #include "lvgl.h"
 #include "ft8_test.h"   // ft8_op_mode_t - the sub-mode these take and return
 
+// Orange accent used for everything FT4: the dropdown's FT4 column header,
+// the "MODE: FT4" label, and the left drawer's MODE: FT4 button - so they can
+// never drift apart. FT8 keeps the gold UI_COLOR_ACCENT_GOLD.
+//
+// WAS CYAN 0x00B4FF UNTIL 2026-10-28, and the clash was real. The CW page
+// took its place in the left drawer that day, one row above FT4, and its
+// accent is UI_COLOR_MODE_CW 0x2477B3. Two blues, adjacent; the operator saw
+// it immediately.
+//
+// CW's blue is NOT the one free to move. ui_theme.h binds it to the band-plan
+// strip's CW segment so that the same mode reads as the same colour in the
+// freq keypad, the memory grid, the spots lane and the strip. FT4 has no
+// band-plan analogue - it draws as DiGi there - so FT4's accent is local to
+// FT4 and is the one that can change.
+//
+// Orange rather than another yellow, so FT4 stays in the FT8 family (his
+// word) while sitting far enough off FT8's own gold to be told apart: hue
+// 25 deg against gold's 51 deg, both at full saturation and brightness.
+#define FT4_ACCENT_HEX 0xFF6A00
+// Magenta for JS8. Picked to be unmistakable against both gold and orange at a
+// glance across the room - the mode label is the only thing on the screen that
+// says which protocol is about to be transmitted.
+#define JS8_ACCENT_HEX 0xE040FB
+
 // Step 4c.2 v0.10: FT8 screen LVGL view.
 //
 // Owns the middle-band container shown when ui_mode == UI_MODE_FT8.
@@ -68,6 +92,19 @@ void ft8_screen_view_freetext_result(char *out, size_t out_len);
  * row click selects and transmits nothing - see js8_target.h. */
 void ft8_screen_view_request_js8_macro(int which);
 
+/* The macro sheet from the browser. Records the directive; the 1 Hz LVGL
+ * timer sends it, because arming must not happen on the HTTP task. The word
+ * is the one js8_cmd_text() spells - "GRID?", "HW CPY?" - plus "RR73". What
+ * became of it lands in /api/status with the other web results. */
+void ft8_screen_view_request_js8_directive(const char *cmd_text);
+
+/* The macro SHEET's sends - any directive js8_cmd_from_text() accepts, plus
+ * "RR73". Composes "<them> <us> <cmd>", builds a one-frame request through
+ * the round-trip guard and arms it. Returns false with the refusal in *out,
+ * which is the text both the toast and the browser show. Must be called on
+ * the LVGL task: it arms. */
+bool ft8_screen_view_js8_directive(const char *cmd_text, char *out, size_t out_len);
+
 // CQ slot parity: -1 = any, 0 = EVEN only, 1 = ODD only. The Tab5's cycling
 // TXCQ button and the web page drive the SAME state - set is deferred to the
 // LVGL task, get is a plain read.
@@ -80,6 +117,24 @@ int  ft8_screen_view_get_cq_parity(void);
 // (mid-exchange). The outcome lands in ft8_screen_view_get_web_reply_result(),
 // surfaced through /api/status - a Tab5 toast is invisible from another room.
 void ft8_screen_view_request_reply(const char *call);
+
+/* The same pick, but allowed to ABANDON an exchange already running in order
+ * to take this station instead (Randy N4OPI, 2026-10-21: "enable the ability
+ * to double click a different CQ caller of your choice which would abandon the
+ * one you have determined to be inappropriate or a lost cause and pick someone
+ * specific without exiting the Auto-answer mode. I can already pick a specific
+ * station to respond to in Auto-answer mode, but not if I am already in an
+ * exchange.").
+ *
+ * ⛔ A SEPARATE ENTRY POINT, not a flag on the ordinary pick, because the
+ * ordinary pick MUST keep refusing: starting a second exchange over a live one
+ * is what ft8_qso_start()'s own guard exists to prevent, and a single stray
+ * click should never cost a contact in progress. The browser sends this only
+ * on a DOUBLE click, which is Randy's own suggestion and the right one - it
+ * makes abandoning an exchange deliberate.
+ *
+ * Auto-answer is left running, exactly as the Skip button leaves it. */
+void ft8_screen_view_request_reply_retarget(const char *call);
 
 // Mid-QSO override from the browser (#205): 1=resend 2=RR73 3=73 4=cancel.
 // Deferred to the LVGL task and consumed even when FT8 is not up, so a stale
@@ -125,6 +180,8 @@ void ft8_screen_view_refresh_mode_label(void);
  * so both surfaces run the one code path. */
 void ft8_screen_view_request_js8_flush(void);
 
-/* Which JS8 pane is showing. Reported in /api/status so the capture and the
- * API can say what is on the screen without asking the operator. */
-bool ft8_screen_view_js8_tab_is_conversation(void);
+/* ⛔ ft8_screen_view_js8_tab_is_conversation() WAS HERE and is gone - T14.
+ * It answered "which JS8 pane is showing" for /api/status. All three panes
+ * are up at once now, so the question has no answer and the API reports
+ * "all" literally rather than this returning a constant that reads like a
+ * live reading. */

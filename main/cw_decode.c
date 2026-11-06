@@ -65,15 +65,41 @@ int cw_decode_parse_tb(const char *resp, char *out, size_t out_sz, int *tx_pendi
  * "the line fills with rubbish" actually consisted of. E and T together were
  * only 8%, so the first version of this squelch was filtering the wrong thing.
  *
- * So it is dropped outright rather than held for a run verdict. There is no
- * reading of "the decoder could not tell what that was" that is worth a column,
- * and unlike E or T it can never be real text. */
+ * ⭐ 2026-11-02: IT IS NO LONGER DROPPED OUTRIGHT, and the reason the first
+ * version gave - "there is no reading of 'the decoder could not tell what that
+ * was' that is worth a column" - was wrong about what the column carries. It
+ * carries the GAP. Dropping the symbol silently also dropped the word boundary,
+ * so "CQ*DE*W1AW" reached the screen as "CQDEW1AW": measured on the host probe,
+ * and reported by the operator as "several words get truncated into one long row
+ * of letters". Welding two words into a plausible-looking one is worse than
+ * admitting a character was lost.
+ *
+ * So it now goes through the SAME run verdict as E and T: a short run prints one
+ * '*' (the radio's own notation - what the operator already reads on the QMX
+ * LCD), a long run is still dropped as noise. The 23.6% measured below was
+ * overwhelmingly long runs on a dead band, so collapsing a short run to a single
+ * character does not bring the flood back. */
 static int is_unresolved(char c) { return c == '*'; }
 
 /* E and T are the two SHORTEST Morse symbols - one dit, one dah - so a random
  * threshold crossing lands on them more often than on anything longer. Unlike
  * '*' they ARE real letters, so they are only dropped as part of a long run. */
 static int is_noise_char(char c) { return c == 'E' || c == 'T'; }
+
+/* Copies pend verbatim into out (not NUL-terminated - callers add whatever
+ * comes after) and clears n_pend/run. Shared by the "a settling character
+ * arrived" path (cw_squelch_push) and the "nothing arrived for a while, the
+ * caller's own clock says release it anyway" path (cw_squelch_flush_stale),
+ * so the two cannot drift into disagreeing about what "released verbatim"
+ * means. */
+static int release_pending(cw_squelch_t *st, char *out, size_t out_sz)
+{
+    size_t n = 0;
+    for (int i = 0; i < st->n_pend && n < out_sz - 1; i++) out[n++] = st->pend[i];
+    st->n_pend = 0;
+    st->run = 0;
+    return (int)n;
+}
 
 int cw_squelch_push(cw_squelch_t *st, char c, char *out, size_t out_sz)
 {
@@ -85,13 +111,13 @@ int cw_squelch_push(cw_squelch_t *st, char c, char *out, size_t out_sz)
     /* Unresolved symbols never reach the screen. They also COUNT toward the run,
      * so "T*T*E*T" is recognised as one stretch of the decoder struggling
      * rather than as text interrupted by noise. */
-    if (is_unresolved(c)) {
-        st->run++;
-        return 0;
-    }
-
-    if (c == ' ' || is_noise_char(c)) {
-        if (is_noise_char(c)) st->run++;
+    /* '*' is HELD, exactly like a space or an E/T, rather than thrown away at
+     * the door. Holding it is what keeps its POSITION: the first version of
+     * this fix appended one '*' after the pending buffer had been released, so
+     * it landed against the settling character - "CQ  *DE" instead of the
+     * radio's "CQ * DE". Pending it needs no position bookkeeping at all. */
+    if (is_unresolved(c) || c == ' ' || is_noise_char(c)) {
+        if (is_unresolved(c) || is_noise_char(c)) st->run++;
         if (st->n_pend < CW_SQUELCH_HOLD) st->pend[st->n_pend++] = c;
         return 0;
     }
@@ -100,7 +126,14 @@ int cw_squelch_push(cw_squelch_t *st, char c, char *out, size_t out_sz)
     size_t n = 0;
     if (st->run < CW_SQUELCH_RUN) {
         // Short run - this was real text with some E/T in it. Release it.
-        for (int i = 0; i < st->n_pend && n < out_sz - 1; i++) out[n++] = st->pend[i];
+        /* Released verbatim, '*' included and in the place it arrived - which
+         * is what makes the Tab5 and the web read the same as the radio's own
+         * LCD. CW_SQUELCH_RUN bounds it: at most 4 consecutive unresolved
+         * symbols can ever reach the screen, because the 5th calls the run
+         * noise and the branch below drops the lot. That is the bound which
+         * keeps the measured 23.6% off the screen while still admitting that a
+         * character was lost. */
+        n = (size_t)release_pending(st, out, out_sz);
     } else {
         // A long run was the decoder chewing on noise, so it goes. But if the
         // operator stopped sending, the noise ran, and then sending resumed,
@@ -110,13 +143,46 @@ int cw_squelch_push(cw_squelch_t *st, char c, char *out, size_t out_sz)
         // just indent the first word.
         int had_space = 0;
         for (int i = 0; i < st->n_pend; i++) if (st->pend[i] == ' ') had_space = 1;
+        st->n_pend = 0;
+        st->run = 0;
         if (had_space && st->emitted && n < out_sz - 1) out[n++] = ' ';
     }
     if (n < out_sz - 1) out[n++] = c;
     out[n] = '\0';
     if (n > 0) st->emitted = 1;
-    st->n_pend = 0;
-    st->run = 0;
+    return (int)n;
+}
+
+/* T141: on a quiet band the squelch can hold a genuinely real trailing E/T
+ * forever, because nothing short of a non-E/T settling character ever
+ * releases it - "CQ TTTTTTTT DE" (measured on the host probe) renders "CQ D",
+ * the final E of "DE" never shown, because the band went quiet right behind
+ * it. cw_squelch_push() cannot fix this itself: it is portable and has no
+ * clock, so a caller with ITS OWN clock calls this once it decides enough
+ * time has passed with nothing new arriving.
+ *
+ * Same run-length verdict as a settling character would have gotten: a short
+ * pending run was real text and is released verbatim (the T141 case); a long
+ * run is still a noise stretch that just never got a letter after it either,
+ * and is dropped with the same single-space-for-a-real-gap rule - staleness
+ * does not make noise stop being noise. PORTABLE; host-tested. */
+int cw_squelch_flush_stale(cw_squelch_t *st, char *out, size_t out_sz)
+{
+    if (!st || !out || out_sz == 0) return 0;
+    if (st->n_pend == 0) { out[0] = '\0'; return 0; }
+
+    size_t n = 0;
+    if (st->run < CW_SQUELCH_RUN) {
+        n = (size_t)release_pending(st, out, out_sz);
+    } else {
+        int had_space = 0;
+        for (int i = 0; i < st->n_pend; i++) if (st->pend[i] == ' ') had_space = 1;
+        st->n_pend = 0;
+        st->run = 0;
+        if (had_space && st->emitted && n < out_sz - 1) out[n++] = ' ';
+    }
+    out[n] = '\0';
+    if (n > 0) st->emitted = 1;
     return (int)n;
 }
 
@@ -142,6 +208,11 @@ int cw_wpm_estimate(int chars, unsigned elapsed_ms)
 #include <time.h>       /* transcript timestamps (#323) */
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+/* snprintf, in sd_transcript_putc(). It compiled on the device only because an
+   IDF header above happens to pull stdio in; built against a host shim the
+   declaration was missing and gcc fell back to the implicit int. Named here
+   rather than relied on from a neighbour. */
+#include <stdio.h>
 
 // A CW QSO's worth of text and then some. PSRAM: nothing here is hot, and
 // internal RAM is the scarce resource on this board.
@@ -156,8 +227,52 @@ int cw_wpm_estimate(int chars, unsigned elapsed_ms)
 #define CW_WPM_MIN_CHARS   12
 
 static cw_squelch_t     s_squelch;
-static char             s_line[CW_GRID_CELLS];  /* the wrapping display grid, CW_LINE_ROWS rows */
+/* T141: last time any character (pending or released) was pushed into the
+ * squelch - cw_decode_flush_stale() is the clock cw_squelch_push() itself
+ * cannot have. */
+static uint32_t         s_squelch_touch_ms;
+#define CW_SQUELCH_STALE_MS 1500u   /* ~1.5 TB; polls (poll runs at ~1 Hz) */
+/* The buffer is always the MAXIMUM, CW_LINE_ROWS rows. Only the part in use is
+ * written, copied and drawn - see s_rows. Sizing it to the current choice
+ * would mean a reallocation on a settings change for no gain; 288 bytes is
+ * not worth that. */
+static char             s_line[CW_GRID_CELLS];
+/* ⭐ WHICH CELLS ARE OUR OWN TRANSMISSION. Sam W7STF (T06): "transmitted morse
+ * in its own colour".
+ *
+ * The radio already tells us. TB's t-field is the number of characters of a KY
+ * send still to go, so a response carrying t > 0 arrived while the QMX was
+ * keying - and what it decoded in that same response is its own sidetone. The
+ * flag was parsed and thrown away: cw_decode_feed() passed NULL for it.
+ *
+ * ⚠ ATTRIBUTION IS APPROXIMATE AT THE SEAM, by one or two characters. The last
+ * characters of a send can land in the response where t has already fallen to
+ * 0, so they read as received. Better than not marking TX at all, and the
+ * alternative - tracking our own KY text and matching it against the decode -
+ * would be a second model that can disagree with the radio. */
+static uint8_t          s_line_tx[CW_GRID_CELLS];
 static int              s_line_col;             /* where the next character lands */
+/* How many of those rows are IN USE. Bryan N0LUF, 2026-10-16: "Maybe an option
+ * to select 2 or 4 lines as well?" - four rows cover about 66 px more of the
+ * waterfall than two, and not everyone wants to spend it.
+ *
+ * ⛔ This is the WRAP MODULUS, not just a draw count. If the text kept
+ * wrapping over four rows while two were drawn, half of every pass would be
+ * decoded into rows nobody can see and the visible half would jump. So it
+ * lives here, with the write position, and not in either screen. */
+static int              s_rows = CW_LINE_ROWS;
+/* ⛔ AND THE COLUMN COUNT IS A WRAP MODULUS TOO, for exactly the reason given
+ * above about the rows. It became runtime on 2026-11-02 because the two screens
+ * that draw this grid are not the same width: the panadapter has the whole
+ * 1280 px and fits 72 columns of qmx_mono_25 (15 px advance), while the CW
+ * page's ticker sits to the right of a 320 px pane and fits 64. Before this
+ * they could not share the grid at all - the CW page kept its own 512-byte
+ * ring and its own squelch instance, which is two models of one stream and the
+ * fault that file's own comment warns about one layer up. */
+static int              s_cols = CW_LINE_COLS;
+
+/* Cells currently in use. Not a macro: s_rows changes at run time. */
+static inline int grid_cells(void) { return s_rows * s_cols; }
 static uint32_t        *s_stamp;
 static int              s_stamp_head, s_stamp_count;
 static char            *s_ring;
@@ -294,41 +409,106 @@ void cw_decode_init(void)
     s_stamp_head = s_stamp_count = 0;
     s_total = 0;
     memset(&s_squelch, 0, sizeof(s_squelch));
+    s_squelch_touch_ms = 0;
     memset(s_line, ' ', sizeof(s_line));
+    memset(s_line_tx, 0, sizeof(s_line_tx));
     s_line_col = 0;
+}
+
+/* The text-level entry: squelch it, then into the ring, the grid, the speed
+ * stamps and the microSD transcript. Split out of cw_decode_feed() on
+ * 2026-11-02 so there is ONE model of the decode stream.
+ *
+ * ⛔ WHY THE SPLIT EXISTS, because it is not tidiness. The CW page used to keep
+ * its OWN 512-byte ring and its OWN squelch instance, fed by
+ * cw_screen_feed_decoded() - two models of one stream, which is the fault that
+ * file's own comment already warned about for the squelch alone. Moving its
+ * renderer onto this grid would have silently broken CW SIMULATION MODE: the
+ * phantom QSOs in cw_qso.c reach the screen through cw_screen_feed_decoded()
+ * and never through cw_decode_feed(), which only takes a raw "TB...;" frame.
+ * So the grid needed a way in for text that never came off the wire.
+ *
+ * is_tx marks the operator's own keying coming back through the radio's
+ * decoder. The simulator passes false: its phantoms are received text, and
+ * painting them in the TX colour would say the operator sent them. */
+
+/* One released character's path into the ring, the wrapping line, the speed
+ * stamps and the microSD transcript - shared by cw_decode_feed_text()'s loop
+ * and cw_decode_flush_stale()'s single release, so the T141 flush path is
+ * the SAME sink rather than a second copy that could drift. Caller holds
+ * s_lock. */
+static void sink_released_char(char c, uint8_t tx, uint32_t now_ms)
+{
+    s_ring[s_head] = c;
+    s_head = (s_head + 1) % CW_RING_CAP;
+    if (s_count < CW_RING_CAP) s_count++;
+    /* ...and into the wrapping line both screens draw from. */
+    s_line[s_line_col]    = c;
+    s_line_tx[s_line_col] = tx;
+    s_line_col = (s_line_col + 1) % grid_cells();
+    // Timestamp every accepted character for the speed estimate. Noise
+    // never reaches here, so it cannot drag the figure around.
+    s_stamp[s_stamp_head] = now_ms;
+    s_stamp_head = (s_stamp_head + 1) % CW_STAMP_CAP;
+    if (s_stamp_count < CW_STAMP_CAP) s_stamp_count++;
+    /* ...and into the microSD transcript (#323). Squelched noise and
+       the radio's '*' never reach here, so the file holds what the
+       screen showed, not the raw stream. */
+    sd_transcript_putc(c);
+}
+
+void cw_decode_feed_text(const char *text, int n, bool is_tx)
+{
+    if (!s_ring || !text || n <= 0) return;
+    const uint8_t tx = is_tx ? 1u : 0u;
+
+    if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_squelch_touch_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    for (int i = 0; i < n; i++) {
+        char rel[CW_SQUELCH_HOLD + 2];
+        int m = cw_squelch_push(&s_squelch, text[i], rel, sizeof(rel));
+        for (int k = 0; k < m; k++) sink_released_char(rel[k], tx, s_squelch_touch_ms);
+        s_total += (unsigned)m;
+    }
+    if (s_lock) xSemaphoreGive(s_lock);
+}
+
+/* T141: called on every IDLE TB; poll (nothing decoded this cycle) - the
+ * ~1 Hz poll cat.c already runs is this module's clock, so no new timer is
+ * needed. If something has sat in the squelch for CW_SQUELCH_STALE_MS with
+ * nothing new arriving to settle it, release it now. is_tx is unknown here
+ * (nothing came off the wire this cycle to carry a t-field), so a flushed
+ * character is marked received - the stale case is specifically a quiet
+ * band, never mid-KY-send. */
+static void cw_decode_flush_stale(void)
+{
+    if (!s_ring) return;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (s_squelch.n_pend > 0 && s_squelch_touch_ms &&
+        (now - s_squelch_touch_ms) >= CW_SQUELCH_STALE_MS) {
+        char rel[CW_SQUELCH_HOLD + 2];
+        int m = cw_squelch_flush_stale(&s_squelch, rel, sizeof(rel));
+        for (int k = 0; k < m; k++) sink_released_char(rel[k], 0, now);
+        s_total += (unsigned)m;
+        s_squelch_touch_ms = now;   // don't re-fire every idle poll after this
+    }
+    if (s_lock) xSemaphoreGive(s_lock);
 }
 
 void cw_decode_feed(const char *resp)
 {
     if (!s_ring) return;
     char chunk[CW_DECODE_MAX_CHUNK + 1];
-    int n = cw_decode_parse_tb(resp, chunk, sizeof(chunk), NULL);
-    if (n <= 0) return;   // malformed, or simply nothing decoded this poll
-
-    if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
-    for (int i = 0; i < n; i++) {
-        char rel[CW_SQUELCH_HOLD + 2];
-        int m = cw_squelch_push(&s_squelch, chunk[i], rel, sizeof(rel));
-        for (int k = 0; k < m; k++) {
-            s_ring[s_head] = rel[k];
-            s_head = (s_head + 1) % CW_RING_CAP;
-            if (s_count < CW_RING_CAP) s_count++;
-            /* ...and into the wrapping line both screens draw from. */
-            s_line[s_line_col] = rel[k];
-            s_line_col = (s_line_col + 1) % CW_GRID_CELLS;
-            // Timestamp every accepted character for the speed estimate. Noise
-            // never reaches here, so it cannot drag the figure around.
-            s_stamp[s_stamp_head] = (uint32_t)(esp_timer_get_time() / 1000);
-            s_stamp_head = (s_stamp_head + 1) % CW_STAMP_CAP;
-            if (s_stamp_count < CW_STAMP_CAP) s_stamp_count++;
-            /* ...and into the microSD transcript (#323). Squelched noise and
-               the radio's '*' never reach here, so the file holds what the
-               screen showed, not the raw stream. */
-            sd_transcript_putc(rel[k]);
-        }
-        s_total += (unsigned)m;
+    int tx_pending = 0;
+    int n = cw_decode_parse_tb(resp, chunk, sizeof(chunk), &tx_pending);
+    if (n <= 0) {
+        if (n == 0) cw_decode_flush_stale();   // valid idle poll, nothing decoded
+        return;                                 // n < 0: malformed, ignore
     }
-    if (s_lock) xSemaphoreGive(s_lock);
+    /* t > 0 means a KY send is still running, so this payload is our own
+     * keying coming back through the radio's decoder - see s_line_tx. */
+    cw_decode_feed_text(chunk, n, tx_pending > 0);
 }
 
 /* Where the next character will land - i.e. the cursor, in grid columns.
@@ -358,7 +538,7 @@ size_t cw_decode_line(char *out, size_t out_sz)
     if (!s_ring) return 0;
 
     if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
-    size_t n = CW_GRID_CELLS;
+    size_t n = (size_t)grid_cells();
     if (n > out_sz - 1) n = out_sz - 1;
     memcpy(out, s_line, n);
     /* Two blank columns at the write position - see the header. Applied to the
@@ -368,10 +548,31 @@ size_t cw_decode_line(char *out, size_t out_sz)
      * Wrapped over the WHOLE grid, so the gap crosses the row boundary with the
      * text instead of stopping at the end of the first line. */
     for (int i = 0; i < 2; i++) {
-        size_t idx = (size_t)((s_line_col + i) % CW_GRID_CELLS);
+        size_t idx = (size_t)((s_line_col + i) % grid_cells());
         if (idx < n) out[idx] = ' ';
     }
     out[n] = '\0';
+    if (s_lock) xSemaphoreGive(s_lock);
+    return n;
+}
+
+/* The TX mask for the same grid cw_decode_line() returns, cell for cell: 1
+ * where the character was our own transmission. A separate call rather than a
+ * second out-parameter, because both surfaces want the mask and neither wants
+ * to re-copy the text to get it.
+ *
+ * The two-column gap cw_decode_line() lays over the write position is NOT
+ * applied here. A blank cell has no colour, so it cannot matter, and leaving
+ * the mask alone keeps this a pure read of the model. */
+size_t cw_decode_line_tx(uint8_t *out, size_t out_sz)
+{
+    if (!out || out_sz == 0) return 0;
+    if (!s_ring) { out[0] = 0; return 0; }
+
+    if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
+    size_t n = (size_t)grid_cells();
+    if (n > out_sz) n = out_sz;
+    memcpy(out, s_line_tx, n);
     if (s_lock) xSemaphoreGive(s_lock);
     return n;
 }
@@ -434,9 +635,62 @@ void cw_decode_clear(void)
     s_head = s_count = 0;
     s_stamp_head = s_stamp_count = 0;
     memset(&s_squelch, 0, sizeof(s_squelch));
+    s_squelch_touch_ms = 0;
     memset(s_line, ' ', sizeof(s_line));
+    memset(s_line_tx, 0, sizeof(s_line_tx));
     s_line_col = 0;
     if (s_lock) xSemaphoreGive(s_lock);
 }
+
+int cw_decode_rows(void)
+{
+    return s_rows;
+}
+
+/* ⛔ CHANGING THE COUNT WIPES THE GRID, and that is the honest behaviour, not
+ * laziness. Going 4 -> 2 leaves text in rows 3 and 4 that nothing can ever
+ * reach again, and a write position that may already be past the new modulus;
+ * going 2 -> 4 leaves two rows of whatever the last 4-row pass left there,
+ * presented as if it were current. Either way the operator would be reading a
+ * line that is partly a ghost. Wiping says what happened. */
+void cw_decode_set_rows(int rows)
+{
+    if (rows < 1) rows = 1;
+    if (rows > CW_LINE_ROWS) rows = CW_LINE_ROWS;
+    if (rows == s_rows) return;
+
+    if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_rows = rows;
+    memset(s_line, ' ', sizeof(s_line));
+    memset(s_line_tx, 0, sizeof(s_line_tx));
+    s_line_col = 0;
+    if (s_lock) xSemaphoreGive(s_lock);
+}
+
+/* Same shape as set_rows above, and the same cost: the grid is WIPED rather
+ * than re-wrapped, so switching pages clears the visible pane.
+ *
+ * ⚠ That is deliberate and it is the conservative choice, not the nice one.
+ * s_ring still holds the history, so a re-wrap IS possible - but s_ring holds
+ * characters only, never the TX flags, so re-wrapping would repaint our own
+ * keying as received text. Showing the operator's own sending in the colour
+ * that means "the other station said this" is a worse fault than a cleared
+ * pane, so until the mask can be carried too this wipes, exactly as a row
+ * change already did. */
+void cw_decode_set_cols(int cols)
+{
+    if (cols < 8) cols = 8;
+    if (cols > CW_LINE_COLS) cols = CW_LINE_COLS;
+    if (cols == s_cols) return;
+
+    if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_cols = cols;
+    memset(s_line, ' ', sizeof(s_line));
+    memset(s_line_tx, 0, sizeof(s_line_tx));
+    s_line_col = 0;
+    if (s_lock) xSemaphoreGive(s_lock);
+}
+
+int cw_decode_cols(void) { return s_cols; }
 
 #endif /* ESP_PLATFORM */

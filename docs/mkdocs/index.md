@@ -22,7 +22,7 @@ Everything below is in the firmware **today**. Nothing needs a PC; only the item
 - **Touch tuning** — tap or drag to tune with mode-aware snapping, pinch-zoom (a real
   zoom-FFT, not a stretch), one-finger pan-and-retune, edge-swipe navigation between
   screens, and a frequency keypad.
-- **Audio, and binaural CW** *(beta)* — the I/Q the radio already sends becomes sound on
+- **Audio, and binaural CW** — the I/Q the radio already sends becomes sound on
   the device. The **panoramic CW split** places two stations on different frequencies to
   the left and right of the stereo image rather than on top of each other, with **pan
   width**, **pan blend** and **overlap** adjustable live while you listen. It plays to
@@ -40,6 +40,12 @@ Everything below is in the firmware **today**. Nothing needs a PC; only the item
   ⚠ **Nothing has been decoded through it yet** — the path runs and the levels read
   correctly, and that is all that is proven. ⛔ The USB radio connection is off in this
   mode by design. See [Audio](guide/audio.md).
+- **MODE: CW page** *(beta)* — the radio's own decode ticker with noise squelch, a
+  copilot hint line, a station card, and two named macro sets (**General**/**Contest**)
+  switched by a toggle at the bottom of the panel. See [CW](guide/cw.md).
+- **Web Radio** — an internet radio player on the Tab5: search and genre filter over the
+  radio-browser.info directory, six memory slots, playback that keeps running after you
+  close the player. See [Web Radio](guide/webradio.md).
 - **QMX control** — frequency, mode (USB/LSB/CW/DiGi, plus AM on QMX firmware 1.04+),
   SSB filter width, CW passband, TX power and SWR, and QMX volume in decibels matching
   the radio's own display. Band presets with per-band frequency recall, 32 memory
@@ -152,11 +158,17 @@ Everything below is in the firmware **today**. Nothing needs a PC; only the item
 
 ## Status
 
-**v1.20.0 — a complete, self-contained FT8/FT4/JS8 station with no PC in the loop, a second
-operating position in any browser, a WSPR propagation beacon, and the radio's own menus
-on the screen.** The panadapter, FT8/FT4 receive and transmit, WSPR, ADIF logging and all
-four logbook uploads — QRZ, eQSL, ARRL LoTW and your own Cloudlog or Wavelog — are stable
-and in daily use. **JS8 Normal is a beta**, and **audio on the Tab5 is a beta** — see below. **v1.20.0** streams the receiver to any browser on your network, and **v1.19.0** demodulates AM on the Tab5 itself, with a bandwidth you choose rather than the radio's fixed one, and makes the SWR limit stop a WSPR burst the way it has always stopped an FT8 one; **v1.18.0** lets you set a PA voltage the radio must never exceed, stops the Output power control writing a figure it invented over it, and reads the portable and special-event callsigns JS8 used to discard; **v1.17.1** fixes a web page that stopped reading the radio's status altogether in v1.17.0, and documents JS8 properly; **v1.17.0** decodes JS8 off air and sends free text back, adds a JS8 page with Stations and Conversation tabs, a GPS Stats page with a live sky view, CW keyer speed from the browser and the Tab5, and the 3.5 mm jack as a receive source; **v1.16.12** added support for a GPS receiver on PORT.A and reads the date from a GPS-equipped QMX+ over CAT; **v1.16.11** keeps the WiFi link alive on a busy network and lets you eject the microSD card safely; **v1.16.10** stops the Tab5 moving your radio to 160 m every time it connects.
+**v1.24.2 — a complete, self-contained FT8/FT4/JS8 station with no PC in the loop, a second
+operating position in any browser, a WSPR propagation beacon, a MODE: CW page, an internet
+radio player, and the radio's own menus on the screen.** The panadapter, FT8/FT4 receive and
+transmit, WSPR, ADIF logging and all four logbook uploads — QRZ, eQSL, ARRL LoTW and your own
+Cloudlog or Wavelog — are stable and in daily use. **Audio and binaural CW are no longer a
+beta.** **JS8 Normal** and the new **CW page** are — see below. **v1.24.2 fixes WSPR decoding
+dying after a visit to the FT8 page**, adds a **CW TX offset shortcut** and **Semi QSK
+break-in delay** to the CW page, and fixes an FT8 pileup crash, an RRR handling bug, and a
+one-frame screen flash — see the [release notes](releases.md) for the full list. In v1.24.0:
+the CW page (decode ticker, copilot hints, General/Contest macro sets), Web Radio, and
+two-finger pinch now pans while it zooms, on the Panadapter and the CW page alike.
 
 !!! warning "Coming from v1.14.x or earlier? One USB-C cable update first"
 
@@ -326,7 +338,7 @@ given a static IP address.
 
 **Stuck, or not sure what something is called?** The Tab5 can help you itself — see [Getting Help](getting-help.md).
 
-**Want the whole guide at once?** Download the [User Guide PDF](QMX-Panadapter-UserGuide-v1.20.0.pdf) — the whole user guide as one printable document.
+**Want the whole guide at once?** Download the [User Guide PDF](QMX-Panadapter-UserGuide-v1.24.2.pdf) — the whole user guide as one printable document.
 
 **Builder?** Head to [Build from Source](build/build.md) for ESP-IDF setup and the complete module map.
 

@@ -43,8 +43,9 @@ int adif_log_count(void);
 const char *adif_log_file_path(void);
 
 // True if `call` appears in any previously logged QSO (ANY band).
-// Uses an in-memory cache (up to ADIF_WORKED_CACHE entries) loaded at init.
-// O(n) linear scan — fine for the cache size used.
+// Uses an in-memory (callsign, band) cache in PSRAM, loaded at init and grown
+// on demand to hold a full SPIFFS log. O(n) linear scan over a uint32 hash,
+// so a string is only compared on a hash hit.
 bool adif_log_contains_call(const char *call);
 
 // True if `call` was previously logged ON THE BAND that contains freq_hz.
@@ -85,6 +86,17 @@ bool adif_log_set_field(int idx, const char *field, const char *value);
 // number an activator is actually counting in the field. One pass over the
 // file; case-insensitive on the reference.
 int adif_log_count_activation(const char *sig_info);
+
+/* Write TODAY's contacts for one MY_SIG_INFO to their own file on the SD
+ * card, named <REF>-<YYYYMMDD>.adi, and copy the full path into out_path.
+ * Returns the number of records written, or -1 (no card, nothing matching,
+ * or the write failed - no partial file is left behind).
+ *
+ * Called when an activation is stopped: an activator working two parks in a
+ * day needs one file per park, and splitting the combined log afterwards is
+ * work the device can do at the moment it has the answer.
+ * ⚠ Does file I/O on both SPIFFS and FatFs - not for a fast path. */
+int adif_log_export_activation(const char *sig_info, char *out_path, size_t out_sz);
 
 /* #263 "check my log" - one pass over the file reporting what records are
  * missing. ONE walk, shared by GET /api/adif/check and the Tab5's Activation

@@ -3,9 +3,11 @@
 #include "util/gpio_relay.h"    // relay polarity, applied on set (same reason)
 #include "unit_gps/unit_gps.h"  // PORT.A's other backend - the mode sequencer below
 #include "ui.h"                 // CW_CENTER_* - the grid the radio accepts (#359)
+#include "cw_decode.h"         // row count, applied on set (wrap modulus, not a draw count)
 #include "sd_archive.h"
 
 #include <string.h>
+#include <ctype.h>
 #include <strings.h>   // strncasecmp - band names are matched case-INSENSITIVELY
 #include <stdint.h>
 #include <time.h>   // time(NULL) - power-calibration row timestamp
@@ -14,12 +16,14 @@
 #include <unistd.h>  // fsync
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"   // the flush snapshot is heaped - see flush_task
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "psram_task.h"
+#include "panic_hook.h"   // T138: mark the cache-off stretches
 
 static const char *TAG = "settings";
 
@@ -33,6 +37,7 @@ static const char *TAG = "settings";
 #define KEY_WIFI_SSID   "wifi_ssid"
 #define KEY_MY_CALL     "my_call"
 #define KEY_MY_GRID     "my_grid"
+#define KEY_MY_STATE    "my_state"
 /* Provenance, NOT a user setting: the grid the GPS last wrote into
  * my_grid. gps_autogrid.c needs it to tell "the operator typed over my
  * value" from "we have not written this square yet", and that answer must
@@ -52,6 +57,9 @@ static const char *TAG = "settings";
 #define KEY_CW_PITCH   "cw_pitch"
 #define KEY_COLORMAP   "colormap"
 #define KEY_CW_CAL     "cw_cal"
+#define KEY_SB_LOWCUT  "sb_lowcut"
+#define KEY_FT4_FREQ   "ft4_freq"
+#define KEY_JS8_FREQ   "js8_freq"
 #define KEY_ZOOM       "zoom"
 #define KEY_BRIGHTNESS "brightness"
 #define KEY_LAST_MODE  "last_mode"
@@ -63,6 +71,14 @@ static const char *TAG = "settings";
 #define KEY_CQ_MSG2    "cq_msg2"
 #define KEY_CQ_SEL     "cq_sel"
 #define KEY_CQ_MAX     "cq_max"
+#define KEY_CW_MSG     "cw_msg"    // + digit 0..5 appended at use sites (set A, "General")
+#define KEY_CW_MSG_B   "cw_msgb"   // + digit 0..5 appended at use sites (set B, "Contest")
+#define KEY_CW_MSG_SET "cw_mset"   // which set is active: 0 = General, 1 = Contest
+#define KEY_CW_PARK    "cw_park"
+#define KEY_CW_RST_CUT "cw_rst_cut"
+#define KEY_CW_SERIAL  "cw_serial"
+#define KEY_CW_SIM     "cw_sim"
+#define KEY_CW_PAGE_EN "cw_page_en"
 #define KEY_HOUND_MODE "hound_md"
 #define KEY_ONBOARDED  "onboarded"
 #define KEY_FT8_FILT   "ft8_filt"
@@ -89,6 +105,8 @@ static const char *TAG = "settings";
 #define KEY_CL_STATION   "cl_stn"
 #define KEY_CL_UPLOADED  "cl_upl_n"
 #define KEY_RX_AUD_EN    "rx_aud_en"
+#define KEY_BINAURAL     "binaural_en"
+#define KEY_WEBRADIO_EN  "webradio_en"
 #define KEY_RX_AUD_VOL   "rx_aud_vol"
 #define KEY_WF_BLACK     "wf_black"
 #define KEY_WF_CONTRAST  "wf_contr"
@@ -96,12 +114,15 @@ static const char *TAG = "settings";
 #define KEY_WF_WINDOW    "wf_window"
 #define KEY_WF_SPEED     "wf_speed"   /* LEGACY 1..4x multiplier - read once, then never written again */
 #define KEY_WF_ROWS      "wf_rows"    /* waterfall rows per second, 1..40 */
+#define KEY_SPEC_PEAK    "spec_peak"  /* spectrum peak-hold window, seconds, 0 = off */
+#define KEY_CW_PEAK      "cw_peak"    /* CW audio peak filter width, Hz, 0 = off */
 #define KEY_DISP_FLIP    "disp_flip"
 #define KEY_QMX_VOL      "qmx_vol_db"
 #define KEY_CW_TX_OFF    "cw_tx_off"
 #define KEY_CQ_LISTEN    "cq_listen"
 #define KEY_SWR_LIMIT    "swr_lim"
 #define KEY_JS8_SUBMODE  "js8_sub"
+#define KEY_JS8_ALT_SUB  "js8_altsub"
 #define KEY_RXA_GAIN     "rxa_gain"
 #define KEY_RXA_PWIDTH   "rxa_pw"
 #define KEY_RXA_PBLEND   "rxa_pb"
@@ -117,6 +138,8 @@ static const char *TAG = "settings";
 #define KEY_DISTANCE_MILES "dist_miles"
 #define KEY_FREQ_SEP       "freq_sep"
 #define KEY_CW_DECODE       "cw_dec_en"
+#define KEY_LOG_VIEW_ALL    "log_vw_all"  /* ADIF window: Today/All, sticky (T113) */
+#define KEY_CW_ROWS         "cw_dec_rows" /* rows of decoded CW drawn, 2 or 4 */
 #define KEY_RIT_PILL_SHOW  "rit_pill"
 #define KEY_STILL_VIEW     "still_vw"
 /* Version marker for the still_view default migration - see settings_init().
@@ -127,6 +150,7 @@ static const char *TAG = "settings";
 #define KEY_SPUR_SUP       "spur_sup"
 #define KEY_FT8_EARLY_DEC  "ft8_earlydec"
 #define KEY_GREYLIST_EN    "greylist_en"
+#define KEY_TXBAND_OFF     "txband_off"
 #define KEY_PSKREP_EN      "pskrep_en"
 #define KEY_PSK_RX_EN      "pskrx_en"
 #define KEY_BT_MOUSE_EN    "btmouse_en"
@@ -172,6 +196,7 @@ static const char *TAG = "settings";
 #define KEY_RELAY_PIN      "relay_pin"
 #define KEY_RELAY_LEVEL    "relay_lvl"
 #define KEY_RELAY_MS       "relay_ms"
+#define KEY_RELAY_SOLO     "relay_solo"
 #define KEY_PORT_A_MODE    "port_a_mode"
 #define KEY_RX_SOURCE      "rx_source"
 #define KEY_LINEIN_GAIN    "linein_gain"
@@ -206,17 +231,29 @@ static const char *TAG = "settings";
 #define DEF_LAST_MODE     (0)
 #define DEF_WIFI_ENABLED  (true)
 #define DEF_RX_AUD_EN     (false)
+#define DEF_BINAURAL      (false)   /* an upgrade must not change anyone's audio */
+/* ⭐ TRUE, unlike RX audio. The codec can only be opened at boot, so this
+ * flag is what decides whether the web-radio player has an output at all
+ * later in the session - defaulting it off would mean the feature does
+ * nothing until the operator finds a setting and reboots, which is how the
+ * player first failed on the bench. Turn it off to keep the I2S/DMA claim
+ * off a unit that uses neither. */
+#define DEF_WEBRADIO_EN   (true)
 #define DEF_RX_AUD_VOL    (60)
 #define DEF_WF_BLACK      (9.0f)
 #define DEF_WF_CONTRAST   (45.0f)
 #define DEF_WF_BLEND      (100)
 #define DEF_WF_WINDOW     (0)
+#define DEF_CW_ROWS       (4)    /* four since 2026-10-15 (Sam W7STF); Bryan N0LUF may pick 2 */
 #define DEF_WF_ROWS       (10)   /* rows/s - the rate the waterfall has always run at */
+#define DEF_SPEC_PEAK     (0)    /* peak hold OFF until asked for - it costs 25 KB of PSRAM */
+#define DEF_CW_PEAK       (0)    /* CW peak filter OFF - it changes how the radio SOUNDS */
 #define DEF_CHARGE_LIM_EN  (false)
 #define DEF_CHARGE_LIM_PCT (80)
 #define DEF_RELAY_PIN      (53)
 #define DEF_RELAY_LEVEL    (true)   /* active HIGH */
 #define DEF_RELAY_MS       (1000)
+#define DEF_RELAY_SOLO     (false)  /* both pads driven - what every unit has done */
 
 // Debounce: how long we wait after the last change before flushing.
 #define DEBOUNCE_MS     500
@@ -245,7 +282,7 @@ static const char *TAG = "settings";
  * taken every one of them while the comment still said 62. Bumped to 5 words
  * rather than land the next person on a full bitmap behind a wrong number.
  * Cost is 4 bytes. Recount before trusting this figure again. */
-#define DIRTY_WORDS      5                        /* 160 bits; highest used 141, 18 spare */
+#define DIRTY_WORDS      5                        /* 160 bits; highest used 158, 1 spare */
 #define DIRTY_BITS_MAX   (DIRTY_WORDS * 32)
 
 typedef struct { uint32_t w[DIRTY_WORDS]; } dirty_t;
@@ -327,6 +364,9 @@ static inline bool dirty_test_any(const dirty_t *d, const uint8_t *bits, size_t 
 #define DIRTY_CL_STATION    93
 #define DIRTY_CL_UPLOADED   94
 #define DIRTY_RX_AUD_EN     32
+/* 154: the next free index - tools/check_dirty_bits.py prints the free list
+ * every build and is the authority on it, never a number written in prose. */
+#define DIRTY_BINAURAL     154
 #define DIRTY_RX_AUD_VOL    33
 #define DIRTY_WF_BLACK      34
 #define DIRTY_WF_CONTRAST   35
@@ -385,6 +425,10 @@ static inline bool dirty_test_any(const dirty_t *d, const uint8_t *bits, size_t 
 #define DIRTY_RBN_EN         76
 #define DIRTY_WIFI_KNOWN     77
 #define DIRTY_CQ_MAX_CALLS   66
+#define DIRTY_CW_MSG0        67   // ..72 = slots 0..5 (contiguous, indexed math below)
+#define DIRTY_CW_MSG5        72
+#define DIRTY_CW_PARK        73
+#define DIRTY_CW_SIM         74   // not config-exported, same as sim_mode_en
 // 78 and up: after the CW-page reservation above. The CW TX offset lives on
 // main (it is a tuning behaviour, not part of the CW page), so it deliberately
 // does NOT take one of the reserved 67..74.
@@ -450,7 +494,32 @@ static inline bool dirty_test_any(const dirty_t *d, const uint8_t *bits, size_t 
 #define DIRTY_PORT_A_MODE     135  /* PORT.A owner: relay | unit_gps (#15) */
 #define DIRTY_GNSS_MBUS       136  /* M-Bus GNSS receiver enable */
 #define DIRTY_RX_SOURCE       137  /* RX input source: qmx_usb | line_in */
-#define DIRTY_LINEIN_GAIN     138  /* line-in analogue gain, dB; 21 spare */
+#define DIRTY_LINEIN_GAIN     138  /* line-in analogue gain, dB */
+/* 142, not 139: tools/check_dirty_bits.py refused the build because 139 is
+   DIRTY_PA_CEILING, defined elsewhere in this file. The "spare" counts in
+   the comments above had gone stale - the checker is the authority. */
+#define DIRTY_CW_ROWS         142  /* rows of decoded CW drawn */
+#define DIRTY_TXBAND_OFF      143  /* TX band guard disabled (T48) */
+#define DIRTY_MY_STATE        144  /* US state, for the directed-CQ filter */
+#define DIRTY_SPEC_PEAK       145  /* spectrum peak-hold window (A4) */
+#define DIRTY_CW_PEAK         146  /* CW audio peak filter width (A4) */
+#define DIRTY_LOG_VIEW_ALL    147  /* ADIF window Today/All, sticky (T113) */
+#define DIRTY_SB_LOWCUT       148  /* T90 SSB auto-tune low-cut trim */
+#define DIRTY_FT4_FREQ        149  /* T89 per-sub-mode preset frequency */
+#define DIRTY_JS8_FREQ        150  /* T89 per-sub-mode preset frequency */
+#define DIRTY_JS8_ALT_SUB     151  /* T132 duty-cycled alternate-submode decode */
+#define DIRTY_WEBRADIO_EN     152  /* web-radio player: open the codec at boot */
+/* 153, not 152: the web-radio switch and the CW-page gate were written on
+   two branches against the same tree and both took 152. main had it first,
+   so the CW gate moved. Runtime bitmap indices only - nothing on flash
+   carries them, the NVS KEY strings do - and tools/check_dirty_bits.py is
+   the authority on what is free. */
+#define DIRTY_CW_PAGE_EN      153  /* master switch for the CW page - default OFF */
+#define DIRTY_CW_MSG_B        155  /* all 6 slots of macro set B "Contest", ONE bit - only
+                                       5 free when this was added, unlike cw_msg's six (67..72) */
+#define DIRTY_CW_MSG_SET      156
+#define DIRTY_CW_RST_CUT      157  /* active macro set toggle: 0 = General, 1 = Contest */
+#define DIRTY_CW_SERIAL        158  /* {SERIAL} macro - next contest serial to send */
 
 // Bits that actually affect config_io_export()'s output (storage/config_io.c).
 // Bookkeeping bits like DIRTY_LAST_TIME (rewritten by the continuous time-sync
@@ -468,7 +537,7 @@ static const uint8_t s_config_export_bits[] = {
     DIRTY_OTA_AUTODL,
     DIRTY_DB_MIN, DIRTY_DB_MAX, DIRTY_EMA_ALPHA, DIRTY_IQ_ENABLED,
     DIRTY_FLAT_MODE, DIRTY_WIFI_SSID, DIRTY_WIFI_PASS, DIRTY_CW_PITCH,
-    DIRTY_COLORMAP, DIRTY_MY_CALL, DIRTY_MY_GRID, DIRTY_CW_CAL,
+    DIRTY_COLORMAP, DIRTY_MY_CALL, DIRTY_MY_GRID, DIRTY_MY_STATE, DIRTY_CW_CAL,
     DIRTY_ZOOM, DIRTY_BRIGHTNESS, DIRTY_CQ_MSG0, DIRTY_CQ_MSG1,
     DIRTY_CQ_MSG2, DIRTY_CQ_SEL, DIRTY_ONBOARDED, DIRTY_FT8_FILT,
     DIRTY_WIFI_ENABLED, DIRTY_QMX_GPS, DIRTY_FREQ_KP_CALC,
@@ -479,10 +548,13 @@ static const uint8_t s_config_export_bits[] = {
     DIRTY_CHARGE_LIM_PCT, DIRTY_GPIO_RELAY, DIRTY_FREQ_SEP,
     DIRTY_LOTW_DXCC, DIRTY_LOTW_CQZ, DIRTY_LOTW_ITUZ, DIRTY_DISP_SLEEP,
     DIRTY_TX_TONE_HZ, DIRTY_TX_TONE_HOLD, DIRTY_CQ_MAX_CALLS, DIRTY_JS8_SUBMODE,
+    DIRTY_CW_MSG0, DIRTY_CW_MSG0 + 1, DIRTY_CW_MSG0 + 2, DIRTY_CW_MSG0 + 3,
+    DIRTY_CW_MSG0 + 4, DIRTY_CW_MSG5, DIRTY_CW_PARK,
     DIRTY_SPOTS_EN, DIRTY_RBN_EN, DIRTY_SPOTMAP_EN, DIRTY_WIFI_KNOWN, DIRTY_CW_TX_OFFSET,
     DIRTY_CQ_LISTEN, DIRTY_SWR_LIMIT, DIRTY_PSK_RX_EN, DIRTY_BT_MOUSE_EN,
     DIRTY_CLUSTER_EN, DIRTY_SOTA_EN, DIRTY_HOUND_MODE,
     DIRTY_WSPR_EN,   /* joins because config_io_export() now prints wspr_enabled */
+    DIRTY_CW_PAGE_EN,   /* same - config_io_export() prints cw_page_enabled */
     DIRTY_STILL_VIEW,   /* #298 - config_io_export() carries still_spectrum */
     /* RX audio: a level the operator set by ear belongs in a config backup for
      * the same reason the power calibration does - nobody can recreate it from
@@ -497,6 +569,13 @@ static const uint8_t s_config_export_bits[] = {
      * A config file that silently moved a board back to the QMX would look
      * like the jack had stopped working. */
     DIRTY_RX_SOURCE, DIRTY_LINEIN_GAIN,
+    /* ⛔ DIRTY_LOG_VIEW_ALL is deliberately NOT here, and neither are
+     * DIRTY_CW_DECODE / DIRTY_CW_ROWS, although config_io_export() prints all
+     * three. They are one-tap view preferences, and an SD mirror write per tap
+     * is exactly the unnecessary SDMMC contention the note above is about. The
+     * exported file still carries the current value whenever a mirror happens
+     * for any other reason, so a backup is never wrong - only occasionally
+     * later than the tap. */
 };
 
 // ---- Module state ------------------------------------------------------
@@ -566,15 +645,33 @@ static void load_from_nvs(qmx_settings_t *out);
 // Runs forever, wakes every 100 ms, writes to NVS once the dirty set is
 // older than DEBOUNCE_MS. Cheap to leave running; only allocates a
 // 1.5kB stack.
+//
+// ⛔ THE SNAPSHOT IS HEAPED, NOT A LOCAL, AND MUST STAY THAT WAY.
+// qmx_settings_t is over a kilobyte and grows every time a setting is added.
+// As a local it sat on this task's 3072-byte stack alongside an ESP_LOG's
+// ~1 KB vfprintf frame, which left no room and was NOT obviously wrong at any
+// single point in its history - it fit at 912 bytes and overflowed at 1192,
+// so the commit that broke it was simply the one that happened to add a field.
+// Serial-captured 2026-09-01 as a Stack protection fault in "settings_flush"
+// on EVERY page swipe (a swipe writes last_ui_mode, which wakes this task).
+// One PSRAM allocation for the life of the task costs nothing and makes the
+// next field free. Same rule as ft8_tx.c and ft8_qso.c: kB-scale structs do
+// not go on stacks. See CLAUDE.md's note on the v0.20.1 pounce crash.
 static void flush_task(void *arg)
 {
     (void)arg;
+    qmx_settings_t *const snap = heap_caps_malloc(sizeof(qmx_settings_t),
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!snap) {
+        ESP_LOGE(TAG, "flush task: no memory for the settings snapshot - settings will NOT persist");
+        vTaskDelete(NULL);
+        return;
+    }
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(100));
         if (!s_ready) continue;
 
         dirty_t dirty_local = {0};
-        qmx_settings_t snap;
         bool do_flush = false;
 
         if (xSemaphoreTake(s_mutex, portMAX_DELAY) == pdTRUE) {
@@ -582,7 +679,7 @@ static void flush_task(void *arg)
                 TickType_t age = xTaskGetTickCount() - s_last_change_tick;
                 if (age >= pdMS_TO_TICKS(DEBOUNCE_MS)) {
                     dirty_local = s_dirty;
-                    snap = s_pending;
+                    *snap = s_pending;
                     dirty_clear_all(&s_dirty);
                     do_flush = true;
                 }
@@ -593,110 +690,147 @@ static void flush_task(void *arg)
         if (!do_flush) continue;
 
         // We hold no mutex now — NVS writes can be slow.
-        if (dirty_test(&dirty_local, DIRTY_DB_MIN))     nvs_set_float(KEY_DB_MIN,    snap.db_min);
-        if (dirty_test(&dirty_local, DIRTY_DB_MAX))     nvs_set_float(KEY_DB_MAX,    snap.db_max);
-        if (dirty_test(&dirty_local, DIRTY_EMA_ALPHA))  nvs_set_float(KEY_EMA_ALPHA, snap.ema_alpha);
-        if (dirty_test(&dirty_local, DIRTY_IQ_ENABLED)) nvs_set_u8(s_nvs, KEY_IQ_ENABLED, snap.iq_enabled ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_FLAT_MODE))  nvs_set_u8(s_nvs, KEY_FLAT_MODE,  snap.flat_mode    ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_WIFI_SSID))  nvs_set_str(s_nvs, KEY_WIFI_SSID, snap.wifi_ssid);
-        if (dirty_test(&dirty_local, DIRTY_MY_CALL))    nvs_set_str(s_nvs, KEY_MY_CALL,   snap.my_callsign);
-        if (dirty_test(&dirty_local, DIRTY_MY_GRID))    nvs_set_str(s_nvs, KEY_MY_GRID,   snap.my_grid);
-        if (dirty_test(&dirty_local, DIRTY_WIFI_PASS))  nvs_set_str(s_nvs, KEY_WIFI_PASS, snap.wifi_pass);
-        if (dirty_test(&dirty_local, DIRTY_LAST_VFO))  nvs_set_u32(s_nvs, KEY_LAST_VFO, snap.last_vfo_hz);
-        if (dirty_test(&dirty_local, DIRTY_FT8_FREQ))  nvs_set_u32(s_nvs, KEY_FT8_FREQ, snap.ft8_freq_hz);
-        if (dirty_test(&dirty_local, DIRTY_CW_PITCH))  nvs_set_u16(s_nvs, KEY_CW_PITCH, snap.cw_pitch_hz);
-        if (dirty_test(&dirty_local, DIRTY_CW_CAL))    nvs_set_i16(s_nvs, KEY_CW_CAL,   snap.cw_cal_hz);
+        if (dirty_test(&dirty_local, DIRTY_DB_MIN))     nvs_set_float(KEY_DB_MIN,    snap->db_min);
+        if (dirty_test(&dirty_local, DIRTY_DB_MAX))     nvs_set_float(KEY_DB_MAX,    snap->db_max);
+        if (dirty_test(&dirty_local, DIRTY_EMA_ALPHA))  nvs_set_float(KEY_EMA_ALPHA, snap->ema_alpha);
+        if (dirty_test(&dirty_local, DIRTY_IQ_ENABLED)) nvs_set_u8(s_nvs, KEY_IQ_ENABLED, snap->iq_enabled ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_FLAT_MODE))  nvs_set_u8(s_nvs, KEY_FLAT_MODE,  snap->flat_mode    ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_WIFI_SSID))  nvs_set_str(s_nvs, KEY_WIFI_SSID, snap->wifi_ssid);
+        if (dirty_test(&dirty_local, DIRTY_MY_CALL))    nvs_set_str(s_nvs, KEY_MY_CALL,   snap->my_callsign);
+        if (dirty_test(&dirty_local, DIRTY_MY_GRID))    nvs_set_str(s_nvs, KEY_MY_GRID,   snap->my_grid);
+        if (dirty_test(&dirty_local, DIRTY_MY_STATE))   nvs_set_str(s_nvs, KEY_MY_STATE,  snap->my_state);
+        if (dirty_test(&dirty_local, DIRTY_WIFI_PASS))  nvs_set_str(s_nvs, KEY_WIFI_PASS, snap->wifi_pass);
+        if (dirty_test(&dirty_local, DIRTY_LAST_VFO))  nvs_set_u32(s_nvs, KEY_LAST_VFO, snap->last_vfo_hz);
+        if (dirty_test(&dirty_local, DIRTY_FT8_FREQ))  nvs_set_u32(s_nvs, KEY_FT8_FREQ, snap->ft8_freq_hz);
+        if (dirty_test(&dirty_local, DIRTY_CW_PITCH))  nvs_set_u16(s_nvs, KEY_CW_PITCH, snap->cw_pitch_hz);
+        if (dirty_test(&dirty_local, DIRTY_CW_CAL))    nvs_set_i16(s_nvs, KEY_CW_CAL,   snap->cw_cal_hz);
+        if (dirty_test(&dirty_local, DIRTY_SB_LOWCUT)) nvs_set_u16(s_nvs, KEY_SB_LOWCUT, snap->sb_lowcut_hz);
+        if (dirty_test(&dirty_local, DIRTY_FT4_FREQ))  nvs_set_u32(s_nvs, KEY_FT4_FREQ,  snap->ft4_freq_hz);
+        if (dirty_test(&dirty_local, DIRTY_JS8_FREQ))  nvs_set_u32(s_nvs, KEY_JS8_FREQ,  snap->js8_freq_hz);
         if (dirty_test(&dirty_local, DIRTY_ZOOM)) {
-            uint32_t bits; memcpy(&bits, &snap.zoom_factor, 4);
+            uint32_t bits; memcpy(&bits, &snap->zoom_factor, 4);
             nvs_set_u32(s_nvs, KEY_ZOOM, bits);
         }
-        if (dirty_test(&dirty_local, DIRTY_COLORMAP))  nvs_set_u8(s_nvs, KEY_COLORMAP, snap.colormap_idx);
-        if (dirty_test(&dirty_local, DIRTY_BRIGHTNESS)) nvs_set_u8(s_nvs, KEY_BRIGHTNESS, snap.brightness_pct);
-        if (dirty_test(&dirty_local, DIRTY_LAST_MODE))  nvs_set_u8(s_nvs, KEY_LAST_MODE,  snap.last_ui_mode);
-        if (dirty_test(&dirty_local, DIRTY_LAST_TIME))  nvs_set_u32(s_nvs, KEY_LAST_TIME, snap.last_unix_time);
-        if (dirty_test(&dirty_local, DIRTY_DATE_SRC))   nvs_set_u8(s_nvs,  KEY_DATE_SRC,  snap.date_src);
-        if (dirty_test(&dirty_local, DIRTY_GNSS_MBUS))  nvs_set_u8(s_nvs,  KEY_GNSS_MBUS, snap.gnss_mbus_en);
-        if (dirty_test(&dirty_local, DIRTY_CQ_MSG0))    nvs_set_str(s_nvs, KEY_CQ_MSG0, snap.cq_msg[0]);
-        if (dirty_test(&dirty_local, DIRTY_CQ_MSG1))    nvs_set_str(s_nvs, KEY_CQ_MSG1, snap.cq_msg[1]);
-        if (dirty_test(&dirty_local, DIRTY_CQ_MSG2))    nvs_set_str(s_nvs, KEY_CQ_MSG2, snap.cq_msg[2]);
-        if (dirty_test(&dirty_local, DIRTY_CQ_SEL))     nvs_set_u8(s_nvs, KEY_CQ_SEL, snap.cq_sel);
-        if (dirty_test(&dirty_local, DIRTY_CQ_MAX_CALLS)) nvs_set_u8(s_nvs, KEY_CQ_MAX, snap.cq_max_calls);
-        if (dirty_test(&dirty_local, DIRTY_HOUND_MODE))   nvs_set_u8(s_nvs, KEY_HOUND_MODE, snap.hound_mode);
-        if (dirty_test(&dirty_local, DIRTY_CQ_LISTEN))    nvs_set_u8(s_nvs, KEY_CQ_LISTEN, snap.cq_listen_every);
-        if (dirty_test(&dirty_local, DIRTY_ONBOARDED))  nvs_set_u8(s_nvs, KEY_ONBOARDED, snap.onboarded ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_FT8_FILT))     nvs_set_blob(s_nvs, KEY_FT8_FILT, &snap.ft8_filters, sizeof(snap.ft8_filters));
+        if (dirty_test(&dirty_local, DIRTY_COLORMAP))  nvs_set_u8(s_nvs, KEY_COLORMAP, snap->colormap_idx);
+        if (dirty_test(&dirty_local, DIRTY_BRIGHTNESS)) nvs_set_u8(s_nvs, KEY_BRIGHTNESS, snap->brightness_pct);
+        if (dirty_test(&dirty_local, DIRTY_LAST_MODE))  nvs_set_u8(s_nvs, KEY_LAST_MODE,  snap->last_ui_mode);
+        if (dirty_test(&dirty_local, DIRTY_LAST_TIME))  nvs_set_u32(s_nvs, KEY_LAST_TIME, snap->last_unix_time);
+        if (dirty_test(&dirty_local, DIRTY_DATE_SRC))   nvs_set_u8(s_nvs,  KEY_DATE_SRC,  snap->date_src);
+        if (dirty_test(&dirty_local, DIRTY_GNSS_MBUS))  nvs_set_u8(s_nvs,  KEY_GNSS_MBUS, snap->gnss_mbus_en);
+        if (dirty_test(&dirty_local, DIRTY_CQ_MSG0))    nvs_set_str(s_nvs, KEY_CQ_MSG0, snap->cq_msg[0]);
+        if (dirty_test(&dirty_local, DIRTY_CQ_MSG1))    nvs_set_str(s_nvs, KEY_CQ_MSG1, snap->cq_msg[1]);
+        if (dirty_test(&dirty_local, DIRTY_CQ_MSG2))    nvs_set_str(s_nvs, KEY_CQ_MSG2, snap->cq_msg[2]);
+        if (dirty_test(&dirty_local, DIRTY_CQ_SEL))     nvs_set_u8(s_nvs, KEY_CQ_SEL, snap->cq_sel);
+        if (dirty_test(&dirty_local, DIRTY_CQ_MAX_CALLS)) nvs_set_u8(s_nvs, KEY_CQ_MAX, snap->cq_max_calls);
+        for (int i = 0; i < 6; i++) {
+            if (dirty_test(&dirty_local, DIRTY_CW_MSG0 + i)) {
+                char k[12];
+                snprintf(k, sizeof(k), KEY_CW_MSG "%d", i);
+                nvs_set_str(s_nvs, k, snap->cw_msg[i]);
+            }
+        }
+        if (dirty_test(&dirty_local, DIRTY_CW_MSG_B)) {
+            // ONE bit for all 6, unlike set A's six (DIRTY_CW_MSG0..72) - only
+            // 5 dirty bits were free when this set was added. Costs 6 NVS
+            // writes whenever ANY slot of this set is edited, instead of 1;
+            // the editor saves all 6 fields together anyway, so this never
+            // fires more often than set A's six already did per edit.
+            for (int i = 0; i < 6; i++) {
+                char k[12];
+                snprintf(k, sizeof(k), KEY_CW_MSG_B "%d", i);
+                nvs_set_str(s_nvs, k, snap->cw_msg_b[i]);
+            }
+        }
+        if (dirty_test(&dirty_local, DIRTY_CW_MSG_SET)) nvs_set_u8(s_nvs, KEY_CW_MSG_SET, snap->cw_msg_set);
+        if (dirty_test(&dirty_local, DIRTY_CW_PARK)) nvs_set_str(s_nvs, KEY_CW_PARK, snap->cw_park);
+        if (dirty_test(&dirty_local, DIRTY_CW_RST_CUT)) nvs_set_u8(s_nvs, KEY_CW_RST_CUT, snap->cw_rst_cut_nines ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_CW_SERIAL)) nvs_set_u16(s_nvs, KEY_CW_SERIAL, snap->cw_serial_next);
+        if (dirty_test(&dirty_local, DIRTY_CW_SIM))  nvs_set_u8(s_nvs, KEY_CW_SIM, snap->cw_sim_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_CW_PAGE_EN)) nvs_set_u8(s_nvs, KEY_CW_PAGE_EN, snap->cw_page_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_HOUND_MODE))   nvs_set_u8(s_nvs, KEY_HOUND_MODE, snap->hound_mode);
+        if (dirty_test(&dirty_local, DIRTY_CQ_LISTEN))    nvs_set_u8(s_nvs, KEY_CQ_LISTEN, snap->cq_listen_every);
+        if (dirty_test(&dirty_local, DIRTY_ONBOARDED))  nvs_set_u8(s_nvs, KEY_ONBOARDED, snap->onboarded ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_FT8_FILT))     nvs_set_blob(s_nvs, KEY_FT8_FILT, &snap->ft8_filters, sizeof(snap->ft8_filters));
         if (dirty_test(&dirty_local, DIRTY_CW_PROFILES))  nvs_set_blob(s_nvs, KEY_CW_PROF, s_pending.cw_profile, sizeof(s_pending.cw_profile));
         if (dirty_test(&dirty_local, DIRTY_TUNE_SNAP))    nvs_set_u16(s_nvs, KEY_TUNE_SNAP, s_pending.tune_snap_hz);
-        if (dirty_test(&dirty_local, DIRTY_KBD_BIND))     nvs_set_blob(s_nvs, KEY_KBD_BIND, &snap.kbd_bindings, sizeof(snap.kbd_bindings));
-        if (dirty_test(&dirty_local, DIRTY_PWR_CAL))      nvs_set_blob(s_nvs, KEY_PWR_CAL, &snap.pwr_cal, sizeof(snap.pwr_cal));
-        if (dirty_test(&dirty_local, DIRTY_PWR_TARGET))   nvs_set_blob(s_nvs, KEY_PWR_TARGET, &snap.pwr_target, sizeof(snap.pwr_target));
-        if (dirty_test(&dirty_local, DIRTY_PA_CEILING))   nvs_set_u16(s_nvs, KEY_PA_CEILING, snap.pa_ceiling_x10);
-        if (dirty_test(&dirty_local, DIRTY_WIFI_ENABLED)) nvs_set_u8(s_nvs, KEY_WIFI_ENABLED, snap.wifi_enabled ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_QMX_GPS))      nvs_set_u8(s_nvs, KEY_QMX_GPS,      snap.qmx_gps      ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_QMX_TPUSH))    nvs_set_u8(s_nvs, KEY_QMX_TPUSH,    snap.qmx_time_pushed ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_FREQ_KP_CALC)) nvs_set_u8(s_nvs, KEY_FREQ_KP_CALC, snap.freq_kp_calc ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_KBD_BIND))     nvs_set_blob(s_nvs, KEY_KBD_BIND, &snap->kbd_bindings, sizeof(snap->kbd_bindings));
+        if (dirty_test(&dirty_local, DIRTY_PWR_CAL))      nvs_set_blob(s_nvs, KEY_PWR_CAL, &snap->pwr_cal, sizeof(snap->pwr_cal));
+        if (dirty_test(&dirty_local, DIRTY_PWR_TARGET))   nvs_set_blob(s_nvs, KEY_PWR_TARGET, &snap->pwr_target, sizeof(snap->pwr_target));
+        if (dirty_test(&dirty_local, DIRTY_PA_CEILING))   nvs_set_u16(s_nvs, KEY_PA_CEILING, snap->pa_ceiling_x10);
+        if (dirty_test(&dirty_local, DIRTY_WIFI_ENABLED)) nvs_set_u8(s_nvs, KEY_WIFI_ENABLED, snap->wifi_enabled ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_QMX_GPS))      nvs_set_u8(s_nvs, KEY_QMX_GPS,      snap->qmx_gps      ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_QMX_TPUSH))    nvs_set_u8(s_nvs, KEY_QMX_TPUSH,    snap->qmx_time_pushed ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_FREQ_KP_CALC)) nvs_set_u8(s_nvs, KEY_FREQ_KP_CALC, snap->freq_kp_calc ? 1 : 0);
         if (dirty_test(&dirty_local, DIRTY_FREQ_KP_POS)) {
-            nvs_set_i16(s_nvs, KEY_FREQ_KP_DX, snap.freq_kp_dx);
-            nvs_set_i16(s_nvs, KEY_FREQ_KP_DY, snap.freq_kp_dy);
+            nvs_set_i16(s_nvs, KEY_FREQ_KP_DX, snap->freq_kp_dx);
+            nvs_set_i16(s_nvs, KEY_FREQ_KP_DY, snap->freq_kp_dy);
         }
-        if (dirty_test(&dirty_local, DIRTY_FREQ_KP_SMALL)) nvs_set_u8(s_nvs, KEY_FREQ_KP_SMALL, snap.freq_kp_small ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_PASSBAND_HZ))   nvs_set_u32(s_nvs, KEY_PASSBAND_HZ, snap.passband_width_hz);
-        if (dirty_test(&dirty_local, DIRTY_QRZ_KEY))      nvs_set_str(s_nvs, KEY_QRZ_KEY, snap.qrz_api_key);
-        if (dirty_test(&dirty_local, DIRTY_QRZ_UPLOADED)) nvs_set_u32(s_nvs, KEY_QRZ_UPLOADED, snap.qrz_uploaded_n);
-        if (dirty_test(&dirty_local, DIRTY_EQSL_USER))     nvs_set_str(s_nvs, KEY_EQSL_USER, snap.eqsl_user);
-        if (dirty_test(&dirty_local, DIRTY_EQSL_PSWD))     nvs_set_str(s_nvs, KEY_EQSL_PSWD, snap.eqsl_pswd);
-        if (dirty_test(&dirty_local, DIRTY_QRZ_LU_USER))   nvs_set_str(s_nvs, KEY_QRZ_LU_USER, snap.qrz_lookup_user);
-        if (dirty_test(&dirty_local, DIRTY_QRZ_LU_PASS))   nvs_set_str(s_nvs, KEY_QRZ_LU_PASS, snap.qrz_lookup_pass);
-        if (dirty_test(&dirty_local, DIRTY_EQSL_UPLOADED)) nvs_set_u32(s_nvs, KEY_EQSL_UPLOADED, snap.eqsl_uploaded_n);
-        if (dirty_test(&dirty_local, DIRTY_CL_URL))      nvs_set_str(s_nvs, KEY_CL_URL, snap.cloudlog_url);
-        if (dirty_test(&dirty_local, DIRTY_CL_KEY))      nvs_set_str(s_nvs, KEY_CL_KEY, snap.cloudlog_key);
-        if (dirty_test(&dirty_local, DIRTY_CL_STATION))  nvs_set_str(s_nvs, KEY_CL_STATION, snap.cloudlog_station);
-        if (dirty_test(&dirty_local, DIRTY_CL_UPLOADED)) nvs_set_u32(s_nvs, KEY_CL_UPLOADED, snap.cloudlog_uploaded_n);
-        if (dirty_test(&dirty_local, DIRTY_RX_AUD_EN))  nvs_set_u8(s_nvs, KEY_RX_AUD_EN,  snap.rx_audio_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_RX_AUD_VOL)) nvs_set_u8(s_nvs, KEY_RX_AUD_VOL, snap.rx_audio_vol);
-        if (dirty_test(&dirty_local, DIRTY_WF_BLACK))    nvs_set_float(KEY_WF_BLACK,    snap.wf_black_db);
-        if (dirty_test(&dirty_local, DIRTY_WF_CONTRAST)) nvs_set_float(KEY_WF_CONTRAST, snap.wf_contrast_db);
-        if (dirty_test(&dirty_local, DIRTY_WF_BLEND))    nvs_set_u8(s_nvs, KEY_WF_BLEND,  snap.wf_floor_blend);
-        if (dirty_test(&dirty_local, DIRTY_WF_WINDOW))   nvs_set_u8(s_nvs, KEY_WF_WINDOW, snap.wf_window);
-        if (dirty_test(&dirty_local, DIRTY_WF_SPEED))    nvs_set_u8(s_nvs, KEY_WF_ROWS,   snap.wf_rows_per_s);
-        if (dirty_test(&dirty_local, DIRTY_DISP_FLIP))   nvs_set_u8(s_nvs, KEY_DISP_FLIP, snap.display_flip ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_QMX_VOL))     nvs_set_u8(s_nvs, KEY_QMX_VOL,   snap.qmx_vol_db);
-        if (dirty_test(&dirty_local, DIRTY_CW_TX_OFFSET)) nvs_set_i16(s_nvs, KEY_CW_TX_OFF, snap.cw_tx_offset_hz);
-        if (dirty_test(&dirty_local, DIRTY_SWR_LIMIT))    nvs_set_u8(s_nvs, KEY_SWR_LIMIT, snap.swr_limit_x10);
-        if (dirty_test(&dirty_local, DIRTY_JS8_SUBMODE)) nvs_set_u8(s_nvs, KEY_JS8_SUBMODE, snap.js8_submode);
-        if (dirty_test(&dirty_local, DIRTY_RXA_GAIN))     nvs_set_u8(s_nvs, KEY_RXA_GAIN,   snap.rxaud_gain_d10);
-        if (dirty_test(&dirty_local, DIRTY_RXA_PWIDTH))   nvs_set_u8(s_nvs, KEY_RXA_PWIDTH, snap.rxaud_pan_width_x10);
-        if (dirty_test(&dirty_local, DIRTY_RXA_PBLEND))   nvs_set_u8(s_nvs, KEY_RXA_PBLEND, snap.rxaud_pan_blend_x100);
-        if (dirty_test(&dirty_local, DIRTY_RXA_POVLP))    nvs_set_u8(s_nvs, KEY_RXA_POVLP,  snap.rxaud_pan_ovlp_x100);
-        if (dirty_test(&dirty_local, DIRTY_RXA_ATTACK))   nvs_set_u8(s_nvs, KEY_RXA_ATTACK, snap.rxaud_agc_attack_ms);
-        if (dirty_test(&dirty_local, DIRTY_RXA_RELEASE))  nvs_set_u16(s_nvs, KEY_RXA_RELEASE, snap.rxaud_agc_release_ms);
-        if (dirty_test(&dirty_local, DIRTY_RXA_AGCOFF))   nvs_set_u8(s_nvs, KEY_RXA_AGCOFF, snap.rxaud_agc_off ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_RXA_AMBW))     nvs_set_u8(s_nvs, KEY_RXA_AMBW,   snap.rxaud_am_half_bw_h100);
-        if (dirty_test(&dirty_local, DIRTY_HP_MUTE))      nvs_set_u8(s_nvs, KEY_HP_MUTE, snap.hp_mute_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_FREQ_KP_SMALL)) nvs_set_u8(s_nvs, KEY_FREQ_KP_SMALL, snap->freq_kp_small ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_PASSBAND_HZ))   nvs_set_u32(s_nvs, KEY_PASSBAND_HZ, snap->passband_width_hz);
+        if (dirty_test(&dirty_local, DIRTY_QRZ_KEY))      nvs_set_str(s_nvs, KEY_QRZ_KEY, snap->qrz_api_key);
+        if (dirty_test(&dirty_local, DIRTY_QRZ_UPLOADED)) nvs_set_u32(s_nvs, KEY_QRZ_UPLOADED, snap->qrz_uploaded_n);
+        if (dirty_test(&dirty_local, DIRTY_EQSL_USER))     nvs_set_str(s_nvs, KEY_EQSL_USER, snap->eqsl_user);
+        if (dirty_test(&dirty_local, DIRTY_EQSL_PSWD))     nvs_set_str(s_nvs, KEY_EQSL_PSWD, snap->eqsl_pswd);
+        if (dirty_test(&dirty_local, DIRTY_QRZ_LU_USER))   nvs_set_str(s_nvs, KEY_QRZ_LU_USER, snap->qrz_lookup_user);
+        if (dirty_test(&dirty_local, DIRTY_QRZ_LU_PASS))   nvs_set_str(s_nvs, KEY_QRZ_LU_PASS, snap->qrz_lookup_pass);
+        if (dirty_test(&dirty_local, DIRTY_EQSL_UPLOADED)) nvs_set_u32(s_nvs, KEY_EQSL_UPLOADED, snap->eqsl_uploaded_n);
+        if (dirty_test(&dirty_local, DIRTY_CL_URL))      nvs_set_str(s_nvs, KEY_CL_URL, snap->cloudlog_url);
+        if (dirty_test(&dirty_local, DIRTY_CL_KEY))      nvs_set_str(s_nvs, KEY_CL_KEY, snap->cloudlog_key);
+        if (dirty_test(&dirty_local, DIRTY_CL_STATION))  nvs_set_str(s_nvs, KEY_CL_STATION, snap->cloudlog_station);
+        if (dirty_test(&dirty_local, DIRTY_CL_UPLOADED)) nvs_set_u32(s_nvs, KEY_CL_UPLOADED, snap->cloudlog_uploaded_n);
+        if (dirty_test(&dirty_local, DIRTY_RX_AUD_EN))  nvs_set_u8(s_nvs, KEY_RX_AUD_EN,  snap->rx_audio_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_BINAURAL))   nvs_set_u8(s_nvs, KEY_BINAURAL,   snap->binaural_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_WEBRADIO_EN)) nvs_set_u8(s_nvs, KEY_WEBRADIO_EN, snap->webradio_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_RX_AUD_VOL)) nvs_set_u8(s_nvs, KEY_RX_AUD_VOL, snap->rx_audio_vol);
+        if (dirty_test(&dirty_local, DIRTY_WF_BLACK))    nvs_set_float(KEY_WF_BLACK,    snap->wf_black_db);
+        if (dirty_test(&dirty_local, DIRTY_WF_CONTRAST)) nvs_set_float(KEY_WF_CONTRAST, snap->wf_contrast_db);
+        if (dirty_test(&dirty_local, DIRTY_WF_BLEND))    nvs_set_u8(s_nvs, KEY_WF_BLEND,  snap->wf_floor_blend);
+        if (dirty_test(&dirty_local, DIRTY_WF_WINDOW))   nvs_set_u8(s_nvs, KEY_WF_WINDOW, snap->wf_window);
+        if (dirty_test(&dirty_local, DIRTY_WF_SPEED))    nvs_set_u8(s_nvs, KEY_WF_ROWS,   snap->wf_rows_per_s);
+        if (dirty_test(&dirty_local, DIRTY_SPEC_PEAK))   nvs_set_u8(s_nvs, KEY_SPEC_PEAK, snap->spec_peak_s);
+        if (dirty_test(&dirty_local, DIRTY_CW_PEAK))     nvs_set_u16(s_nvs, KEY_CW_PEAK,  snap->cw_peak_hz);
+        if (dirty_test(&dirty_local, DIRTY_DISP_FLIP))   nvs_set_u8(s_nvs, KEY_DISP_FLIP, snap->display_flip ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_QMX_VOL))     nvs_set_u8(s_nvs, KEY_QMX_VOL,   snap->qmx_vol_db);
+        if (dirty_test(&dirty_local, DIRTY_CW_TX_OFFSET)) nvs_set_i16(s_nvs, KEY_CW_TX_OFF, snap->cw_tx_offset_hz);
+        if (dirty_test(&dirty_local, DIRTY_SWR_LIMIT))    nvs_set_u8(s_nvs, KEY_SWR_LIMIT, snap->swr_limit_x10);
+        if (dirty_test(&dirty_local, DIRTY_JS8_SUBMODE)) nvs_set_u8(s_nvs, KEY_JS8_SUBMODE, snap->js8_submode);
+        if (dirty_test(&dirty_local, DIRTY_JS8_ALT_SUB)) nvs_set_u8(s_nvs, KEY_JS8_ALT_SUB, snap->js8_alt_submode);
+        if (dirty_test(&dirty_local, DIRTY_RXA_GAIN))     nvs_set_u8(s_nvs, KEY_RXA_GAIN,   snap->rxaud_gain_d10);
+        if (dirty_test(&dirty_local, DIRTY_RXA_PWIDTH))   nvs_set_u8(s_nvs, KEY_RXA_PWIDTH, snap->rxaud_pan_width_x10);
+        if (dirty_test(&dirty_local, DIRTY_RXA_PBLEND))   nvs_set_u8(s_nvs, KEY_RXA_PBLEND, snap->rxaud_pan_blend_x100);
+        if (dirty_test(&dirty_local, DIRTY_RXA_POVLP))    nvs_set_u8(s_nvs, KEY_RXA_POVLP,  snap->rxaud_pan_ovlp_x100);
+        if (dirty_test(&dirty_local, DIRTY_RXA_ATTACK))   nvs_set_u8(s_nvs, KEY_RXA_ATTACK, snap->rxaud_agc_attack_ms);
+        if (dirty_test(&dirty_local, DIRTY_RXA_RELEASE))  nvs_set_u16(s_nvs, KEY_RXA_RELEASE, snap->rxaud_agc_release_ms);
+        if (dirty_test(&dirty_local, DIRTY_RXA_AGCOFF))   nvs_set_u8(s_nvs, KEY_RXA_AGCOFF, snap->rxaud_agc_off ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_RXA_AMBW))     nvs_set_u8(s_nvs, KEY_RXA_AMBW,   snap->rxaud_am_half_bw_h100);
+        if (dirty_test(&dirty_local, DIRTY_HP_MUTE))      nvs_set_u8(s_nvs, KEY_HP_MUTE, snap->hp_mute_en ? 1 : 0);
         if (dirty_test(&dirty_local, DIRTY_ACTIVATION)) {
-            nvs_set_u8(s_nvs, KEY_ACT_TYPE, snap.act_type);
-            nvs_set_str(s_nvs, KEY_ACT_REF, snap.act_ref);
+            nvs_set_u8(s_nvs, KEY_ACT_TYPE, snap->act_type);
+            nvs_set_str(s_nvs, KEY_ACT_REF, snap->act_ref);
         }
-        if (dirty_test(&dirty_local, DIRTY_BP_REGION))   nvs_set_u8(s_nvs, KEY_BP_REGION, snap.bandplan_region);
-        if (dirty_test(&dirty_local, DIRTY_DISTANCE_MILES)) nvs_set_u8(s_nvs, KEY_DISTANCE_MILES, snap.distance_in_miles ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_FREQ_SEP))       nvs_set_u8(s_nvs, KEY_FREQ_SEP, snap.freq_sep_style);
-        if (dirty_test(&dirty_local, DIRTY_CW_DECODE)) nvs_set_u8(s_nvs, KEY_CW_DECODE, snap.cw_decode_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_RIT_PILL_SHOW)) nvs_set_u8(s_nvs, KEY_RIT_PILL_SHOW, snap.rit_pill_show ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_STILL_VIEW))   nvs_set_u8(s_nvs, KEY_STILL_VIEW,   snap.still_view ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_STILL_NOTICE)) nvs_set_u8(s_nvs, KEY_STILL_NOTICE, snap.still_notice_done ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_SPUR_SUP))      nvs_set_u8(s_nvs, KEY_SPUR_SUP, snap.spur_mode);
-        if (dirty_test(&dirty_local, DIRTY_FT8_EARLY_DEC)) nvs_set_u8(s_nvs, KEY_FT8_EARLY_DEC, snap.ft8_early_decode ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_GREYLIST_EN))   nvs_set_u8(s_nvs, KEY_GREYLIST_EN,   snap.greylist_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_PSKREP_EN))     nvs_set_u8(s_nvs, KEY_PSKREP_EN,     snap.pskreporter_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_PSK_RX_EN))     nvs_set_u8(s_nvs, KEY_PSK_RX_EN,     snap.psk_rx_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_BT_MOUSE_EN))   nvs_set_u8(s_nvs, KEY_BT_MOUSE_EN,   snap.bt_mouse_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_CLUSTER_EN))    nvs_set_u8(s_nvs, KEY_CLUSTER_EN,    snap.cluster_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_SPOTS_MODE_FLT)) nvs_set_u8(s_nvs, KEY_SPOTS_MODE_FLT, snap.spots_mode_filter ? 1 : 0);
-    if (dirty_test(&dirty_local, DIRTY_SPOTS_EN))      nvs_set_u8(s_nvs, KEY_SPOTS_EN,      snap.spots_en ? 1 : 0);
-    if (dirty_test(&dirty_local, DIRTY_RBN_EN))        nvs_set_u8(s_nvs, KEY_RBN_EN,        snap.rbn_en ? 1 : 0);
-    if (dirty_test(&dirty_local, DIRTY_SOTA_EN))       nvs_set_u8(s_nvs, KEY_SOTA_EN,       snap.sota_en ? 1 : 0);
-    if (dirty_test(&dirty_local, DIRTY_OTA_AUTODL))    nvs_set_u8(s_nvs, KEY_OTA_AUTODL,    snap.ota_autodl ? 1 : 0);
-    if (dirty_test(&dirty_local, DIRTY_DRAWER_EXPERT)) nvs_set_u8(s_nvs, KEY_DRAWER_EXPERT, snap.drawer_expert ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_BP_REGION))   nvs_set_u8(s_nvs, KEY_BP_REGION, snap->bandplan_region);
+        if (dirty_test(&dirty_local, DIRTY_DISTANCE_MILES)) nvs_set_u8(s_nvs, KEY_DISTANCE_MILES, snap->distance_in_miles ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_FREQ_SEP))       nvs_set_u8(s_nvs, KEY_FREQ_SEP, snap->freq_sep_style);
+        if (dirty_test(&dirty_local, DIRTY_CW_DECODE)) nvs_set_u8(s_nvs, KEY_CW_DECODE, snap->cw_decode_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_LOG_VIEW_ALL)) nvs_set_u8(s_nvs, KEY_LOG_VIEW_ALL, snap->log_view_all ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_CW_ROWS))   nvs_set_u8(s_nvs, KEY_CW_ROWS,   snap->cw_decode_rows);
+        if (dirty_test(&dirty_local, DIRTY_RIT_PILL_SHOW)) nvs_set_u8(s_nvs, KEY_RIT_PILL_SHOW, snap->rit_pill_show ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_STILL_VIEW))   nvs_set_u8(s_nvs, KEY_STILL_VIEW,   snap->still_view ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_STILL_NOTICE)) nvs_set_u8(s_nvs, KEY_STILL_NOTICE, snap->still_notice_done ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_SPUR_SUP))      nvs_set_u8(s_nvs, KEY_SPUR_SUP, snap->spur_mode);
+        if (dirty_test(&dirty_local, DIRTY_FT8_EARLY_DEC)) nvs_set_u8(s_nvs, KEY_FT8_EARLY_DEC, snap->ft8_early_decode ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_GREYLIST_EN))   nvs_set_u8(s_nvs, KEY_GREYLIST_EN,   snap->greylist_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_TXBAND_OFF))    nvs_set_u8(s_nvs, KEY_TXBAND_OFF,    snap->tx_band_guard_off ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_PSKREP_EN))     nvs_set_u8(s_nvs, KEY_PSKREP_EN,     snap->pskreporter_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_PSK_RX_EN))     nvs_set_u8(s_nvs, KEY_PSK_RX_EN,     snap->psk_rx_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_BT_MOUSE_EN))   nvs_set_u8(s_nvs, KEY_BT_MOUSE_EN,   snap->bt_mouse_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_CLUSTER_EN))    nvs_set_u8(s_nvs, KEY_CLUSTER_EN,    snap->cluster_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_SPOTS_MODE_FLT)) nvs_set_u8(s_nvs, KEY_SPOTS_MODE_FLT, snap->spots_mode_filter ? 1 : 0);
+    if (dirty_test(&dirty_local, DIRTY_SPOTS_EN))      nvs_set_u8(s_nvs, KEY_SPOTS_EN,      snap->spots_en ? 1 : 0);
+    if (dirty_test(&dirty_local, DIRTY_RBN_EN))        nvs_set_u8(s_nvs, KEY_RBN_EN,        snap->rbn_en ? 1 : 0);
+    if (dirty_test(&dirty_local, DIRTY_SOTA_EN))       nvs_set_u8(s_nvs, KEY_SOTA_EN,       snap->sota_en ? 1 : 0);
+    if (dirty_test(&dirty_local, DIRTY_OTA_AUTODL))    nvs_set_u8(s_nvs, KEY_OTA_AUTODL,    snap->ota_autodl ? 1 : 0);
+    if (dirty_test(&dirty_local, DIRTY_DRAWER_EXPERT)) nvs_set_u8(s_nvs, KEY_DRAWER_EXPERT, snap->drawer_expert ? 1 : 0);
     if (dirty_test(&dirty_local, DIRTY_WIFI_KNOWN)) {
         // Known-network list: not part of s_pending (see settings.h), so take a
         // consistent copy under the mutex before writing it out.
@@ -727,72 +861,81 @@ static void flush_task(void *arg)
         xSemaphoreGive(s_mutex);
         nvs_set_str(s_nvs, KEY_WIFI_STATIC_SSID, own);
     }
-        if (dirty_test(&dirty_local, DIRTY_TX_TONE_HZ))    nvs_set_u16(s_nvs, KEY_TX_TONE_HZ,   snap.tx_tone_hz);
-        if (dirty_test(&dirty_local, DIRTY_TX_TONE_HOLD))  nvs_set_u8(s_nvs, KEY_TX_TONE_HOLD,  snap.tx_tone_hold ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_FT8_SYNC_LINES)) nvs_set_u8(s_nvs, KEY_FT8_SYNC_LINES, snap.ft8_sync_lines ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_FIELD_DAY_EN)) nvs_set_u8(s_nvs, KEY_FIELD_DAY_EN, snap.field_day_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_FD_CLASS))     nvs_set_str(s_nvs, KEY_FD_CLASS, snap.fd_class);
-        if (dirty_test(&dirty_local, DIRTY_FD_SECTION))   nvs_set_str(s_nvs, KEY_FD_SECTION, snap.fd_section);
-        if (dirty_test(&dirty_local, DIRTY_SIM_MODE))     nvs_set_u8(s_nvs, KEY_SIM_MODE, snap.sim_mode_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_WSPR_DIAL))    nvs_set_u32(s_nvs, KEY_WSPR_DIAL, snap.wspr_dial_hz);
-        if (dirty_test(&dirty_local, DIRTY_WSPR_TX_EN))   nvs_set_u8(s_nvs, KEY_WSPR_TX_EN, snap.wspr_tx_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_WSPR_DUTY))  { nvs_set_u8(s_nvs, KEY_WSPR_DUTY, snap.wspr_rx_cycles);
+        if (dirty_test(&dirty_local, DIRTY_TX_TONE_HZ))    nvs_set_u16(s_nvs, KEY_TX_TONE_HZ,   snap->tx_tone_hz);
+        if (dirty_test(&dirty_local, DIRTY_TX_TONE_HOLD))  nvs_set_u8(s_nvs, KEY_TX_TONE_HOLD,  snap->tx_tone_hold ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_FT8_SYNC_LINES)) nvs_set_u8(s_nvs, KEY_FT8_SYNC_LINES, snap->ft8_sync_lines ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_FIELD_DAY_EN)) nvs_set_u8(s_nvs, KEY_FIELD_DAY_EN, snap->field_day_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_FD_CLASS))     nvs_set_str(s_nvs, KEY_FD_CLASS, snap->fd_class);
+        if (dirty_test(&dirty_local, DIRTY_FD_SECTION))   nvs_set_str(s_nvs, KEY_FD_SECTION, snap->fd_section);
+        if (dirty_test(&dirty_local, DIRTY_SIM_MODE))     nvs_set_u8(s_nvs, KEY_SIM_MODE, snap->sim_mode_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_WSPR_DIAL))    nvs_set_u32(s_nvs, KEY_WSPR_DIAL, snap->wspr_dial_hz);
+        if (dirty_test(&dirty_local, DIRTY_WSPR_TX_EN))   nvs_set_u8(s_nvs, KEY_WSPR_TX_EN, snap->wspr_tx_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_WSPR_DUTY))  { nvs_set_u8(s_nvs, KEY_WSPR_DUTY, snap->wspr_rx_cycles);
                                                           nvs_set_u8(s_nvs, KEY_WSPR_SCHED_V, 1); }
-        if (dirty_test(&dirty_local, DIRTY_WSPR_BURST)) { nvs_set_u8(s_nvs, KEY_WSPR_BURST, snap.wspr_tx_cycles);
+        if (dirty_test(&dirty_local, DIRTY_WSPR_BURST)) { nvs_set_u8(s_nvs, KEY_WSPR_BURST, snap->wspr_tx_cycles);
                                                           nvs_set_u8(s_nvs, KEY_WSPR_SCHED_V, 1); }
-        if (dirty_test(&dirty_local, DIRTY_WSPR_DBM))     nvs_set_i8(s_nvs, KEY_WSPR_DBM, snap.wspr_tx_dbm);
-        if (dirty_test(&dirty_local, DIRTY_WSPR_TONE))    nvs_set_u16(s_nvs, KEY_WSPR_TONE, snap.wspr_tx_tone_hz);
+        if (dirty_test(&dirty_local, DIRTY_WSPR_DBM))     nvs_set_i8(s_nvs, KEY_WSPR_DBM, snap->wspr_tx_dbm);
+        if (dirty_test(&dirty_local, DIRTY_WSPR_TONE))    nvs_set_u16(s_nvs, KEY_WSPR_TONE, snap->wspr_tx_tone_hz);
         if (dirty_test(&dirty_local, DIRTY_WSPR_PA)) {
-            nvs_set_u8(s_nvs, KEY_WSPR_PARED, snap.wspr_pa_reduce ? 1 : 0);
-            nvs_set_u16(s_nvs, KEY_WSPR_PASAVE, snap.wspr_pa_saved_x10);
+            nvs_set_u8(s_nvs, KEY_WSPR_PARED, snap->wspr_pa_reduce ? 1 : 0);
+            nvs_set_u16(s_nvs, KEY_WSPR_PASAVE, snap->wspr_pa_saved_x10);
         }
-        if (dirty_test(&dirty_local, DIRTY_WSPR_DUMP))    nvs_set_u8(s_nvs, KEY_WSPR_DUMP, snap.wspr_dump_cycles);
-        if (dirty_test(&dirty_local, DIRTY_WSPR_HOPM))    nvs_set_u16(s_nvs, KEY_WSPR_HOPM, snap.wspr_hop_mask);
-        if (dirty_test(&dirty_local, DIRTY_WSPR_HOPE))    nvs_set_u8(s_nvs, KEY_WSPR_HOPE, snap.wspr_hop_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_WSPR_EN))      nvs_set_u8(s_nvs, KEY_WSPR_EN,   snap.wspr_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_WSPR_NET))     nvs_set_u8(s_nvs, KEY_WSPR_NET,  snap.wspr_net_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_FT8_OP_MODE))  nvs_set_u8(s_nvs, KEY_FT8_OP_MODE, snap.ft8_op_mode);
-        if (dirty_test(&dirty_local, DIRTY_CHARGE_LIM_EN))  nvs_set_u8(s_nvs, KEY_CHARGE_LIM_EN,  snap.charge_limit_en ? 1 : 0);
-        if (dirty_test(&dirty_local, DIRTY_CHARGE_LIM_PCT)) nvs_set_u8(s_nvs, KEY_CHARGE_LIM_PCT, snap.charge_limit_pct);
+        if (dirty_test(&dirty_local, DIRTY_WSPR_DUMP))    nvs_set_u8(s_nvs, KEY_WSPR_DUMP, snap->wspr_dump_cycles);
+        if (dirty_test(&dirty_local, DIRTY_WSPR_HOPM))    nvs_set_u16(s_nvs, KEY_WSPR_HOPM, snap->wspr_hop_mask);
+        if (dirty_test(&dirty_local, DIRTY_WSPR_HOPE))    nvs_set_u8(s_nvs, KEY_WSPR_HOPE, snap->wspr_hop_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_WSPR_EN))      nvs_set_u8(s_nvs, KEY_WSPR_EN,   snap->wspr_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_WSPR_NET))     nvs_set_u8(s_nvs, KEY_WSPR_NET,  snap->wspr_net_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_FT8_OP_MODE))  nvs_set_u8(s_nvs, KEY_FT8_OP_MODE, snap->ft8_op_mode);
+        if (dirty_test(&dirty_local, DIRTY_CHARGE_LIM_EN))  nvs_set_u8(s_nvs, KEY_CHARGE_LIM_EN,  snap->charge_limit_en ? 1 : 0);
+        if (dirty_test(&dirty_local, DIRTY_CHARGE_LIM_PCT)) nvs_set_u8(s_nvs, KEY_CHARGE_LIM_PCT, snap->charge_limit_pct);
         if (dirty_test(&dirty_local, DIRTY_GPIO_RELAY)) {
-            nvs_set_u8 (s_nvs, KEY_RELAY_PIN,   snap.gpio_relay_pin);
-            nvs_set_u8 (s_nvs, KEY_RELAY_LEVEL, snap.gpio_relay_level ? 1 : 0);
-            nvs_set_u16(s_nvs, KEY_RELAY_MS,    snap.gpio_relay_ms);
+            nvs_set_u8 (s_nvs, KEY_RELAY_PIN,   snap->gpio_relay_pin);
+            nvs_set_u8 (s_nvs, KEY_RELAY_LEVEL, snap->gpio_relay_level ? 1 : 0);
+            nvs_set_u16(s_nvs, KEY_RELAY_MS,    snap->gpio_relay_ms);
+            nvs_set_u8 (s_nvs, KEY_RELAY_SOLO,  snap->gpio_relay_solo ? 1 : 0);
         }
         if (dirty_test(&dirty_local, DIRTY_PORT_A_MODE))
-            nvs_set_u8(s_nvs, KEY_PORT_A_MODE, snap.port_a_mode);
+            nvs_set_u8(s_nvs, KEY_PORT_A_MODE, snap->port_a_mode);
         if (dirty_test(&dirty_local, DIRTY_RX_SOURCE))
-            nvs_set_u8(s_nvs, KEY_RX_SOURCE, snap.rx_source);
+            nvs_set_u8(s_nvs, KEY_RX_SOURCE, snap->rx_source);
         if (dirty_test(&dirty_local, DIRTY_LINEIN_GAIN))
-            nvs_set_u8(s_nvs, KEY_LINEIN_GAIN, snap.line_in_gain_db);
-        if (dirty_test(&dirty_local, DIRTY_RESMON_EN))  nvs_set_u8(s_nvs, KEY_RESMON_EN, snap.resmon_en ? 1 : 0);
+            nvs_set_u8(s_nvs, KEY_LINEIN_GAIN, snap->line_in_gain_db);
+        if (dirty_test(&dirty_local, DIRTY_RESMON_EN))  nvs_set_u8(s_nvs, KEY_RESMON_EN, snap->resmon_en ? 1 : 0);
         if (dirty_test(&dirty_local, DIRTY_RESMON_POS)) {
-            nvs_set_i16(s_nvs, KEY_RESMON_DX, snap.resmon_dx);
-            nvs_set_i16(s_nvs, KEY_RESMON_DY, snap.resmon_dy);
+            nvs_set_i16(s_nvs, KEY_RESMON_DX, snap->resmon_dx);
+            nvs_set_i16(s_nvs, KEY_RESMON_DY, snap->resmon_dy);
         }
-        if (dirty_test(&dirty_local, DIRTY_DISP_SLEEP))    nvs_set_u8(s_nvs, KEY_DISP_SLEEP, snap.display_sleep_min);
+        if (dirty_test(&dirty_local, DIRTY_DISP_SLEEP))    nvs_set_u8(s_nvs, KEY_DISP_SLEEP, snap->display_sleep_min);
         // State/county ride DIRTY_LOTW_DXCC: the dirty bitmap is full (bits
         // 0-63 all allocated) and all three are only ever written together, so
         // one bit covers them. Re-writing an unchanged dxcc costs nothing.
         if (dirty_test(&dirty_local, DIRTY_LOTW_DXCC)) {
-            nvs_set_str(s_nvs, KEY_LOTW_DXCC,   snap.lotw_dxcc);
-            nvs_set_str(s_nvs, KEY_LOTW_STATE,  snap.lotw_state);
-            nvs_set_str(s_nvs, KEY_LOTW_COUNTY, snap.lotw_county);
+            nvs_set_str(s_nvs, KEY_LOTW_DXCC,   snap->lotw_dxcc);
+            nvs_set_str(s_nvs, KEY_LOTW_STATE,  snap->lotw_state);
+            nvs_set_str(s_nvs, KEY_LOTW_COUNTY, snap->lotw_county);
         }
         // One bit for all four: they are only ever set together, and a
         // partially-applied network configuration is not a state worth being
         // able to reach.
         if (dirty_test(&dirty_local, DIRTY_WIFI_STATIC)) {
-            nvs_set_str(s_nvs, KEY_WIFI_IP,   snap.wifi_ip);
-            nvs_set_str(s_nvs, KEY_WIFI_MASK, snap.wifi_mask);
-            nvs_set_str(s_nvs, KEY_WIFI_GW,   snap.wifi_gw);
-            nvs_set_str(s_nvs, KEY_WIFI_DNS,  snap.wifi_dns);
+            nvs_set_str(s_nvs, KEY_WIFI_IP,   snap->wifi_ip);
+            nvs_set_str(s_nvs, KEY_WIFI_MASK, snap->wifi_mask);
+            nvs_set_str(s_nvs, KEY_WIFI_GW,   snap->wifi_gw);
+            nvs_set_str(s_nvs, KEY_WIFI_DNS,  snap->wifi_dns);
         }
-        if (dirty_test(&dirty_local, DIRTY_LOTW_CQZ))      nvs_set_str(s_nvs, KEY_LOTW_CQZ,  snap.lotw_cqz);
-        if (dirty_test(&dirty_local, DIRTY_LOTW_ITUZ))     nvs_set_str(s_nvs, KEY_LOTW_ITUZ, snap.lotw_ituz);
-        if (dirty_test(&dirty_local, DIRTY_LOTW_UPLOADED)) nvs_set_u32(s_nvs, KEY_LOTW_UPLOADED, snap.lotw_uploaded_n);
+        if (dirty_test(&dirty_local, DIRTY_LOTW_CQZ))      nvs_set_str(s_nvs, KEY_LOTW_CQZ,  snap->lotw_cqz);
+        if (dirty_test(&dirty_local, DIRTY_LOTW_ITUZ))     nvs_set_str(s_nvs, KEY_LOTW_ITUZ, snap->lotw_ituz);
+        if (dirty_test(&dirty_local, DIRTY_LOTW_UPLOADED)) nvs_set_u32(s_nvs, KEY_LOTW_UPLOADED, snap->lotw_uploaded_n);
 
+        /* T138: an NVS commit is a flash write with the cache off, and this
+         * one fires within 100 ms of any changed setting - so it is the stretch
+         * a TOUCH can put on the bus, which is the shape Michael KZ4LY's crash
+         * report has ("it crashed when I touched the Tab5"). Marked, not
+         * accused: a crumb here at the next boot is evidence, the hypothesis
+         * on its own was not. */
+        panic_hook_crumb_enter("nvs:settings-commit");
         esp_err_t err = nvs_commit(s_nvs);
+        panic_hook_crumb_exit();
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "nvs_commit failed: 0x%x", err);
         } else {
@@ -923,8 +1066,11 @@ static void load_from_nvs(qmx_settings_t *out)
     out->flat_mode  = DEF_FLAT_MODE;
     out->last_vfo_hz = 0;
     out->ft8_freq_hz = 14074000;   // 20m FT8 — sane default so FT8 never opens on an inherited odd VFO
+    out->ft4_freq_hz = 14080000;   // 20m FT4 calling frequency (T89)
+    out->js8_freq_hz = 14078000;   // 20m JS8 calling frequency (T89)
     out->cw_pitch_hz = DEF_CW_PITCH;
     out->cw_cal_hz   = DEF_CW_CAL;
+    out->sb_lowcut_hz = 300;   /* T90: the common SSB transmit low cut */
     out->rit_pill_show = true;   // opt-OUT, so it must be set here and not left zeroed
     /* 500 Hz is today's SSB/digital grid, so an existing unit's behaviour does
        not change when this setting appears. Must be set here, not left zeroed -
@@ -933,6 +1079,10 @@ static void load_from_nvs(qmx_settings_t *out)
     /* Decoded CW is ON by default - it is the point of the feature - so like
        rit_pill_show it is an opt-OUT and must be set here, not left zeroed. */
     out->cw_decode_en = true;
+    /* log_view_all stays false: the window opens on Today, which is what the
+       10-QSO activation count is for. Left zeroed on purpose and noted here
+       so the next reader does not take the absence for an oversight. */
+    out->cw_decode_rows = DEF_CW_ROWS;
     /* #298: the still display is the DEFAULT. Anyone who prefers the old
      * dial-centred view turns it off in the drawer, and is told once that they
      * can - see the notice in ui.c. still_notice_done stays false so an
@@ -955,6 +1105,56 @@ static void load_from_nvs(qmx_settings_t *out)
     out->cq_msg[2][0] = '\0';
     out->cq_sel = 0;
     out->cq_max_calls = 0;
+    // CW keyer memory defaults: usable out of the box, editable in place.
+    // {MYCALL}/{PARK} expand at send time (cw_screen_view.c) so the defaults
+    // work for every operator without baking a callsign in.
+    strcpy(out->cw_msg[0], "CQ CQ DE {MYCALL} {MYCALL} K");
+    strcpy(out->cw_msg[1], "CQ POTA DE {MYCALL} {MYCALL} K");
+    /* ⛔ M3 AND M4 NAME THE STATION, because a direct tap and the NEXT
+     * button used to send different things from the same memory. NEXT
+     * prefixed the captured call (cw_qso.c compose()); tapping M3 on the
+     * pane keyed a bare "UR 599 599 BK" addressed to nobody, which on a busy
+     * band is a report anyone might take as theirs. With {CALL} in the text
+     * both paths send the same words, and compose() skips its prefix when
+     * it sees the macro so the call is not sent twice.
+     *
+     * ⚠ The cost, stated rather than discovered: these two now REFUSE when
+     * no station has been captured, with "station (tap the card)". That is
+     * already how the NEXT ladder behaved - it returned false without a
+     * target - so this makes the direct tap agree with it rather than
+     * inventing a new rule. */
+    strcpy(out->cw_msg[2], "{CALL} UR 599 599 BK");
+    strcpy(out->cw_msg[3], "{CALL} TU 73 EE");
+    strcpy(out->cw_msg[4], "AGN AGN BK");
+    strcpy(out->cw_msg[5], "QRZ? DE {MYCALL} K");
+    // Set B defaults, "Contest" - same structure, 5NN instead of 599 (decided
+    // 2026-11-02, see memory/project_cw_macro_set_selector_decided.md).
+    // {SERIAL} built 2026-11-03 (T151) - M3 now sends a real serial exchange
+    // instead of repeating 5NN where the number belongs; still just a
+    // starting point, not a finished contest sheet for every exchange format.
+    strcpy(out->cw_msg_b[0], "CQ CQ TEST DE {MYCALL} {MYCALL} K");
+    strcpy(out->cw_msg_b[1], "CQ TEST DE {MYCALL} {MYCALL} TEST");
+    strcpy(out->cw_msg_b[2], "{CALL} 5NN {SERIAL} BK");
+    strcpy(out->cw_msg_b[3], "{CALL} TU 73 EE");
+    strcpy(out->cw_msg_b[4], "AGN AGN BK");
+    strcpy(out->cw_msg_b[5], "QRZ? DE {MYCALL} K");
+    out->cw_msg_set = 0;   // General first - the set that already had real use
+    /* ⚠ NO DEFAULT USES {PARK}, and that is on purpose after looking at what
+     * it would cost. expand_macros() REFUSES a message whose macro has no
+     * value, so putting {PARK} in M2 would stop "CQ POTA" working for
+     * everyone who is not activating - a worse failure than the park not
+     * being offered. M2 also still says POTA literally; a {PROG} macro taking
+     * the word from the running activation has the same refusal problem when
+     * nothing is running. Both want an operator decision, not a default. */
+    out->cw_park[0] = '\0';
+    out->cw_rst_cut_nines = false;
+    out->cw_serial_next = 1;
+    out->cw_sim_en = false;
+    /* ON from v1.24.0 (operator): ships as the release's beta, not hidden
+     * behind a config line nobody would find. It still has no abort for a
+     * message in flight - see cw_screen_view.c's header - and "beta" is
+     * carried everywhere the page is documented for exactly that reason. */
+    out->cw_page_en = true;
     out->hound_mode   = 0;   // off: Hound changes TX behaviour, so it is opt-in
     out->cq_listen_every = 0;
     out->onboarded = false;
@@ -978,16 +1178,21 @@ static void load_from_nvs(qmx_settings_t *out)
     out->cloudlog_station[0] = '\0';
     out->cloudlog_uploaded_n = 0;
     out->rx_audio_en  = DEF_RX_AUD_EN;
+    out->binaural_en  = DEF_BINAURAL;
+    out->webradio_en  = DEF_WEBRADIO_EN;
     out->rx_audio_vol = DEF_RX_AUD_VOL;
     out->wf_black_db    = DEF_WF_BLACK;
     out->wf_contrast_db = DEF_WF_CONTRAST;
     out->wf_floor_blend = DEF_WF_BLEND;
     out->wf_window      = DEF_WF_WINDOW;
     out->wf_rows_per_s  = DEF_WF_ROWS;
+    out->spec_peak_s    = DEF_SPEC_PEAK;
+    out->cw_peak_hz     = DEF_CW_PEAK;
     out->display_flip   = false;
     out->qmx_vol_db     = 20;   // fallback slider position only - never sent at boot
     out->ft8_early_decode = true; // on by default (WSJT-X-style fast pounce timing)
     out->greylist_en = false;     // opt-in ("Allow grey-listing", Filter modal)
+    out->tx_band_guard_off = false;   // guard ON by default - see settings.h
     // ON by default: contributing reception reports is the norm for FT8
     // software (WSJT-X ships PSK Reporter spotting enabled) and the data is
     // inherently public ham activity. Disclosed in the release notes + manual;
@@ -1029,6 +1234,12 @@ static void load_from_nvs(qmx_settings_t *out)
     // on a merely mediocre match; the drawer can raise it or turn it off.
     out->swr_limit_x10 = 30;
     out->js8_submode   = 0;    /* Normal - what every station runs */
+    /* T132: the alternate submode to ALSO decode, on a duty cycle.
+     * 255 (JS8_ALT_OFF) = off, and it is off by default because Fast,
+     * Turbo and Slow have never been exchanged with a real JS8Call
+     * station - only our own encoder and decoder agree. It costs CPU on
+     * core 1 and it must earn that on air first. */
+    out->js8_alt_submode = 255;
     /* Defaults mirror rx_audio.h's documented ones (200 / 1.8 / 0.15 / 0.30),
      * which are the values tuned on the air 2026-09-20. */
     out->rxaud_gain_d10       = 20;
@@ -1072,6 +1283,7 @@ static void load_from_nvs(qmx_settings_t *out)
     out->gpio_relay_pin   = DEF_RELAY_PIN;
     out->gpio_relay_level = DEF_RELAY_LEVEL;
     out->gpio_relay_ms    = DEF_RELAY_MS;
+    out->gpio_relay_solo  = DEF_RELAY_SOLO;
     /* Absent key == relay. This is the upgrade guarantee: a board that has
      * never heard of the Unit GPS boots with both pins driven exactly as they
      * were before the setting existed (task 2.4's READ BACK check). */
@@ -1108,8 +1320,11 @@ static void load_from_nvs(qmx_settings_t *out)
     if (nvs_get_u8(s_nvs, KEY_FLAT_MODE,  &u8v) == ESP_OK) out->flat_mode  = (u8v != 0);
     nvs_get_u32(s_nvs, KEY_LAST_VFO, &out->last_vfo_hz);
     nvs_get_u32(s_nvs, KEY_FT8_FREQ, &out->ft8_freq_hz);
+    nvs_get_u32(s_nvs, KEY_FT4_FREQ, &out->ft4_freq_hz);
+    nvs_get_u32(s_nvs, KEY_JS8_FREQ, &out->js8_freq_hz);
     nvs_get_u16(s_nvs, KEY_CW_PITCH, &out->cw_pitch_hz);
     nvs_get_i16(s_nvs, KEY_CW_CAL,   &out->cw_cal_hz);
+    nvs_get_u16(s_nvs, KEY_SB_LOWCUT, &out->sb_lowcut_hz);
     { uint32_t bits = 0; if (nvs_get_u32(s_nvs, KEY_ZOOM, &bits) == ESP_OK) memcpy(&out->zoom_factor, &bits, 4); }
     nvs_get_u8(s_nvs, KEY_COLORMAP, &out->colormap_idx);
     nvs_get_u8(s_nvs, KEY_BRIGHTNESS, &out->brightness_pct);
@@ -1135,6 +1350,9 @@ static void load_from_nvs(qmx_settings_t *out)
     out->my_grid[0] = '\0';
     sz = sizeof(out->my_grid);
     nvs_get_str(s_nvs, KEY_MY_GRID, out->my_grid, &sz);
+    out->my_state[0] = 0;
+    sz = sizeof(out->my_state);
+    nvs_get_str(s_nvs, KEY_MY_STATE, out->my_state, &sz);
 
     // FT8 CQ presets
     sz = sizeof(out->cq_msg[0]); nvs_get_str(s_nvs, KEY_CQ_MSG0, out->cq_msg[0], &sz);
@@ -1143,10 +1361,26 @@ static void load_from_nvs(qmx_settings_t *out)
     nvs_get_u8(s_nvs, KEY_CQ_SEL, &out->cq_sel);
     if (out->cq_sel > 2) out->cq_sel = 0;
     nvs_get_u8(s_nvs, KEY_CQ_MAX, &out->cq_max_calls);
+    for (int i = 0; i < 6; i++) {
+        char k[12];
+        snprintf(k, sizeof(k), KEY_CW_MSG "%d", i);
+        sz = sizeof(out->cw_msg[i]);
+        nvs_get_str(s_nvs, k, out->cw_msg[i], &sz);   // absent key keeps the default
+        snprintf(k, sizeof(k), KEY_CW_MSG_B "%d", i);
+        sz = sizeof(out->cw_msg_b[i]);
+        nvs_get_str(s_nvs, k, out->cw_msg_b[i], &sz); // absent key keeps the default
+    }
+    { uint8_t v8 = 0; if (nvs_get_u8(s_nvs, KEY_CW_MSG_SET, &v8) == ESP_OK) out->cw_msg_set = v8 > 1 ? 0 : v8; }
+    sz = sizeof(out->cw_park); nvs_get_str(s_nvs, KEY_CW_PARK, out->cw_park, &sz);
+    if (nvs_get_u8(s_nvs, KEY_CW_RST_CUT, &u8v) == ESP_OK) out->cw_rst_cut_nines = (u8v != 0);
+    nvs_get_u16(s_nvs, KEY_CW_SERIAL, &out->cw_serial_next);
+    { uint8_t v8 = 0; if (nvs_get_u8(s_nvs, KEY_CW_SIM, &v8) == ESP_OK) out->cw_sim_en = v8 != 0; }
+    { uint8_t v8 = 0; if (nvs_get_u8(s_nvs, KEY_CW_PAGE_EN, &v8) == ESP_OK) out->cw_page_en = v8 != 0; }
     nvs_get_u8(s_nvs, KEY_HOUND_MODE, &out->hound_mode);
     nvs_get_u8(s_nvs, KEY_CQ_LISTEN, &out->cq_listen_every);
     nvs_get_u8(s_nvs, KEY_SWR_LIMIT, &out->swr_limit_x10);
     nvs_get_u8(s_nvs, KEY_JS8_SUBMODE, &out->js8_submode);
+    nvs_get_u8(s_nvs, KEY_JS8_ALT_SUB, &out->js8_alt_submode);
     nvs_get_u8(s_nvs, KEY_RXA_GAIN,   &out->rxaud_gain_d10);
     nvs_get_u8(s_nvs, KEY_RXA_PWIDTH, &out->rxaud_pan_width_x10);
     nvs_get_u8(s_nvs, KEY_RXA_PBLEND, &out->rxaud_pan_blend_x100);
@@ -1206,6 +1440,8 @@ static void load_from_nvs(qmx_settings_t *out)
     nvs_get_u32(s_nvs, KEY_CL_UPLOADED, &out->cloudlog_uploaded_n);
 
     if (nvs_get_u8(s_nvs, KEY_RX_AUD_EN, &u8v) == ESP_OK) out->rx_audio_en = (u8v != 0);
+    if (nvs_get_u8(s_nvs, KEY_BINAURAL, &u8v) == ESP_OK) out->binaural_en = (u8v != 0);
+    if (nvs_get_u8(s_nvs, KEY_WEBRADIO_EN, &u8v) == ESP_OK) out->webradio_en = (u8v != 0);
     nvs_get_u8(s_nvs, KEY_RX_AUD_VOL, &out->rx_audio_vol);
 
     if (nvs_get_float(KEY_WF_BLACK,    &fv)) out->wf_black_db    = fv;
@@ -1226,7 +1462,17 @@ static void load_from_nvs(qmx_settings_t *out)
     }
     if (out->wf_floor_blend > 100) out->wf_floor_blend = 100;
     if (out->wf_window > 2)        out->wf_window = 0;
-    if (out->wf_rows_per_s < 1 || out->wf_rows_per_s > 40) out->wf_rows_per_s = DEF_WF_ROWS;
+    /* 0 = off is a legal STORED value too, or the setting would not survive
+     * a reboot - and the waterfall rate already has history there. Only a
+     * value above the range is nonsense worth replacing. */
+    if (out->wf_rows_per_s > 40) out->wf_rows_per_s = DEF_WF_ROWS;
+    if (nvs_get_u8(s_nvs, KEY_SPEC_PEAK, &out->spec_peak_s) != ESP_OK)
+        out->spec_peak_s = DEF_SPEC_PEAK;
+    if (out->spec_peak_s > 60) out->spec_peak_s = DEF_SPEC_PEAK;
+    if (nvs_get_u16(s_nvs, KEY_CW_PEAK, &out->cw_peak_hz) != ESP_OK)
+        out->cw_peak_hz = DEF_CW_PEAK;
+    if (out->cw_peak_hz && (out->cw_peak_hz < 40 || out->cw_peak_hz > 1000))
+        out->cw_peak_hz = DEF_CW_PEAK;
     if (nvs_get_u8(s_nvs, KEY_DISP_FLIP, &u8v) == ESP_OK) out->display_flip = (u8v != 0);
     if (nvs_get_u8(s_nvs, KEY_QMX_VOL, &u8v) == ESP_OK) out->qmx_vol_db = (u8v <= 199) ? u8v : 199;
     {
@@ -1243,12 +1489,19 @@ static void load_from_nvs(qmx_settings_t *out)
        one rather than printing something nobody has seen. */
     if (nvs_get_u8(s_nvs, KEY_FREQ_SEP, &u8v) == ESP_OK) out->freq_sep_style = (u8v <= 1) ? u8v : 0;
     if (nvs_get_u8(s_nvs, KEY_CW_DECODE, &u8v) == ESP_OK) out->cw_decode_en = (u8v != 0);
+    if (nvs_get_u8(s_nvs, KEY_LOG_VIEW_ALL, &u8v) == ESP_OK) out->log_view_all = (u8v != 0);
+    /* Only 2 or 4 are offered; anything else on flash is a value this build
+       does not know, so it falls back to the default rather than being
+       clamped into a shape the UI cannot show. */
+    if (nvs_get_u8(s_nvs, KEY_CW_ROWS, &u8v) == ESP_OK && (u8v == 2 || u8v == 4))
+        out->cw_decode_rows = u8v;
     if (nvs_get_u8(s_nvs, KEY_RIT_PILL_SHOW, &u8v) == ESP_OK) out->rit_pill_show = (u8v != 0);
     if (nvs_get_u8(s_nvs, KEY_STILL_VIEW,   &u8v) == ESP_OK) out->still_view = (u8v != 0);
     if (nvs_get_u8(s_nvs, KEY_STILL_NOTICE, &u8v) == ESP_OK) out->still_notice_done = (u8v != 0);
     if (nvs_get_u8(s_nvs, KEY_SPUR_SUP, &u8v) == ESP_OK) out->spur_mode = (u8v <= 2) ? u8v : 0;
     if (nvs_get_u8(s_nvs, KEY_FT8_EARLY_DEC, &u8v) == ESP_OK) out->ft8_early_decode = (u8v != 0);
     if (nvs_get_u8(s_nvs, KEY_GREYLIST_EN, &u8v) == ESP_OK) out->greylist_en = (u8v != 0);
+    if (nvs_get_u8(s_nvs, KEY_TXBAND_OFF, &u8v) == ESP_OK) out->tx_band_guard_off = (u8v != 0);
     if (nvs_get_u8(s_nvs, KEY_PSKREP_EN, &u8v) == ESP_OK) out->pskreporter_en = (u8v != 0);
     if (nvs_get_u8(s_nvs, KEY_PSK_RX_EN, &u8v) == ESP_OK) out->psk_rx_en = (u8v != 0);
     if (nvs_get_u8(s_nvs, KEY_BT_MOUSE_EN, &u8v) == ESP_OK) out->bt_mouse_en = (u8v != 0);
@@ -1342,7 +1595,28 @@ static void load_from_nvs(qmx_settings_t *out)
     nvs_get_str(s_nvs, KEY_FD_SECTION, out->fd_section, &sz);
 
     if (nvs_get_u8(s_nvs, KEY_SIM_MODE, &u8v) == ESP_OK) out->sim_mode_en = (u8v != 0);
-    { uint32_t u32v; if (nvs_get_u32(s_nvs, KEY_WSPR_DIAL, &u32v) == ESP_OK) out->wspr_dial_hz = u32v; }
+    { uint32_t u32v; if (nvs_get_u32(s_nvs, KEY_WSPR_DIAL, &u32v) == ESP_OK) out->wspr_dial_hz = u32v;
+      /* ⛔ ONE-TIME MIGRATION: the old 60 m WSPR dial transmitted OUT OF BAND.
+       *
+       * 5287200 emits at 5288600-5288800, about 63 kHz below the bottom of 60 m
+       * in every IARU region (Wolfgang DF1KZ, 2026-10-21 - checked against our
+       * own bandplan.c, see main/ui/wspr_screen_view.c's kBands). Correcting
+       * the table alone fixes NOBODY who has already chosen 60 m: their
+       * selection is this stored u32, and WSPR is one of the six sites that
+       * can key the radio with nobody deciding.
+       *
+       * So the stored value is moved, not just the menu. Narrow on purpose -
+       * it matches that one wrong number and nothing else, so an operator who
+       * has deliberately tuned somewhere unusual is untouched.
+       *
+       * ⚠ It is NOT written back here; load must not write. The next save
+       * carries it, and until then the corrected value is what the radio is
+       * tuned to, which is the part that matters. */
+      if (out->wspr_dial_hz == 5287200u) {
+          out->wspr_dial_hz = 5364700u;
+          ESP_LOGW(TAG, "WSPR 60 m dial 5.287200 was out of band in every region "
+                        "- moved to 5.364700 MHz");
+      } }
     if (nvs_get_u8(s_nvs, KEY_WSPR_TX_EN, &u8v) == ESP_OK) out->wspr_tx_en = (u8v != 0);
     /* ---- WSPR schedule: two cycle counts, migrated from "1 in N" + bursts ----
      *
@@ -1417,6 +1691,10 @@ static void load_from_nvs(qmx_settings_t *out)
         out->gpio_relay_pin   = (rp == 53 || rp == 54) ? rp : DEF_RELAY_PIN;
         out->gpio_relay_level = (rl != 0);
         if (out->gpio_relay_ms < 50 || out->gpio_relay_ms > 5000) out->gpio_relay_ms = DEF_RELAY_MS;
+        /* Absent key == both pads driven, so an upgrade changes nothing. */
+        uint8_t rs = DEF_RELAY_SOLO ? 1 : 0;
+        nvs_get_u8(s_nvs, KEY_RELAY_SOLO, &rs);
+        out->gpio_relay_solo = (rs != 0);
     }
     {
         // 0 when the key was never written, so "no key" and "relay" are the
@@ -1743,6 +2021,22 @@ void settings_set_my_grid(const char *grid)
     mark_dirty(DIRTY_MY_GRID);
 }
 
+/* Upper-cased and clamped to two letters on the way in, so the comparison in
+ * ft8_cq_direction() never has to care how it was typed. Empty clears it. */
+void settings_set_my_state(const char *st)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_pending.my_state[0] = '\0';
+    if (st && st[0] && st[1]) {
+        s_pending.my_state[0] = (char)toupper((unsigned char)st[0]);
+        s_pending.my_state[1] = (char)toupper((unsigned char)st[1]);
+        s_pending.my_state[2] = '\0';
+    }
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_MY_STATE);
+}
+
 void settings_set_cq_msg(uint8_t idx, const char *text)
 {
     if (!s_ready || idx > 2) return;
@@ -1775,6 +2069,151 @@ void settings_set_cq_max_calls(uint8_t n)
     s_pending.cq_max_calls = n;
     xSemaphoreGive(s_mutex);
     mark_dirty(DIRTY_CQ_MAX_CALLS);
+}
+
+void settings_set_cw_msg(uint8_t idx, const char *text)
+{
+    if (!s_ready || idx > 5) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    char buf[sizeof(s_pending.cw_msg[0])] = {0};
+    if (text) { strncpy(buf, text, sizeof(buf) - 1); }
+    if (strcmp(s_pending.cw_msg[idx], buf) == 0) { xSemaphoreGive(s_mutex); return; }
+    strcpy(s_pending.cw_msg[idx], buf);
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_CW_MSG0 + idx);
+}
+
+// Explicit-set sibling for the CW editor, which knows which set it is
+// showing and must not guess from s_pending.cw_msg_set (that would make a
+// save land in whichever set a web/CAT write happened to switch to mid-edit).
+// set==0 behaves exactly like settings_set_cw_msg(); config_io.c's import
+// keeps calling that one directly, so set A's NVS round-trip is unchanged.
+void settings_set_cw_msg_for_set(uint8_t set, uint8_t idx, const char *text)
+{
+    if (set == 0) { settings_set_cw_msg(idx, text); return; }
+    if (!s_ready || idx > 5) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    char buf[sizeof(s_pending.cw_msg_b[0])] = {0};
+    if (text) { strncpy(buf, text, sizeof(buf) - 1); }
+    if (strcmp(s_pending.cw_msg_b[idx], buf) == 0) { xSemaphoreGive(s_mutex); return; }
+    strcpy(s_pending.cw_msg_b[idx], buf);
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_CW_MSG_B);   // one bit for the whole set, see its #define
+}
+
+void settings_set_cw_msg_set(uint8_t set)
+{
+    if (!s_ready || set > 1) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.cw_msg_set == set) { xSemaphoreGive(s_mutex); return; }
+    s_pending.cw_msg_set = set;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_CW_MSG_SET);
+}
+
+void settings_set_cw_park(const char *park)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    char buf[sizeof(s_pending.cw_park)] = {0};
+    if (park) { strncpy(buf, park, sizeof(buf) - 1); }
+    if (strcmp(s_pending.cw_park, buf) == 0) { xSemaphoreGive(s_mutex); return; }
+    strcpy(s_pending.cw_park, buf);
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_CW_PARK);
+}
+
+void settings_set_cw_rst_cut_nines(bool v)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.cw_rst_cut_nines == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.cw_rst_cut_nines = v;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_CW_RST_CUT);
+}
+
+bool settings_get_cw_rst_cut_nines(void)
+{
+    if (!s_ready) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.cw_rst_cut_nines;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+void settings_set_cw_serial_next(uint16_t v)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.cw_serial_next == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.cw_serial_next = v;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_CW_SERIAL);
+}
+
+uint16_t settings_get_cw_serial_next(void)
+{
+    if (!s_ready) return 1;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint16_t v = s_pending.cw_serial_next;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+uint16_t settings_cw_serial_advance(void)
+{
+    if (!s_ready) return 1;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint16_t sent = s_pending.cw_serial_next;
+    s_pending.cw_serial_next = sent + 1;   // wraps past 65535, same as every other u16 counter here
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_CW_SERIAL);
+    return sent;
+}
+
+void settings_set_cw_sim_en(bool v)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.cw_sim_en == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.cw_sim_en = v;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_CW_SIM);
+}
+
+void settings_get_cw_park(char *out, size_t out_sz)
+{
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    snprintf(out, out_sz, "%s", s_pending.cw_park);
+    xSemaphoreGive(s_mutex);
+}
+
+void settings_set_cw_page_en(bool v)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.cw_page_en == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.cw_page_en = v;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_CW_PAGE_EN);
+}
+
+/* Narrow for the same measured reason as settings_get_cw_sim_en() below:
+ * left_drawer_build() and ui_apply_saved_mode_view() both call this, and both
+ * run on stacks that a 3.9 kB qmx_settings_t local would overflow. WSPR's
+ * equivalent gate does use settings_load_all(), which is a hazard inherited
+ * rather than copied - do not follow it here. */
+bool settings_get_cw_page_en(void)
+{
+    if (!s_ready) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.cw_page_en;
+    xSemaphoreGive(s_mutex);
+    return v;
 }
 
 // Narrow (#409): ft8_qso.c's rearm_current() reads this from whatever task
@@ -1832,6 +2271,48 @@ void settings_set_cw_cal_hz(int16_t hz)
     mark_dirty(DIRTY_CW_CAL);
 }
 
+/* T89: one place that maps a sub-mode to its slot. Every caller goes through
+ * here, so the three cannot drift apart the way a switch at each call site
+ * would. 1 = FT4, 2 = JS8, anything else = FT8. */
+uint32_t settings_get_ftx_freq_hz(uint8_t op_mode)
+{
+    qmx_settings_t c; settings_load_all(&c);
+    switch (op_mode) {
+        case 1:  return c.ft4_freq_hz;
+        case 2:  return c.js8_freq_hz;
+        default: return c.ft8_freq_hz;
+    }
+}
+void settings_set_ftx_freq_hz(uint8_t op_mode, uint32_t hz)
+{
+    switch (op_mode) {
+        case 1:
+            if (s_pending.ft4_freq_hz == hz) return;
+            s_pending.ft4_freq_hz = hz; mark_dirty(DIRTY_FT4_FREQ); break;
+        case 2:
+            if (s_pending.js8_freq_hz == hz) return;
+            s_pending.js8_freq_hz = hz; mark_dirty(DIRTY_JS8_FREQ); break;
+        default:
+            settings_set_ft8_freq_hz(hz); break;
+    }
+}
+
+uint16_t settings_get_sb_lowcut_hz(void)
+{
+    if (!s_ready || !s_mutex) return 300;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint16_t v = s_pending.sb_lowcut_hz;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+void settings_set_sb_lowcut_hz(uint16_t hz)
+{
+    if (hz > 600) hz = 600;
+    if (s_pending.sb_lowcut_hz == hz) return;
+    s_pending.sb_lowcut_hz = hz;
+    mark_dirty(DIRTY_SB_LOWCUT);
+}
+
 void settings_set_ft8_filters(const ft8_filters_t *f)
 {
     if (!s_ready || !f) return;
@@ -1839,6 +2320,19 @@ void settings_set_ft8_filters(const ft8_filters_t *f)
     s_pending.ft8_filters = *f;
     xSemaphoreGive(s_mutex);
     mark_dirty(DIRTY_FT8_FILT);
+}
+
+// Narrow accessor: ft8_qso_build_manual_reply() reads this on taskLVGL (it's
+// called directly from both ft8_screen_view.c's row touch handler and
+// ft8_pileup_modal.c's), where a full qmx_settings_t is the stack-overflow
+// class fixed elsewhere in this release.
+bool settings_get_ft8_skip_tx1(void)
+{
+    if (!s_ready) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.ft8_filters.skip_tx1;
+    xSemaphoreGive(s_mutex);
+    return v;
 }
 
 void settings_set_kbd_bindings(const kbd_bindings_t *b)
@@ -2135,6 +2629,40 @@ void settings_set_passband_width_hz(uint32_t hz)
     mark_dirty(DIRTY_PASSBAND_HZ);
 }
 
+void settings_set_webradio_en(bool v)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.webradio_en == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.webradio_en = v;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_WEBRADIO_EN);
+}
+
+bool settings_get_webradio_en(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.webradio_en;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+void settings_set_binaural_en(bool v)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.binaural_en == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.binaural_en = v;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_BINAURAL);
+}
+
+bool settings_get_binaural_en(void)
+{
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.binaural_en;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
 void settings_set_rx_audio_en(bool v)
 {
     if (!s_ready) return;
@@ -2351,10 +2879,70 @@ uint8_t settings_get_wf_rows_per_s(void)
     return v;
 }
 
+float settings_get_ema_alpha(void)
+{
+    if (!s_ready) return DEF_EMA_ALPHA;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    float v = s_pending.ema_alpha;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+uint8_t settings_get_spec_peak_s(void)
+{
+    if (!s_ready) return DEF_SPEC_PEAK;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t v = s_pending.spec_peak_s;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+void settings_set_spec_peak_s(uint8_t secs)
+{
+    if (!s_ready) return;
+    /* Out of range falls back to OFF rather than to a window nobody asked
+     * for - the same rule the rows/s setter below states, and 0 is a valid
+     * value here too. */
+    if (secs > 60) secs = DEF_SPEC_PEAK;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.spec_peak_s == secs) { xSemaphoreGive(s_mutex); return; }
+    s_pending.spec_peak_s = secs;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_SPEC_PEAK);
+}
+
+uint16_t settings_get_cw_peak_hz(void)
+{
+    if (!s_ready) return DEF_CW_PEAK;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint16_t v = s_pending.cw_peak_hz;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+void settings_set_cw_peak_hz(uint16_t hz)
+{
+    if (!s_ready) return;
+    if (hz && hz < 40) hz = 40;
+    if (hz > 1000)     hz = DEF_CW_PEAK;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.cw_peak_hz == hz) { xSemaphoreGive(s_mutex); return; }
+    s_pending.cw_peak_hz = hz;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_CW_PEAK);
+}
+
 void settings_set_wf_rows_per_s(uint8_t rows)
 {
     if (!s_ready) return;
-    if (rows < 1 || rows > 40) rows = DEF_WF_ROWS;
+    /* ⛔ 0 = OFF IS VALID. This clamp used to read `rows < 1 || rows > 40`
+     * and silently substituted DEF_WF_ROWS, which is how a POST of 0 came
+     * back `{"ok":true}` with the stored value still 10 - measured on the
+     * bench 2026-10-22, after the clamps in render.c and webserver.c had
+     * already been lifted. Two of four were fixed and the API reported
+     * success for the other two, which is the worst shape a guard can take.
+     * An out-of-range value still falls back rather than being stored. */
+    if (rows > 40) rows = DEF_WF_ROWS;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     if (s_pending.wf_rows_per_s == rows) { xSemaphoreGive(s_mutex); return; }
     s_pending.wf_rows_per_s = rows;
@@ -2473,7 +3061,16 @@ void settings_set_activation(uint8_t type, const char *ref)
         while (n > 0 && clean[n - 1] == ' ') n--;
         clean[n] = '\0';
     }
-    if (type > 2 || !clean[0]) { type = 0; clean[0] = '\0'; }
+    /* ⛔ THE BOUND IS THE TABLE, NOT A LITERAL 2. This read `type > 2` and
+     * silently turned every programme past SOTA into "not activating", so
+     * WWFF, IOTA, GMA, WCA and WWBOTA built, drew their buttons and did
+     * nothing at all. Found by exercising the API after the build passed -
+     * the build could not see it, and neither could reading the UI code.
+     * settings_activation_type_count() rather than ACT_N because the table
+     * is defined further down this file. */
+    if (type >= settings_activation_type_count() || !clean[0]) {
+        type = 0; clean[0] = '\0';
+    }
 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool same = (s_pending.act_type == type) && (strcmp(s_pending.act_ref, clean) == 0);
@@ -2517,13 +3114,84 @@ bool settings_get_activation_ref(char *out, size_t out_sz)
     return on;
 }
 
+/* ⭐ THE PROGRAMME TABLE. One place, because three things have to agree about
+ * every entry: the word that goes in ADIF MY_SIG, the dedicated ADIF field
+ * (where one exists), and how many contacts make the activation count.
+ *
+ * ⛔ THE DEDICATED FIELD IS NOT COSMETIC. ADIF 3.1.6 makes MY_SIG a free-text
+ * String with no enumeration, so any programme can be written there - but
+ * POTA, SOTA, WWFF and IOTA ALSO have their own fields (MY_POTA_REF,
+ * MY_SOTA_REF, MY_WWFF_REF, MY_IOTA), and those are what the SOTA, WWFF and
+ * IOTA uploaders read. MY_SIG alone is enough for POTA's own uploader and for
+ * nothing else, so both are written. GMA, WCA and WWBOTA have no ADIF field of
+ * their own and travel as MY_SIG/MY_SIG_INFO only, which is what their log
+ * checkers expect.
+ *
+ * ⚠ The targets are the programme's own rule, not ours: POTA 10, SOTA 4,
+ * WWFF 44. The rest publish no single number, and 0 means the panel shows the
+ * count without claiming a threshold - inventing one would tell an operator he
+ * can go home when the programme says otherwise.
+ *
+ * ⛔ IDS ARE PERSISTED IN NVS (act_type). Append only; never renumber. 1 and 2
+ * were POTA and SOTA before the others existed and must stay where they are,
+ * or a unit updated mid-activation changes programme under the operator. */
+static const struct {
+    const char *sig;      /* ADIF MY_SIG */
+    const char *field;    /* dedicated ADIF field, NULL when the programme has none */
+    const char *hint;     /* reference format, for the entry field's placeholder */
+    const char *desc;     /* what the programme is, one line for the Activation window */
+    uint8_t     target;   /* contacts for a valid activation, 0 = no published number */
+} k_act[] = {
+    { NULL,     NULL,          NULL,        NULL, 0 },   /* 0 = not activating */
+    { "POTA",   "MY_POTA_REF", "DL-0123",
+      "Parks on the Air - national, state and regional parks.", 10 },
+    { "SOTA",   "MY_SOTA_REF", "OZ/SJ-001",
+      "Summits on the Air - mountain tops, scored by height.", 4 },
+    { "WWFF",   "MY_WWFF_REF", "DLFF-0123",
+      "World Wide Flora & Fauna - nature reserves and protected land.", 44 },
+    { "IOTA",   "MY_IOTA",     "EU-005",
+      "Islands on the Air - islands and island groups, run by the RSGB.", 0 },
+    { "GMA",    NULL,          "DL/BE-001",
+      "Global Mountain Activity - summits, huts and castles worldwide.", 0 },
+    { "WCA",    NULL,          "DL-00123",
+      "World Castles Award - castles and fortifications.", 0 },
+    { "WWBOTA", NULL,          "DL-00123",
+      "Bunkers on the Air - military bunkers and defence works.", 0 },
+};
+#define ACT_N ((uint8_t)(sizeof(k_act) / sizeof(k_act[0])))
+
+uint8_t settings_activation_type_count(void) { return ACT_N; }
+
+const char *settings_activation_sig_name_for(uint8_t type)
+{
+    return (type > 0 && type < ACT_N) ? k_act[type].sig : NULL;
+}
+
+const char *settings_activation_ref_hint(uint8_t type)
+{
+    return (type > 0 && type < ACT_N) ? k_act[type].hint : NULL;
+}
+
+const char *settings_activation_desc(uint8_t type)
+{
+    return (type > 0 && type < ACT_N) ? k_act[type].desc : NULL;
+}
+
+const char *settings_activation_adif_field(void)
+{
+    uint8_t t = settings_get_activation_type();
+    return (t > 0 && t < ACT_N) ? k_act[t].field : NULL;
+}
+
+uint8_t settings_activation_target(void)
+{
+    uint8_t t = settings_get_activation_type();
+    return (t > 0 && t < ACT_N) ? k_act[t].target : 0;
+}
+
 const char *settings_activation_sig_name(void)
 {
-    switch (settings_get_activation_type()) {
-        case 1:  return "POTA";
-        case 2:  return "SOTA";
-        default: return NULL;
-    }
+    return settings_activation_sig_name_for(settings_get_activation_type());
 }
 
 void settings_set_swr_limit_x10(uint8_t v)
@@ -2561,6 +3229,36 @@ void settings_set_js8_submode(uint8_t v)
     s_pending.js8_submode = v;
     xSemaphoreGive(s_mutex);
     mark_dirty(DIRTY_JS8_SUBMODE);
+}
+
+/* T132: the ALTERNATE submode to decode as well as the primary, on a duty
+ * cycle. Same NSUBMODE numbering as settings_set_js8_submode() above, plus
+ * 255 for off, and clamped here for exactly the same reason - NVS and an
+ * imported config file are writers this module cannot see.
+ *
+ * ⛔ AN UNKNOWN VALUE FALLS BACK TO OFF, not to Normal. "Normal" is a legal
+ * submode but a useless ALTERNATE (it is what we are already decoding), and
+ * silently turning a corrupted byte into extra CPU load on core 1 is worse
+ * than silently doing nothing. js8_alt_select() refuses it too; this is the
+ * outer of the two. */
+void settings_set_js8_alt_submode(uint8_t v)
+{
+    if (!s_ready) return;
+    if (v != 1 && v != 2 && v != 4) v = 255;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.js8_alt_submode == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.js8_alt_submode = v;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_JS8_ALT_SUB);
+}
+
+uint8_t settings_get_js8_alt_submode(void)
+{
+    if (!s_ready) return 255;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t v = s_pending.js8_alt_submode;
+    xSemaphoreGive(s_mutex);
+    return v;
 }
 
 uint8_t settings_get_js8_submode(void)
@@ -2652,8 +3350,35 @@ uint8_t settings_get_rxaud_pan_ovlp_x100(void)   { RXA_GET_U8(rxaud_pan_ovlp_x10
  * back as 4.8 kHz after the next boot with nothing said. Raised with D=2 on
  * 2026-10-15; found by checking every writer of the ceiling, not by hearing
  * it. 100 = 10000 Hz = RX_AUDIO_AM_HALF_BW_MAX_HZ / 100. */
-void settings_set_rxaud_am_half_bw_h100(uint8_t v) { RXA_SET_U8(rxaud_am_half_bw_h100, DIRTY_RXA_AMBW, 10, 100); }
-uint8_t settings_get_rxaud_am_half_bw_h100(void)   { RXA_GET_U8(rxaud_am_half_bw_h100, 30); }
+void settings_set_rxaud_am_half_bw_h100(uint8_t v) { RXA_SET_U8(rxaud_am_half_bw_h100, DIRTY_RXA_AMBW, 10, 48); }
+
+/* ⛔ CLAMPED ON READ AS WELL AS ON WRITE, and that is the whole point of
+ * this not being a bare RXA_GET_U8.
+ *
+ * The ceiling came DOWN on 2026-10-17, from 100 (20.0 kHz) to 48 (9.6 kHz),
+ * when the two widths that needed D=2 were withdrawn. The setter's clamp only
+ * ever sees a NEW value - it cannot touch the 50 or 100 already sitting in an
+ * upgrader's NVS from v1.19/v1.20. Without this, that operator comes back on
+ * a width no list contains: the picker matches nothing, and the stored value
+ * survives every boot because nothing rewrites it.
+ *
+ * This is the same hazard as the bug recorded above, pointing the other way.
+ * That one would have stored 20.0 kHz as 4.8 silently; this one would have
+ * kept 20.0 kHz alive silently after it was removed. A ceiling that moves has
+ * to be enforced wherever the value is READ, not only where it is written. */
+uint8_t settings_get_rxaud_am_half_bw_h100(void)
+{
+    if (!s_ready) return 30;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t v = s_pending.rxaud_am_half_bw_h100;
+    xSemaphoreGive(s_mutex);
+    if (v > 48) {
+        ESP_LOGW(TAG, "stored AM bandwidth %u00 Hz is above the 9.6 kHz ceiling "
+                      "(10.0/20.0 kHz were withdrawn) - using 9.6 kHz", v);
+        v = 48;
+    }
+    return v;
+}
 void settings_set_rxaud_agc_attack_ms(uint8_t v)   { RXA_SET_U8(rxaud_agc_attack_ms,   DIRTY_RXA_ATTACK,  1, 50); }
 uint8_t settings_get_rxaud_agc_attack_ms(void)     { RXA_GET_U8(rxaud_agc_attack_ms,   3); }
 void settings_set_rxaud_agc_release_ms(uint16_t v) { RXA_SET_U16(rxaud_agc_release_ms, DIRTY_RXA_RELEASE, 10, 500); }
@@ -2782,6 +3507,22 @@ bool settings_get_sim_mode_en(void)
     return v;
 }
 
+// Narrow for the same reason, and the reason is measured: usb_replug.c's
+// usb_stale_detect_task has a 4096-byte stack and read BOTH simulation flags
+// with one settings_load_all(). qmx_settings_t is 3888 bytes today (nm on
+// s_pending), so that local alone overflows the stack - the task took a
+// breakpoint at 4.740 s of every boot and the device crash-looped. It fitted
+// when it was written and stopped fitting because the STRUCT grew, which is
+// what makes this class of bug arrive without anyone touching the caller.
+bool settings_get_cw_sim_en(void)
+{
+    if (!s_ready) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.cw_sim_en;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
 // Narrow on purpose: the drawer callback and the feed tasks that read this are
 // on stacks that cannot afford a whole qmx_settings_t local - see CLAUDE.md's
 // "Task stacks on this board are TINY", where that mistake has landed four
@@ -2894,6 +3635,40 @@ void settings_get_wifi_static(char ip[16], char mask[16], char gw[16], char dns[
     if (mask) memcpy(mask, s_pending.wifi_mask, sizeof(s_pending.wifi_mask));
     if (gw)   memcpy(gw,   s_pending.wifi_gw,   sizeof(s_pending.wifi_gw));
     if (dns)  memcpy(dns,  s_pending.wifi_dns,  sizeof(s_pending.wifi_dns));
+    xSemaphoreGive(s_mutex);
+}
+
+/* Two fields, for the same reason as the accessor above - see settings.h. */
+/* Narrow, for callers on a feed task - see settings_get_cw_sim_en()'s
+   comment. A qmx_settings_t is 3888 bytes and these tasks nest two frames
+   that each wanted one. */
+void settings_get_my_grid(char *out, size_t out_sz)
+{
+    if (!out || out_sz == 0) return;
+    out[0] = '\0';
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    snprintf(out, out_sz, "%s", s_pending.my_grid);
+    xSemaphoreGive(s_mutex);
+}
+
+bool settings_get_psk_rx_en(void)
+{
+    if (!s_ready) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.psk_rx_en;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+void settings_get_bandplan(uint8_t *region_out, char grid_out[8])
+{
+    if (region_out) *region_out = 0;
+    if (grid_out)   grid_out[0] = '\0';
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (region_out) *region_out = s_pending.bandplan_region;
+    if (grid_out)   memcpy(grid_out, s_pending.my_grid, sizeof(s_pending.my_grid));
     xSemaphoreGive(s_mutex);
 }
 
@@ -3028,6 +3803,51 @@ void settings_set_cw_decode_en(bool v)
     mark_dirty(DIRTY_CW_DECODE);
 }
 
+bool settings_get_log_view_all(void)
+{
+    if (!s_ready || !s_mutex) return false;   // Today, until settings are up
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.log_view_all;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+void settings_set_log_view_all(bool v)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.log_view_all == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.log_view_all = v;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_LOG_VIEW_ALL);
+}
+
+uint8_t settings_get_cw_decode_rows(void)
+{
+    if (!s_ready || !s_mutex) return DEF_CW_ROWS;   // default until settings are up
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    uint8_t v = s_pending.cw_decode_rows;
+    xSemaphoreGive(s_mutex);
+    return (v == 2 || v == 4) ? v : DEF_CW_ROWS;
+}
+
+/* ⛔ APPLIES IT TO cw_decode.c TOO, and that is not a convenience. The row
+ * count is the WRAP MODULUS, so a stored value that never reached the decoder
+ * would leave the two disagreeing: the text would keep wrapping over four rows
+ * while two were drawn, and half of every pass would land where nobody can see
+ * it. One place sets both, so they cannot drift. The call wipes the line. */
+void settings_set_cw_decode_rows(uint8_t rows)
+{
+    if (rows != 2 && rows != 4) return;
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool same = (s_pending.cw_decode_rows == rows);
+    if (!same) s_pending.cw_decode_rows = rows;
+    xSemaphoreGive(s_mutex);
+    cw_decode_set_rows(rows);        // idempotent; returns at once if unchanged
+    if (!same) mark_dirty(DIRTY_CW_ROWS);
+}
+
 void settings_set_freq_sep_style(uint8_t v)
 {
     if (!s_ready) return;
@@ -3071,6 +3891,42 @@ void settings_set_greylist_en(bool v)
     s_pending.greylist_en = v;
     xSemaphoreGive(s_mutex);
     mark_dirty(DIRTY_GREYLIST_EN);
+}
+
+void settings_set_tx_band_guard_off(bool v)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.tx_band_guard_off == v) { xSemaphoreGive(s_mutex); return; }
+    s_pending.tx_band_guard_off = v;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_TXBAND_OFF);
+}
+
+// Narrow accessor: row_activate_ex() (ft8_screen_view.c) reads this on the
+// CQ-row touch callback, on taskLVGL's small stack. qmx_settings_t is 3888
+// bytes (see the note above settings_load_all()) - a local that size there
+// is what crashed N4OPI and W5NR tapping a CQ caller, 2026-11-03.
+bool settings_get_greylist_en(void)
+{
+    if (!s_ready) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.greylist_en;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+/* ⚠ Deliberately FAILS SAFE: with settings not ready the guard is ON, because
+ * the alternative is transmitting unchecked during the one window where
+ * nothing is known. Same reasoning as the 167 setters that return early on
+ * !s_ready, read from the other direction. */
+bool settings_get_tx_band_guard_off(void)
+{
+    if (!s_ready) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.tx_band_guard_off;
+    xSemaphoreGive(s_mutex);
+    return v;
 }
 
 void settings_set_pskreporter_en(bool v)
@@ -3338,6 +4194,31 @@ void settings_set_field_day_en(bool v)
     s_pending.field_day_en = v;
     xSemaphoreGive(s_mutex);
     mark_dirty(DIRTY_FIELD_DAY_EN);
+}
+
+bool settings_get_field_day_en(void)
+{
+    if (!s_ready) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.field_day_en;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
+// Narrow accessor for the `field_day_en && fd_class[0] && fd_section[0]`
+// check that five call sites repeated, each behind its own full
+// settings_load_all() (3888 B). Two of them - ft8_qso_build_manual_reply()
+// and ft8_pileup_modal.c's row_work_cb() - run on taskLVGL from a touch
+// callback; row_work_cb() is the crash Randy N4OPI hit on v1.24.1
+// clicking a pileup entry to work them (2026-11-03), the same class as the
+// CQ-row fix already shipped in this release, just a second instance of it.
+bool settings_get_fd_mode_active(void)
+{
+    if (!s_ready) return false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.field_day_en && s_pending.fd_class[0] && s_pending.fd_section[0];
+    xSemaphoreGive(s_mutex);
+    return v;
 }
 
 void settings_set_fd_class(const char *cls)
@@ -3715,6 +4596,56 @@ void settings_set_gpio_relay(uint8_t pin, bool level, uint16_t ms)
     gpio_relay_set_polarity(level);
 }
 
+/* Drive only the selected relay pin - see gpio_relay_solo's comment in
+ * settings.h for why this is an option and not simply the behaviour.
+ *
+ * ⭐ RE-CONFIGURES THE PADS HERE, for the same reason the polarity does and
+ * in the same place: turning this on has to RELEASE the other pin, and
+ * turning it off has to start driving it again. Storing it and waiting for a
+ * reboot would be a switch that reads as applied and changes nothing - the
+ * exact failure the settings sweep for T28 went looking for. */
+/* ⛔ CAN THIS DEVICE KEEP ANYTHING AT ALL?
+ *
+ * settings_init() returns early when the `user_nvs` partition is missing or
+ * cannot be opened, leaving s_ready false - and 167 setters begin
+ * `if (!s_ready) return;`. Every one then silently does nothing and every
+ * getter hands back a default. The device receives perfectly and forgets
+ * everything, which is indistinguishable from the operator clicking wrong.
+ *
+ * Sergei AA1SL, issue #21, 2026-10-20: installed with the M5Launcher, whose
+ * partition layout has no user_nvs, and reported "it will not save my
+ * settings, call sign, location... I can't transmit - it shows bunch of error
+ * messages". The transmit errors are the SAME fault: with no callsign stored
+ * every TX path refuses with "Set your callsign first".
+ *
+ * The firmware knew, every time, and said so only on the serial console -
+ * the same shape as the brownout Samuel W7STF lost days to. */
+bool settings_persist_ok(void)
+{
+    return s_ready;
+}
+
+void settings_set_gpio_relay_solo(bool solo)
+{
+    if (!s_ready) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_pending.gpio_relay_solo == solo) { xSemaphoreGive(s_mutex); return; }
+    s_pending.gpio_relay_solo = solo;
+    bool level = s_pending.gpio_relay_level;
+    xSemaphoreGive(s_mutex);
+    mark_dirty(DIRTY_GPIO_RELAY);
+    gpio_relay_set_polarity(level);
+}
+
+bool settings_get_gpio_relay_solo(void)
+{
+    if (!s_ready) return DEF_RELAY_SOLO;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool v = s_pending.gpio_relay_solo;
+    xSemaphoreGive(s_mutex);
+    return v;
+}
+
 void settings_get_gpio_relay(uint8_t *pin, bool *level, uint16_t *ms)
 {
     // Defaults first, so a caller running before settings_init() still gets a
@@ -3973,11 +4904,11 @@ void settings_set_lotw_uploaded_n(uint32_t n)
 void settings_get_gps_grid_auto(char *out, size_t cap)
 {
     if (!out || cap == 0) return;
-    out[0] = ' ';
+    out[0] = '\0';
     if (!s_ready) return;
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     size_t sz = cap;
-    if (nvs_get_str(s_nvs, KEY_GPS_GRID_A, out, &sz) != ESP_OK) out[0] = ' ';
+    if (nvs_get_str(s_nvs, KEY_GPS_GRID_A, out, &sz) != ESP_OK) out[0] = '\0';
     xSemaphoreGive(s_mutex);
 }
 

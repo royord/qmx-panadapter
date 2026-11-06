@@ -29,6 +29,7 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include "panic_hook.h"   // T138: mark the cache-off stretches
 
 static const char *TAG      = "adif";
 static const char *FILE_PATH = "/spiffs/qso.adi";
@@ -40,13 +41,39 @@ static bool              s_mounted = false;
 // Worked-call cache: unique (callsign, band) pairs from every logged QSO.
 // Band-aware so the same station on a new band counts as NOT worked before
 // (a fresh band-slot). ADIF_BAND_MAX fits "160M" + NUL.
-#define ADIF_WORKED_CACHE 1024
+//
+// ⚠ 2026-10-17, Gyula HA3HZ: this was a FIXED 1024 entries and cache_add()
+// dropped everything past it in silence. With ~1000 QSOs logged (a 200 KB
+// ADIF) the table was full at boot, so every NEW QSO was written to the file
+// but never entered the cache - the decode row stayed green for a station
+// just worked, and "Never auto-call worked-before" stopped filtering it.
+// Deleting the log made it work again, which is how he found it. The table
+// now grows, and the ceiling is loud instead of silent.
+//
+// ADIF_WORKED_MAX is sized from the partition, not from taste: `storage` is
+// 1 MB of SPIFFS and a record is ~180 bytes, so a completely full log is
+// ~5800 records and cannot reach 8192 unique pairs.
+#define ADIF_WORKED_CHUNK 1024
+#define ADIF_WORKED_MAX   8192
 #define ADIF_CALL_MAX     16
 #define ADIF_BAND_MAX     6
 typedef struct {
+    uint32_t hash;                  // of call only; a prefilter, never a match
     char call[ADIF_CALL_MAX];
     char band[ADIF_BAND_MAX];
 } worked_entry_t;
+
+// FNV-1a over the callsign. The scan runs per decode row and per spot row
+// (see the note at spots_lane.c), so growing the table 8x would have cost 8x
+// in strcmp. Comparing one uint32 first rejects almost every entry before a
+// string is touched, which keeps the longer scan cheaper than the short one
+// used to be. A collision only costs the strcmp that was there before.
+static uint32_t call_hash(const char *s)
+{
+    uint32_t h = 2166136261u;
+    while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; }
+    return h;
+}
 // PSRAM, allocated in adif_log_init(). As a static array this was 22.5 KB of
 // internal .bss - the single largest consumer in the whole firmware - and every
 // byte of it was pointless: the cache is scanned linearly, on demand, from the
@@ -58,6 +85,8 @@ typedef struct {
 // reboots.
 static worked_entry_t *s_worked;
 static int            s_worked_count = 0;
+static int            s_worked_cap   = 0;
+static bool           s_worked_full  = false;  // ceiling hit; say so once
 
 // ---------------------------------------------------------------------------
 
@@ -87,24 +116,56 @@ static void write_field(FILE *f, const char *name, const char *value)
     fprintf(f, "<%s:%zu>%s", name, strlen(value), value);
 }
 
+// Grow the cache by one chunk. Returns false at the ceiling or on allocation
+// failure, and says which - a full cache is a correctness fault (stations
+// silently read as not worked), so it must never be inferred from behaviour
+// again.
+static bool cache_grow(void)
+{
+    if (s_worked_cap >= ADIF_WORKED_MAX) {
+        if (!s_worked_full) {
+            s_worked_full = true;
+            ESP_LOGE(TAG, "worked-call cache full at %d pairs - stations beyond "
+                          "this read as NOT worked before", s_worked_cap);
+        }
+        return false;
+    }
+    int want = s_worked_cap + ADIF_WORKED_CHUNK;
+    if (want > ADIF_WORKED_MAX) want = ADIF_WORKED_MAX;
+    worked_entry_t *p = heap_caps_realloc(s_worked, (size_t)want * sizeof(worked_entry_t),
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) {
+        if (!s_worked_full) {
+            s_worked_full = true;
+            ESP_LOGE(TAG, "no PSRAM to grow the worked-call cache past %d pairs - "
+                          "stations beyond this read as NOT worked before", s_worked_cap);
+        }
+        return false;
+    }
+    s_worked     = p;
+    s_worked_cap = want;
+    return true;
+}
+
 // Add a (callsign, band) pair to the worked cache (deduplicates on the pair,
-// ignores overflow). band may be NULL/"" (e.g. an out-of-band log entry).
+// grows on demand). band may be NULL/"" (e.g. an out-of-band log entry).
 static void cache_add(const char *call, const char *band)
 {
-    if (!s_worked) return;          // allocation failed at init; cache disabled
     if (!call || !call[0]) return;
     if (!band) band = "";
+    uint32_t h = call_hash(call);
     for (int i = 0; i < s_worked_count; i++) {
+        if (s_worked[i].hash != h) continue;
         if (strcmp(s_worked[i].call, call) == 0 &&
             strcmp(s_worked[i].band, band) == 0) return;  // already present
     }
-    if (s_worked_count < ADIF_WORKED_CACHE) {
-        strncpy(s_worked[s_worked_count].call, call, ADIF_CALL_MAX - 1);
-        s_worked[s_worked_count].call[ADIF_CALL_MAX - 1] = '\0';
-        strncpy(s_worked[s_worked_count].band, band, ADIF_BAND_MAX - 1);
-        s_worked[s_worked_count].band[ADIF_BAND_MAX - 1] = '\0';
-        s_worked_count++;
-    }
+    if (s_worked_count == s_worked_cap && !cache_grow()) return;
+    s_worked[s_worked_count].hash = h;
+    strncpy(s_worked[s_worked_count].call, call, ADIF_CALL_MAX - 1);
+    s_worked[s_worked_count].call[ADIF_CALL_MAX - 1] = '\0';
+    strncpy(s_worked[s_worked_count].band, band, ADIF_BAND_MAX - 1);
+    s_worked[s_worked_count].band[ADIF_BAND_MAX - 1] = '\0';
+    s_worked_count++;
 }
 
 // Extract an ADIF field value (<FIELD:len>value) from a single record line.
@@ -236,12 +297,10 @@ void adif_log_init(void)
 {
     s_lock = xSemaphoreCreateMutex();
 
-    s_worked = heap_caps_calloc(ADIF_WORKED_CACHE, sizeof(worked_entry_t),
-                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_worked) {
-        // Not fatal: worked-before lookups just answer "no". Logging still works.
-        ESP_LOGE(TAG, "no PSRAM for the worked-call cache - worked-before disabled");
-    }
+    // First chunk up front so a boot-time PSRAM shortage is reported here and
+    // not on the first QSO. It then grows from load_from_file() as needed.
+    // Not fatal: worked-before lookups just answer "no". Logging still works.
+    (void)cache_grow();
 
     esp_vfs_spiffs_conf_t conf = {
         .base_path              = "/spiffs",
@@ -295,6 +354,10 @@ void adif_log_init(void)
     // asked for and the deleted pages can still cover it. A too-large request
     // reports a scary error and does nothing, which is what the diag log's own
     // 128 KB request was doing until 2026-10-12 (see DIAG_GC_REQUEST).
+    /* T138: gc scans the partition and check repairs it, both with the cache
+     * off, and this pair is the longest such stretch the firmware runs at all.
+     * At mount, so a crumb naming it would point at boot rather than runtime. */
+    panic_hook_crumb_enter("spiffs:mount-gc+check");
     esp_err_t gc = esp_spiffs_gc("storage", 65536);
     if (gc != ESP_OK) {
         ESP_LOGW(TAG, "SPIFFS gc: %s (continuing anyway)", esp_err_to_name(gc));
@@ -303,6 +366,7 @@ void adif_log_init(void)
     if (chk != ESP_OK) {
         ESP_LOGW(TAG, "SPIFFS check: %s (continuing anyway)", esp_err_to_name(chk));
     }
+    panic_hook_crumb_exit();
 
     // Check free space and warn if low (< 64 KB).
     size_t total = 0, used = 0;
@@ -466,6 +530,15 @@ void adif_log_record(const adif_qso_t *qso)
         if (my_sig && settings_get_activation_ref(my_ref, sizeof(my_ref))) {
             write_field(f, "MY_SIG",      my_sig);
             write_field(f, "MY_SIG_INFO", my_ref);
+            /* ⛔ AND THE PROGRAMME'S OWN FIELD, where ADIF defines one.
+             * MY_SIG is free text (ADIF 3.1.6 gives it no enumeration) and
+             * POTA's uploader reads it, but SOTA, WWFF and IOTA read
+             * MY_SOTA_REF, MY_WWFF_REF and MY_IOTA instead - a log carrying
+             * only MY_SIG is accepted by one of the four and silently
+             * credits nothing in the others. GMA, WCA and WWBOTA have no
+             * field of their own and correctly get none. */
+            const char *my_field = settings_activation_adif_field();
+            if (my_field) write_field(f, my_field, my_ref);
         }
     }
     if (qso->their_sig_info && qso->their_sig_info[0]) {
@@ -548,10 +621,11 @@ const char *adif_log_file_path(void)
 bool adif_log_contains_call(const char *call)
 {
     if (!call || !call[0]) return false;
+    uint32_t h = call_hash(call);
     if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
     bool found = false;
     for (int i = 0; i < s_worked_count && !found; i++) {
-        if (strcmp(s_worked[i].call, call) == 0) found = true;
+        if (s_worked[i].hash == h && strcmp(s_worked[i].call, call) == 0) found = true;
     }
     if (s_lock) xSemaphoreGive(s_lock);
     return found;
@@ -563,15 +637,17 @@ bool adif_log_contains_call_on_band(const char *call, uint32_t freq_hz)
     const char *band = freq_to_band(freq_hz);
     // Unknown band (freq 0: no QMX / CAT not up - e.g. FT8 simulation mode):
     // fall back to a call-only match instead of returning false. Returning
-    // false made "Exclude worked before" silently pass EVERYONE whenever the
+    // false made "Never auto-call worked-before" silently pass EVERYONE whenever the
     // frequency was unreadable - observed in sim mode as the same phantom
     // being worked and logged back-to-back with the filter checked. Matching
     // any band is the conservative direction for a filter whose job is
     // avoiding duplicates.
     bool any_band = (band[0] == '\0');
+    uint32_t h = call_hash(call);
     if (s_lock) xSemaphoreTake(s_lock, portMAX_DELAY);
     bool found = false;
     for (int i = 0; i < s_worked_count && !found; i++) {
+        if (s_worked[i].hash != h) continue;
         if (strcmp(s_worked[i].call, call) == 0 &&
             (any_band || strcmp(s_worked[i].band, band) == 0)) found = true;
     }
@@ -695,6 +771,41 @@ int adif_log_count_activation(const char *sig_info)
     char needle[32];
     snprintf(needle, sizeof(needle), "<MY_SIG_INFO:%u>%s", (unsigned)strlen(sig_info), sig_info);
 
+    /* ⛔⛔ TODAY'S UTC DAY ONLY. THIS COUNTED EVERY CONTACT EVER LOGGED
+     * AGAINST THE REFERENCE.
+     *
+     * Bruce N9JCV, 2026-10-23: he activated US-0986, came back another day and
+     * activated it again, and the panel opened showing 39 contacts and
+     * "activated" before he had made one. "It seems like it is using my past
+     * historical activations in this window to display the counts and status."
+     *
+     * He is right, and the number was not merely stale - it was ANSWERING THE
+     * WRONG QUESTION. The panel exists to say "can I go home yet", and POTA
+     * decides that per UTC DAY: ten contacts today activates the park today,
+     * and yesterday's ten do not carry over. A count that spans days tells an
+     * operator he is finished when he has not started.
+     *
+     * ⚠ UTC, not local, and that is not a detail - it is the whole point. A
+     * US activator working an evening session is already into the next UTC day,
+     * so a local-midnight boundary would split one sitting in half and join
+     * two others. The log writes QSO_DATE from gmtime_r (see adif_log_append),
+     * so comparing against a gmtime_r of now is the same clock on both sides.
+     *
+     * ⚠ A record with no QSO_DATE is COUNTED, as records with no CALL already
+     * are. Over-counting by one is a number an operator can argue with; losing
+     * a contact he really made is not. */
+    char today[9] = "";
+    {
+        time_t now = time(NULL);
+        struct tm tmv;
+        gmtime_r(&now, &tmv);
+        /* Before the clock is set the year reads 1970, and every record would
+         * then fail to match - which would show zero and look like a lost log.
+         * Leave `today` empty in that case and count everything, as before. */
+        if (tmv.tm_year + 1900 >= 2020)
+            strftime(today, sizeof(today), "%Y%m%d", &tmv);
+    }
+
     // Heap (PSRAM), never the stack: this runs from activation_modal.c's
     // refresh() on taskLVGL, which CLAUDE.md already documents as having
     // only ~8 KB - a 512*16 array would be a guaranteed stack-protection
@@ -717,6 +828,15 @@ int adif_log_count_activation(const char *sig_info)
             if (strncasecmp(p, needle, nl) == 0) { hit = true; break; }
         }
         if (!hit) continue;
+
+        /* Wrong UTC day - a different activation of the same reference. */
+        if (today[0]) {
+            char qdate[12];
+            if (adif_log_extract_field(line, "QSO_DATE", qdate, sizeof(qdate))
+                && strcmp(qdate, today) != 0) {
+                continue;
+            }
+        }
 
         char call[ADIF_CALL_MAX];
         if (!seen || !adif_log_extract_field(line, "CALL", call, sizeof(call))) {
@@ -902,8 +1022,10 @@ int adif_log_delete_matching(bool (*want_gone)(int idx, const char *raw, void *c
         // gc before check - see adif_log_init(): a full partition cannot
         // write a repair, so check() first is a no-op on exactly the
         // condition that brought us here.
+        panic_hook_crumb_enter("spiffs:batchdel-gc");
         esp_spiffs_gc("storage", 65536);
         esp_spiffs_check("storage");
+        panic_hook_crumb_exit();
         out = fopen(TMP_PATH, "w");
     }
     if (!out) {
@@ -1009,8 +1131,10 @@ bool adif_log_delete_record(int idx)
         esp_spiffs_info("storage", &t0, &u0);
         // gc BEFORE check - see adif_log_init(). A repair is a write, and
         // ENOSPC is precisely the state in which it cannot land.
+        panic_hook_crumb_enter("spiffs:delrec-gc");
         esp_err_t gc  = esp_spiffs_gc("storage", 65536);
         esp_err_t chk = esp_spiffs_check("storage");
+        panic_hook_crumb_exit();
         esp_spiffs_info("storage", &t1, &u1);
         ESP_LOGW(TAG, "delete record #%d: %s ENOSPC on open - check=%s gc=%s, "
                       "used %zuKB/%zuKB -> %zuKB/%zuKB, retrying once",
@@ -1457,4 +1581,117 @@ int adif_log_import_from_sd(adif_import_result_t *res)
 const char *adif_log_band_for_freq(uint32_t hz)
 {
     return freq_to_band(hz);
+}
+
+/* ⭐ ONE FILE PER ACTIVATION (Brian KB9WFS, 2026-10-27: "I activate more than
+ * one park in a day"). The whole-log export already on the card cannot be
+ * handed to POTA as one activation, and splitting it afterwards by hand is
+ * exactly the work the device can do for free at the moment the session ends.
+ *
+ * Written to the SD card, named for the reference and the UTC day -
+ * DL-0123-20261027.adi - so two activations of the SAME park on different days
+ * do not overwrite each other.
+ *
+ * ⚠ TODAY'S RECORDS ONLY, matching adif_log_count_activation(): the file holds
+ * the session that just ended, not every contact ever made at that reference.
+ * A previous activation of the same park belongs in its own file, which it
+ * already has.
+ *
+ * Returns the number of records written, or -1 when there is no card, no
+ * matching record or the write failed. The caller reports it; a silent
+ * failure here would be discovered when the activation was submitted. */
+int adif_log_export_activation(const char *sig_info, char *out_path, size_t out_sz)
+{
+    if (out_path && out_sz) out_path[0] = '\0';
+    if (!s_mounted || !sig_info || !sig_info[0]) return -1;
+    if (!sd_archive_is_mounted()) return -1;
+
+    char today[9] = "";
+    {
+        time_t now = time(NULL);
+        struct tm tmv;
+        gmtime_r(&now, &tmv);
+        /* Same guard as the counter: before the clock is set every record
+         * would fail to match, and an empty file is worse than an undated
+         * one. With no usable clock, take them all. */
+        if (tmv.tm_year + 1900 >= 2020)
+            strftime(today, sizeof(today), "%Y%m%d", &tmv);
+    }
+
+    /* The reference goes into a filename, so anything FatFs will not take is
+     * replaced rather than refused - a slash in a SOTA reference (OZ/SJ-001)
+     * would otherwise name a directory that does not exist. */
+    char safe[32];
+    size_t si = 0;
+    for (const char *p = sig_info; *p && si + 1 < sizeof(safe); p++) {
+        char c = *p;
+        bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '-' || c == '_';
+        safe[si++] = ok ? c : '-';
+    }
+    safe[si] = '\0';
+    if (!safe[0]) return -1;
+
+    char path[96];
+    if (today[0]) snprintf(path, sizeof(path), "/sdcard/qmx-panadapter/%s-%s.adi", safe, today);
+    else          snprintf(path, sizeof(path), "/sdcard/qmx-panadapter/%s.adi", safe);
+
+    FILE *in = fopen(FILE_PATH, "r");
+    if (!in) return -1;
+
+    /* FatFs has no internal locking and the archive task writes the same
+     * directory - the same lock every other bulk SD access here takes. */
+    if (!sd_archive_lock(3000)) { fclose(in); return -1; }
+
+    FILE *out = fopen(path, "w");
+    if (!out) {
+        sd_archive_unlock();
+        fclose(in);
+        ESP_LOGE(TAG, "activation export: cannot create %s", path);
+        return -1;
+    }
+    fprintf(out, "<ADIF_VER:5>3.1.4 <PROGRAMID:13>QMX-Panadapter <EOH>\n");
+
+    char needle[40];
+    snprintf(needle, sizeof(needle), "<MY_SIG_INFO:%u>%s",
+             (unsigned)strlen(sig_info), sig_info);
+    size_t nl = strlen(needle);
+
+    char line[1024];
+    int  n = 0;
+    bool header_done = false;
+    bool write_failed = false;
+    while (fgets(line, sizeof(line), in)) {
+        if (!header_done) { header_done = true; continue; }
+        bool hit = false;
+        for (const char *p = line; *p && !hit; p++)
+            if (strncasecmp(p, needle, nl) == 0) hit = true;
+        if (!hit) continue;
+        if (today[0]) {
+            char qdate[12];
+            if (adif_log_extract_field(line, "QSO_DATE", qdate, sizeof(qdate))
+                && strcmp(qdate, today) != 0) continue;
+        }
+        if (fputs(line, out) < 0) { write_failed = true; break; }
+        n++;
+    }
+    fclose(in);
+    /* ⛔ fsync before the close is believed: a card pulled straight after an
+     * activation ends is the normal case, not an edge one. */
+    fflush(out);
+    fsync(fileno(out));
+    fclose(out);
+    sd_archive_unlock();
+
+    if (write_failed || n == 0) {
+        /* An empty or truncated file on the card would be taken for the
+         * activation's record. Remove it and say nothing was written. */
+        remove(path);
+        ESP_LOGW(TAG, "activation export %s: %s", path,
+                 write_failed ? "write failed" : "no matching records");
+        return -1;
+    }
+    if (out_path && out_sz) snprintf(out_path, out_sz, "%s", path);
+    ESP_LOGI(TAG, "activation export: %d records -> %s", n, path);
+    return n;
 }
