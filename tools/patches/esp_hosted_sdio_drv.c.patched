@@ -1278,7 +1278,24 @@ static void sdio_process_rx_task(void const* pvParameters)
 			if (chan_arr[buf_handle->if_type] && chan_arr[buf_handle->if_type]->rx) {
 				/* TODO : Need to abstract heap_caps_malloc */
 				uint8_t * copy_payload = (uint8_t *)g_h.funcs->_h_malloc(buf_handle->payload_len);
-				assert(copy_payload);
+				if (!copy_payload) {
+					/* QMX_PANADAPTER_SDIO_COPYPAYLOAD_TOLERANT: _h_malloc() can
+					 * return NULL under the internal-RAM pressure this board
+					 * runs under (see CLAUDE.md's internal RAM sections) -
+					 * stock code asserted here, i.e. abort()+reboot. Field-
+					 * observed on bench1 (ESP32-P4) after a 14+ hour WSPR
+					 * soak: "assert failed: sdio_process_rx_task sdio_drv.c:
+					 * 1281 (copy_payload)". There is nothing to copy this
+					 * frame's payload into, so free the original buffer
+					 * handle and drop the frame (one lost WiFi/BT packet,
+					 * same retransmit assumption as the sibling RX-buffer
+					 * patch) instead of rebooting the whole device.
+					 */
+					ESP_LOGW(TAG, "SDIO RX copy_payload alloc failed (len=%u) - dropping frame",
+							(unsigned)buf_handle->payload_len);
+					H_FREE_PTR_WITH_FUNC(buf_handle->free_buf_handle, buf_handle->priv_buffer_handle);
+					continue;
+				}
 				assert(buf_handle->payload_len);
 				assert(buf_handle->payload);
 				memcpy(copy_payload, buf_handle->payload, buf_handle->payload_len);
